@@ -4,6 +4,19 @@
 #include <cstdio>
 #include <cstring>
 namespace {
+// ASan instruments the allocator teardown after the VM deadline fires.
+// Keep the production wall-clock budget strict in uninstrumented builds.
+#if defined(__SANITIZE_ADDRESS__)
+constexpr double native_conversion_limit_ms = 400;
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+constexpr double native_conversion_limit_ms = 400;
+#else
+constexpr double native_conversion_limit_ms = 40;
+#endif
+#else
+constexpr double native_conversion_limit_ms = 40;
+#endif
 bool check(bool value, const char *message) {
     if (!value)
         std::printf("FAIL: %s\n", message);
@@ -174,7 +187,7 @@ int main(int argc, char **argv) {
             "native conversion deadline");
         ok &= check(double(SDL_GetPerformanceCounter() - started) * 1000 /
                             double(SDL_GetPerformanceFrequency()) <
-                        40,
+                        native_conversion_limit_ms,
                     "large tree bounded");
         inlay_surface_destroy(big);
     }

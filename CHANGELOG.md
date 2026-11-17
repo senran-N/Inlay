@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.5.0] - 2026-11-18
+
+- Require Etch 0.18 for the pre-1.0 cross-repository release candidate.
+- Enforce root/source artifact hygiene with isolated negative guardrail fixtures.
+- Verify stable portal frame-arena use, idle sleeping and zero repeat uploads
+  over 32 frames; retain the normal timing budgets in non-ASan builds.
+- Add an ASan-specific native teardown timing allowance while retaining VM
+  interruption, error recovery and memory checks.
+
 ## [0.4.0] - 2026-11-17
 - Add public portal backend ABI, dirty tile retries, texture/underlay views, transformed
   geometry, focus/capture routing, explicit occlusion policy and IME coordinates.

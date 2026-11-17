@@ -2,6 +2,13 @@ cmake_minimum_required(VERSION 3.24)
 if(NOT ROOT)
  get_filename_component(ROOT "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
 endif()
+file(GLOB root_pngs "${ROOT}/*.png")
+file(GLOB_RECURSE source_vectors "${ROOT}/src/*.vectors.png"
+ "${ROOT}/include/*.vectors.png" "${ROOT}/tests/*.vectors.png"
+ "${ROOT}/examples/*.vectors.png")
+foreach(path IN LISTS root_pngs source_vectors)
+ message(FATAL_ERROR "${path}: directory/artifact hygiene rule")
+endforeach()
 foreach(name LICENSE THIRD_PARTY_NOTICES.md README.md CHANGELOG.md CLAUDE.md AGENTS.md)
  if(NOT EXISTS "${ROOT}/${name}")
   message(FATAL_ERROR "${name}: required documentation missing")

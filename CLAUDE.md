@@ -21,3 +21,6 @@ Portals own backend state and texture storage. Poll dirty regions outside a queu
 frame, build view, synchronize geometry after end_frame, and acknowledge frame
 submission before resize/destruction. Input focus/capture are local; host controls
 occlusion policy. Native WebView2 is optional UNDERLAY with host-owned COM/window/IME.
+
+Release candidate 0.5 requires the public Etch 0.18 package. Keep the pre-1.0
+release boundary until real-hardware cross-platform and adoption sign-off.

@@ -59,7 +59,8 @@ int main(int argc, char **argv) {
       rejected_batch && retained && retried && accepted && inlay_portal_poll(p);
   auto stats = inlay_portal_stats(p);
   ok &= stats.uploaded_bytes == 320 * 180 * 4;
-  for (int f = 0; f < 3; ++f) {
+  size_t idle_arena_bytes = 0;
+  for (int f = 0; f < 32; ++f) {
     auto fd = etch_frame_desc_default();
     fd.viewport_w = 700;
     fd.viewport_h = 500;
@@ -84,6 +85,14 @@ int main(int argc, char **argv) {
     etch_end_canvas();
     etch_end_frame(ctx);
     ok &= inlay_portal_sync_geometry(p);
+    const auto frame = etch_frame_stats(ctx);
+    if (f == 4)
+      idle_arena_bytes = frame.arena_used_bytes;
+    if (f > 4)
+      ok &= frame.arena_used_bytes == idle_arena_bytes &&
+            frame.arena_used_bytes < 256 * 1024 && frame.idle_sleeping;
+    ok &= inlay_portal_poll(p) &&
+          inlay_portal_stats(p).uploaded_bytes == stats.uploaded_bytes;
   }
   EtchElementGeometry g = {};
   ok &= etch_element_geometry(etch_id("portal"), &g);
