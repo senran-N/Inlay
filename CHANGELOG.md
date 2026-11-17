@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.3.0] - 2026-11-17
+
+- Add optional QuickJS-NG sandboxed reactive surfaces with memory, stack and tick limits.
+- Cache native UI nodes between events, resolve live theme tokens, bind typed host actions and preserve JSON state through file HMR.
+- Cover timeout/OOM recovery, zero idle JS ticks, timers, native label lifetimes and C99/C++ consumption.
+
 ## [0.2.0] - 2026-11-17
 
 - Add frame-arena native math measurement and drawing with actual font baselines, fractions, radicals, scripts, accents, matrices, stretchy delimiters and Greek/operator symbols.

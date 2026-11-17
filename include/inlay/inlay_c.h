@@ -5,7 +5,7 @@
 #include <stdint.h>
 #include <etch/etch_c.h>
 #define INLAY_VERSION_MAJOR 0
-#define INLAY_VERSION_MINOR 2
+#define INLAY_VERSION_MINOR 3
 #define INLAY_VERSION_PATCH 0
 #define INLAY_STRING_DETAIL(x) #x
 #define INLAY_STRING(x) INLAY_STRING_DETAIL(x)
@@ -51,6 +51,33 @@ uint32_t inlay_doc_block_count(const InlayDoc*);
 const InlayBlock* inlay_doc_block(const InlayDoc*,uint32_t index);
 EtchStr inlay_doc_source(const InlayDoc*);
 InlayDocResult inlay_doc_view(InlayDoc*,const InlayDocViewDesc*);
+
+typedef struct InlaySurface InlaySurface;
+typedef struct InlaySurfaceDesc {size_t memory_limit_bytes,max_stack_bytes;float max_tick_ms;uint32_t max_nodes,max_text_bytes;} InlaySurfaceDesc;
+typedef enum InlayUiKind {INLAY_UI_BOX,INLAY_UI_TEXT,INLAY_UI_BUTTON} InlayUiKind;
+typedef struct InlayUiNode {InlayUiKind kind;uint32_t id,first_child,next_sibling;EtchStr text;} InlayUiNode;
+typedef struct InlaySurfaceViewDesc {uint32_t id;float width_px,height_px;} InlaySurfaceViewDesc;
+/* last_reload_ms measures engine reload; total includes filesystem read latency. */
+typedef struct InlaySurfaceStats {uint64_t js_ticks,reloads;uint32_t node_count;double last_tick_ms,last_reload_ms,last_reload_total_ms;bool has_error;} InlaySurfaceStats;
+/* Callbacks may set state, but must not destroy or recursively dispatch the surface.
+   The host calls poll_hmr periodically while idle; timers advance when view is built. */
+typedef void (*InlayActionFn)(InlaySurface*,EtchStr payload_json,void* user_data);
+InlaySurfaceDesc inlay_surface_desc_default(void);
+InlaySurfaceViewDesc inlay_surface_view_desc_default(void);
+InlaySurface* inlay_surface_create(EtchContext*,const InlaySurfaceDesc*);
+void inlay_surface_destroy(InlaySurface*);
+bool inlay_surface_set_script(InlaySurface*,EtchStr script);
+bool inlay_surface_set_state_json(InlaySurface*,EtchStr json);
+EtchStr inlay_surface_state_json(const InlaySurface*);
+bool inlay_surface_bind_action(InlaySurface*,EtchStr name,InlayActionFn,void* user_data);
+bool inlay_surface_dispatch(InlaySurface*,EtchStr name,EtchStr payload_json);
+bool inlay_surface_enable_hmr(InlaySurface*,const char* script_path);
+bool inlay_surface_poll_hmr(InlaySurface*);
+void inlay_surface_view(InlaySurface*,const InlaySurfaceViewDesc*);
+InlaySurfaceStats inlay_surface_stats(const InlaySurface*);
+EtchStr inlay_surface_error(const InlaySurface*);
+/* Native nodes/text survive until the next script/state/event evaluation. */
+const InlayUiNode* inlay_surface_nodes(const InlaySurface*,uint32_t* count);
 #ifdef __cplusplus
 }
 #endif

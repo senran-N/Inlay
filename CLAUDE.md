@@ -6,7 +6,11 @@ remain frozen; only the trailing block is reparsed. Source offsets survive reall
 Document views use Etch variable-height virtual lists, selectable rich text and
 frame-arena scratch. Context must outlive documents; documents must outlive views.
 Use out-of-source Release builds. C99 ABI remains strict C99; all versions match
-CMake, both public headers and CHANGELOG. QuickJS-NG is the only future script VM.
+CMake, both public headers and CHANGELOG. QuickJS-NG is the only script VM; it is optional behind INLAY_ENABLE_SCRIPT.
+Surfaces own persistent bounded native node/text pools. Only state/events/timers/HMR
+evaluate JavaScript; idle views consume cached nodes. Host callbacks may set state
+but must not destroy the surface or recursively dispatch it. Host code polls HMR
+periodically while the UI sleeps; timers advance when the view is built.
 Native math uses frame-arena box trees and Etch font metrics. Diagrams use a bounded
 arena graph with feedback-edge reversal, layering and barycentric ordering. Document
 views estimate unseen native rows and replace estimates with visible measured bounds;

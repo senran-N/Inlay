@@ -39,3 +39,29 @@ participants, `as` names and `->>` messages. Inputs are bounded to 16KiB, 256 no
 and 1024 edges. Use `canvas_id` for an interactive pan/zoom canvas, or call inside
 an existing Etch canvas. This is a documented Mermaid subset, not the complete grammar.
 `inlay_document --math` and `--diagram` render standalone native examples.
+
+
+Reactive surfaces use optional QuickJS-NG (`INLAY_ENABLE_SCRIPT=ON`). Create an
+`InlaySurface`, set JSON state, and install a script defining `render(state)`.
+`h("box", {axis:"column", gap:8, bg:"var(--etch-bg-elevated)", radius:"panel"},
+h("text", {text:"Hello"}))` builds cached native nodes. Supported tags are box,
+text and button; buttons dispatch their `onClick` action name to `onEvent`.
+Scripts may invoke explicitly bound host `action(name,payload)` callbacks.
+There are no std/os, filesystem or network globals. Defaults are 8MiB VM memory,
+512KiB stack and a 4ms tick budget. Errors display a themed inline card; a new
+script recovers the surface. JS allocation occurs only during explicit updates.
+
+Call `inlay_surface_enable_hmr` with a trusted local path and poll HMR from the
+host event loop, including during idle periods. Reload retains serialized state;
+mtime/size changes trigger evaluation. `setTimeout`/`clearTimeout` are bounded
+one-shot timers serviced by view builds; outstanding timers request redraw.
+Cached node pointers expire on evaluation. View labels are copied to frame
+storage so later state updates cannot invalidate deferred Etch drawing. The
+context outlives its surfaces; callbacks may set state but may not destroy or
+recursively dispatch their surface. With scripts disabled, creation returns null
+and the public ABI remains linkable.
+
+HMR engine timing is reported separately from total filesystem latency in
+`last_reload_ms` and `last_reload_total_ms`; local disk/antivirus latency is outside
+the VM budget. The regression checks median engine reload below 2ms. Promise jobs
+run under the same deadline and settle before native nodes are published.
