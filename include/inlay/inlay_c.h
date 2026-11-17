@@ -5,7 +5,7 @@
 #include <stdint.h>
 #include <etch/etch_c.h>
 #define INLAY_VERSION_MAJOR 0
-#define INLAY_VERSION_MINOR 3
+#define INLAY_VERSION_MINOR 4
 #define INLAY_VERSION_PATCH 0
 #define INLAY_STRING_DETAIL(x) #x
 #define INLAY_STRING(x) INLAY_STRING_DETAIL(x)
@@ -78,6 +78,79 @@ InlaySurfaceStats inlay_surface_stats(const InlaySurface*);
 EtchStr inlay_surface_error(const InlaySurface*);
 /* Native nodes/text survive until the next script/state/event evaluation. */
 const InlayUiNode* inlay_surface_nodes(const InlaySurface*,uint32_t* count);
+/* Windowless portal. Backends own returned pixel spans until the next callback;
+   all callbacks run synchronously on the host UI thread. Context outlives portal.
+   Backend callbacks must not destroy or reenter the portal. */
+typedef struct InlayPortal InlayPortal;
+typedef enum InlayPortalMode {INLAY_PORTAL_MODE_TEXTURE,INLAY_PORTAL_MODE_UNDERLAY} InlayPortalMode;
+typedef struct InlayPortalDirtyRect {
+ uint32_t x,y,width,height,row_pitch_bytes;
+ const void* rgba_pixels;
+} InlayPortalDirtyRect;
+typedef struct InlayPortalBackendVTable {
+ void* (*create)(void* user_data,uint32_t width,uint32_t height);
+ void (*destroy)(void* backend);
+ bool (*load_url)(void* backend,EtchStr url);
+ bool (*load_html)(void* backend,EtchStr html);
+ bool (*resize)(void* backend,uint32_t width,uint32_t height);
+ uint32_t (*poll_dirty_rects)(void* backend,InlayPortalDirtyRect* rects,uint32_t capacity);
+ void (*inject_pointer)(void* backend,EtchVec2 local_pos,bool down);
+ void (*inject_wheel)(void* backend,EtchVec2 delta);
+ void (*inject_key)(void* backend,uint32_t key,bool down,uint16_t mods);
+ void (*inject_text)(void* backend,EtchStr text);
+ bool (*query_ime_rect)(void* backend,EtchRect* out_local);
+ void (*set_underlay_bounds)(void* backend,EtchRect bounds,EtchRect visible_bounds);
+ /* Poll must retain/coalesce dirt until accepted=true; failed uploads retry it. */
+ void (*ack_dirty_rects)(void* backend,bool accepted);
+} InlayPortalBackendVTable;
+typedef struct InlayPortalDesc {
+ uint32_t width,height;
+ InlayPortalMode mode;
+ const InlayPortalBackendVTable* backend; /* NULL selects the built-in mock. */
+ void* backend_user_data;
+} InlayPortalDesc;
+typedef struct InlayPortalViewDesc {uint32_t id;float width,height,radius;} InlayPortalViewDesc;
+typedef struct InlayPortalStats {uint64_t uploaded_bytes;uint32_t uploaded_rects;bool has_texture;} InlayPortalStats;
+InlayPortalDesc inlay_portal_desc_default(void);
+InlayPortal* inlay_portal_create(EtchContext*,const InlayPortalDesc*);
+/* resize/destroy fail while a view may still be queued. After submitting the
+   host frame to the GPU (or discarding ALL its draws), acknowledge completion. */
+bool inlay_portal_destroy(InlayPortal*);
+void inlay_portal_frame_submitted(InlayPortal*);
+bool inlay_portal_load_url(InlayPortal*,EtchStr);
+bool inlay_portal_load_html(InlayPortal*,EtchStr);
+bool inlay_portal_resize(InlayPortal*,uint32_t width,uint32_t height);
+bool inlay_portal_poll(InlayPortal*);
+void inlay_portal_view(InlayPortal*,const InlayPortalViewDesc*);
+/* Call after end_frame to synchronize final bounds. Hidden views send empty bounds. */
+bool inlay_portal_sync_geometry(InlayPortal*);
+bool inlay_portal_inject_pointer(InlayPortal*,EtchVec2 screen_pos,bool down);
+void inlay_portal_inject_wheel(InlayPortal*,EtchVec2);
+void inlay_portal_inject_key(InlayPortal*,uint32_t key,bool down,uint16_t mods);
+void inlay_portal_inject_text(InlayPortal*,EtchStr);
+bool inlay_portal_query_ime_rect(InlayPortal*,EtchRect* out_screen);
+InlayPortalStats inlay_portal_stats(const InlayPortal*);
+const InlayPortalBackendVTable* inlay_portal_mock_backend(void);
+/* Host policy: call after geometry sync. Disable routing while a modal, popup or
+   another surface covers the portal; rectangle visibility cannot prove occlusion.
+   Disabling releases capture. Keyboard/text/wheel require portal focus. */
+void inlay_portal_set_input_enabled(InlayPortal*,bool enabled);
+bool inlay_portal_has_focus(const InlayPortal*);
+/* Deterministic mock animation clock. No wall-clock polling or idle animation. */
+bool inlay_portal_mock_advance(InlayPortal*,uint32_t phase);
+/* Optional Windows native UNDERLAY backend. The host supplies a dedicated HWND
+   BELOW its alpha-composited Etch surface, with the same client origin, and owns
+   STA COM initialization/message pumping/native keyboard and IME dispatch.
+   No OSR texture support. NULL on unsupported/disabled builds. Paths are UTF-8.
+   Options and strings need only survive create; native window outlives backend. */
+typedef struct InlayPortalWebView2Options {
+ void* underlay_hwnd;
+ const char* loader_path;
+ const char* user_data_path;
+void (*completed)(void* user_data,int32_t hresult); /* async; no callback after destroy */
+void* user_data;
+} InlayPortalWebView2Options;
+const InlayPortalBackendVTable* inlay_portal_webview2_backend(void);
 #ifdef __cplusplus
 }
 #endif

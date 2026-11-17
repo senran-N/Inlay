@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.0] - 2026-11-17
+- Add public portal backend ABI, dirty tile retries, texture/underlay views, transformed
+  geometry, focus/capture routing, explicit occlusion policy and IME coordinates.
+- Add deterministic synthetic tiles/caret/animation and optional asynchronous native
+  WebView2 underlay with safe cancellation and platform-disabled stubs.
+- Add integrated Cromma workbench and dual-backend portal/composition regressions.
+- Resolve default native math color from the active theme for light-mode contrast.
+
 ## [0.3.0] - 2026-11-17
 
 - Add optional QuickJS-NG sandboxed reactive surfaces with memory, stack and tick limits.

@@ -29,3 +29,10 @@ THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
+
+Optional Microsoft WebView2 SDK (external, not vendored): the Windows backend
+consumes official WebView2.h through a private include directory and dynamically
+loads the host-supplied WebView2Loader.dll. SDK copyright Microsoft Corporation;
+redistribution follows the BSD-style LICENSE.txt in the official NuGet package.
+Hosts distributing the loader must retain that license. The Edge WebView2 Runtime
+is separately installed by the host; Inlay does not redistribute it.

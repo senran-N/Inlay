@@ -65,3 +65,43 @@ HMR engine timing is reported separately from total filesystem latency in
 `last_reload_ms` and `last_reload_total_ms`; local disk/antivirus latency is outside
 the VM budget. The regression checks median engine reload below 2ms. Promise jobs
 run under the same deadline and settle before native nodes are published.
+
+Windowless portals: `inlay_portal_create` accepts a synchronous
+C99 backend vtable or defaults to the synthetic tile backend. Poll native dirty
+rectangles, build `inlay_portal_view`, then call `inlay_portal_sync_geometry` after
+Etch `end_frame` on the portal's owning context/window. Pointer coordinates enter
+in logical screen pixels; backend coordinates use backing-store pixels. IME
+queries return logical screen rectangles for the host's OS text-input integration.
+The portal tracks focus and pointer capture; the host disables input while other
+UI covers it using `inlay_portal_set_input_enabled`. Captured release can land
+outside the clipped rectangle. Keys, text and wheel require focus. Geometry
+visibility is rectangular and cannot establish sibling or rounded occlusion; the
+host resolves those cases. Polling does not run a browser event loop. Context outlives portal. The mock has an explicit animation clock (`inlay_portal_mock_advance`); unchanged
+phases perform no upload. `cromma_workbench_demo --headless output.png` renders
+the integrated streaming document, native math/diagram, sandbox, terminal, shader
+surface and zoomed portal. Run without flags for the interactive desktop host.
+
+After submitting or discarding the frame's draw commands, call
+`inlay_portal_frame_submitted`. Resize and destroy reject pending views to preserve
+textures referenced by deferred Etch commands. A failed destroy leaves ownership
+with the caller, who must retry after frame submission.
+
+
+Windows native web hosting is optional: configure `INLAY_ENABLE_PORTAL_WEBVIEW2=ON`
+and `INLAY_WEBVIEW2_INCLUDE_DIR` pointing at the official WebView2 SDK include folder.
+The loader/runtime is dynamically probed at creation, with no redistribution or
+link-time browser dependency. Select `inlay_portal_webview2_backend()` and pass
+`InlayPortalWebView2Options` through `backend_user_data`, including absolute UTF-8
+loader/profile paths. The caller initializes STA COM and pumps Windows messages.
+The completion callback reports asynchronous creation failures; it must not reenter
+or destroy the portal. Destroy may precede completion; pending callbacks remain safe.
+
+This backend supports UNDERLAY only. The host provides a dedicated native HWND
+behind an alpha-composited Etch surface with matching client coordinates and owns
+native focus, keyboard and OS IME dispatch. Child-HWND content is hidden under
+partial clipping; rounded masking and desktop alpha composition require host
+window/compositor integration. It does not offer OSR pixels or transformed browser
+input; use a texture-producing backend for those. Linux WPE and macOS WKWebView
+can implement the same public vtable; the built-in web accessor returns NULL when
+disabled or unsupported. No unimplemented native feature is silently mocked.
+Set `INLAY_WEBVIEW2_LOADER` to enable the real-runtime async/destruction smoke test.

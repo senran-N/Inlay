@@ -12,6 +12,13 @@ int main(void) {
   if(!inlay_surface_nodes(scripted,&count) || count!=1)return 1;
   inlay_surface_destroy(scripted);
  }
+ InlayPortalDesc portal_desc=inlay_portal_desc_default();portal_desc.mode=INLAY_PORTAL_MODE_UNDERLAY;
+ InlayPortal* portal=inlay_portal_create(ctx,&portal_desc);
+ inlay_portal_set_input_enabled(portal,false);
+ if(inlay_portal_has_focus(portal) || !inlay_portal_mock_advance(portal,1))return 1;
+ const InlayPortalBackendVTable* web_backend=inlay_portal_webview2_backend();
+ if(web_backend && web_backend->create(NULL,320,240))return 1;
+ if(!portal || !inlay_portal_load_html(portal,ETCH_STR_LIT("C99 portal")) || !inlay_portal_poll(portal) || !inlay_portal_destroy(portal))return 1;
  const InlayMathDesc math=inlay_math_desc_default();
  const InlayDiagramDesc diagram=inlay_diagram_desc_default();
  if(math.font_size_px<=0 || diagram.node_gap_px<=0)return 1;

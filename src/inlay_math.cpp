@@ -226,7 +226,7 @@ InlayMathResult layout(EtchStr tex,float size,const InlayMathDesc* desc) {
 }
 }
 extern "C" {
-InlayMathDesc inlay_math_desc_default(void){return {{0,0},20,{230,235,245,255}};}
+InlayMathDesc inlay_math_desc_default(void){return {{0,0},20,etch_get_theme(etch_current_context()).text_primary};}
 InlayMathResult inlay_measure_math(EtchStr tex,float size){return layout(tex,size,nullptr);}
 InlayMathResult inlay_draw_math(EtchStr tex,const InlayMathDesc* desc){if(!desc || !std::isfinite(desc->pos.x) || !std::isfinite(desc->pos.y))return {};return layout(tex,desc->font_size_px,desc);}
 }

@@ -16,3 +16,8 @@ arena graph with feedback-edge reversal, layering and barycentric ordering. Docu
 views estimate unseen native rows and replace estimates with visible measured bounds;
 they never lay out every offscreen graph. Native callbacks copy source into the frame
 arena so document mutation before end_frame cannot invalidate deferred drawing.
+
+Portals own backend state and texture storage. Poll dirty regions outside a queued
+frame, build view, synchronize geometry after end_frame, and acknowledge frame
+submission before resize/destruction. Input focus/capture are local; host controls
+occlusion policy. Native WebView2 is optional UNDERLAY with host-owned COM/window/IME.

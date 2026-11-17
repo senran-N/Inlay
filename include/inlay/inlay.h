@@ -1,6 +1,9 @@
 #pragma once
 #include "inlay_c.h"
 namespace inlay {
+using Portal=InlayPortal;
+using PortalDesc=InlayPortalDesc;
+using PortalViewDesc=InlayPortalViewDesc;
 using Surface=InlaySurface;
 using SurfaceDesc=InlaySurfaceDesc;
 using SurfaceViewDesc=InlaySurfaceViewDesc;
