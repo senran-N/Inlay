@@ -12,7 +12,7 @@ int main() {
  char input[65536]={};size_t size=0;
  while(size+std::strlen(section)<32768) {std::memcpy(input+size,section,std::strlen(section));size+=std::strlen(section);}
  bool ok=inlay_doc_set_utf8(reference,{input,uint32_t(size),false});
- bool kinds[10]={};for(uint32_t i=0;i<inlay_doc_block_count(reference);++i)kinds[inlay_doc_block(reference,i)->kind]=true;
+ bool kinds[11]={};for(uint32_t i=0;i<inlay_doc_block_count(reference);++i)kinds[inlay_doc_block(reference,i)->kind]=true;
  ok &= kinds[INLAY_PARAGRAPH] && kinds[INLAY_HEADING] && kinds[INLAY_CODE_BLOCK] && kinds[INLAY_ALERT] && kinds[INLAY_TASK_LIST] && kinds[INLAY_TABLE] && kinds[INLAY_THEMATIC_BREAK] && kinds[INLAY_DETAILS];
  const uint32_t chunks[]={1,3,7,64};
  for(uint32_t chunk: chunks) {
@@ -141,6 +141,66 @@ int main() {
   etch_begin_frame(ctx,&f);inlay_doc_view(streamed,&view);etch_end_frame(ctx);
   if(frozen_tokens<=16)ok &= !std::memcmp(saved,cached.tokens,frozen_tokens*sizeof(InlayInline));
  }
+ // Offscreen diagrams must not consume frame scratch for native layout.
+ inlay_doc_clear(streamed);
+ for(uint32_t i=0;i<256;++i)ok &= inlay_doc_append_utf8(streamed,ETCH_STR_LIT("```mermaid\nflowchart TD\nA --> B\n```\n"));
+ etch_begin_frame(ctx,&f);const auto many_diagrams=inlay_doc_view(streamed,&view);
+ const auto remaining_diagram_desc=inlay_diagram_desc_default();
+ ok &= many_diagrams.total_rows==256 && inlay_diagram_layout(ETCH_STR_LIT("flowchart TD\nA --> B"),&remaining_diagram_desc).valid;
+ etch_end_frame(ctx);ok &= etch_frame_stats(ctx).arena_used_bytes<1024u*1024u;
+ // Math block delimiters retain streaming equivalence at every byte boundary.
+ const auto math_source=ETCH_STR_LIT("$$\n\\frac{x}{y}\n$$\n\n\\[\nx^2\n\\]\n");
+ inlay_doc_set_utf8(reference,math_source);inlay_doc_clear(streamed);
+ for(uint32_t i=0;i<math_source.length;++i)ok &= inlay_doc_append_utf8(streamed,{math_source.chars+i,1,false});
+ ok &= inlay_doc_block_count(reference)==2 && inlay_doc_block_count(streamed)==2;
+ for(uint32_t i=0;i<2;++i){const auto a=*inlay_doc_block(reference,i),b=*inlay_doc_block(streamed,i);ok &= a.kind==INLAY_MATH_BLOCK && a.kind==b.kind && a.content_offset==b.content_offset && a.content_length==b.content_length;}
+ const EtchStr closed_math[]={ETCH_STR_LIT("$$x^2$$\n\n# Next\n"),ETCH_STR_LIT("$$x^2$$ \t\n\n# Next\n"),ETCH_STR_LIT("\\[x^2\\] \n\n# Next\n"),ETCH_STR_LIT("  $$\nx^2\n  $$\n\n# Next\n")};
+ for(const auto source:closed_math){inlay_doc_set_utf8(reference,source);inlay_doc_clear(streamed);for(uint32_t i=0;i<source.length;++i)ok &= inlay_doc_append_utf8(streamed,{source.chars+i,1,false});ok &= inlay_doc_block_count(reference)==2 && inlay_doc_block_count(streamed)==2 && inlay_doc_block(streamed,1)->kind==INLAY_HEADING;}
+ // Inline math tokens and Mermaid blocks render in a virtualized native view.
+ ok &= inlay_doc_set_utf8(streamed,ETCH_STR_LIT("Inline $x^2$ and \\(y_1\\).\n\n```mermaid\nflowchart LR\nA --> B\n```\n"));
+ etch_begin_frame(ctx,&f);const auto native=inlay_doc_view(streamed,&view);etch_end_frame(ctx);
+ bool math_token=false;for(uint32_t i=0;i<streamed->views[0].token_count;++i)math_token |= streamed->views[0].tokens[i].kind==4;
+ ok &= math_token && native.total_rows>=2;
+ // Row splits retain both bytes of parenthesized inline-math delimiters.
+ ok &= inlay_doc_set_utf8(streamed,ETCH_STR_LIT("\\(abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz\\)"));
+ etch_begin_frame(ctx,&f);inlay_doc_view(streamed,&narrow_view);etch_end_frame(ctx);
+ ok &= streamed->views[0].count==1 && streamed->views[0].rows[0].length==inlay_doc_source(streamed).length;
+ // Native math reports baseline geometry and bounds recursive input.
+ etch_begin_frame(ctx,&f);
+ const auto atom_math=inlay_measure_math(ETCH_STR_LIT("x"),24);
+ const auto fraction_math=inlay_measure_math(ETCH_STR_LIT("\\frac{x+1}{y}"),24);
+ const auto matrix_math=inlay_measure_math(ETCH_STR_LIT("\\begin{matrix}a&b\\\\c&d\\end{matrix}"),24);
+ const auto delimited_math=inlay_measure_math(ETCH_STR_LIT("\\left(\\frac{x}{y}\\right)"),24);
+ ok &= delimited_math.valid && delimited_math.width>fraction_math.width*.2f;
+ const auto bracket_math=inlay_measure_math(ETCH_STR_LIT("\\begin{bmatrix}a&b\\\\c&d\\end{bmatrix}"),24);
+ const auto tall_script=inlay_measure_math(ETCH_STR_LIT("x^{\\begin{matrix}a\\\\b\\\\c\\\\d\\end{matrix}}"),24);
+ ok &= bracket_math.valid && bracket_math.width>matrix_math.width && tall_script.valid && tall_script.height>atom_math.height;
+ ok &= matrix_math.valid && matrix_math.width>atom_math.width && matrix_math.height>atom_math.height;
+ const auto root_math=inlay_measure_math(ETCH_STR_LIT("\\sqrt{x}"),24);
+ const auto script_math=inlay_measure_math(ETCH_STR_LIT("x_1^2"),24);
+ ok &= atom_math.valid && fraction_math.valid && root_math.valid && script_math.valid;
+ ok &= fraction_math.height>atom_math.height && fraction_math.baseline>atom_math.baseline;
+ ok &= root_math.width>atom_math.width && script_math.height>atom_math.height;
+ ok &= !inlay_measure_math(ETCH_STR_LIT("\\frac{x}"),24).valid;
+ char recursive_math[1024];uint32_t recursive_size=0;
+ for(int level=0;level<100;++level){std::memcpy(recursive_math+recursive_size,"\\sqrt",5);recursive_size+=5;}
+ recursive_math[recursive_size++]='x';
+ ok &= !inlay_measure_math({recursive_math,recursive_size,false},24).valid;
+ const auto diagram_desc=inlay_diagram_desc_default();
+ const auto sample_graph=inlay_diagram_layout(ETCH_STR_LIT("flowchart TD\nA[Stream] --> B[Parse]\nA --> C[Validate]\nB --> D[Render]\nC --> D\nD --> A"),&diagram_desc);
+ ok &= sample_graph.valid;
+ const auto graph=inlay_diagram_layout(ETCH_STR_LIT("flowchart TD\nA[Start] --> B[Middle]\nB --> C[Finish]\nC --> A"),&diagram_desc);
+ ok &= graph.valid && graph.node_count==3 && graph.edge_count==3;
+ for(uint32_t i=0;i<graph.node_count;++i)for(uint32_t j=i+1;j<graph.node_count;++j){const auto a=graph.nodes[i].bounds,b=graph.nodes[j].bounds;ok &= a.x+a.w<=b.x || b.x+b.w<=a.x || a.y+a.h<=b.y || b.y+b.h<=a.y;}
+ const auto sequence=inlay_diagram_layout(ETCH_STR_LIT("sequenceDiagram\nparticipant A as Client\nparticipant B as Server\nA->>B:Request\nB->>A:Reply"),&diagram_desc);
+ ok &= sequence.valid && sequence.sequence && sequence.node_count==2 && sequence.edge_count==2;
+ const auto self_graph=inlay_diagram_layout(ETCH_STR_LIT("flowchart TD\nA --> A"),&diagram_desc);
+ ok &= self_graph.valid && self_graph.width>=self_graph.nodes[0].bounds.w+40;
+ const auto horizontal=inlay_diagram_layout(ETCH_STR_LIT("flowchart LR\nA --> B --> C"),&diagram_desc);
+ ok &= horizontal.valid && horizontal.horizontal && horizontal.nodes[0].bounds.x<horizontal.nodes[2].bounds.x;
+ bool feedback=false;for(uint32_t i=0;i<graph.edge_count;++i)feedback |= graph.edges[i].reversed;
+ ok &= feedback && !inlay_diagram_layout(ETCH_STR_LIT("flowchart TD\nA -->"),&diagram_desc).valid;
+ etch_end_frame(ctx);
  inlay_doc_destroy(reference);inlay_doc_destroy(streamed);etch_destroy_context(ctx);
  std::printf("32KB streaming equivalence: %s\n",ok ? "PASS" : "FAIL");return ok ? 0 : 1;
 }

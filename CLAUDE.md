@@ -7,3 +7,8 @@ Document views use Etch variable-height virtual lists, selectable rich text and
 frame-arena scratch. Context must outlive documents; documents must outlive views.
 Use out-of-source Release builds. C99 ABI remains strict C99; all versions match
 CMake, both public headers and CHANGELOG. QuickJS-NG is the only future script VM.
+Native math uses frame-arena box trees and Etch font metrics. Diagrams use a bounded
+arena graph with feedback-edge reversal, layering and barycentric ordering. Document
+views estimate unseen native rows and replace estimates with visible measured bounds;
+they never lay out every offscreen graph. Native callbacks copy source into the frame
+arena so document mutation before end_frame cannot invalidate deferred drawing.

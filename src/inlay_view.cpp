@@ -14,6 +14,29 @@ void details_range(EtchStr source,const InlayBlock& b,uint32_t* summary,uint32_t
  if(*body<*end)++*body;
  for(uint32_t pos=*body;pos+10<=*end;++pos)if(!std::memcmp(source.chars+pos,"</details>",10)) {*end=pos;break;}
 }
+bool diagram_block(const InlayDoc* doc,const InlayBlock& block) {
+ return block.kind==INLAY_CODE_BLOCK && block.language_length==7 && !std::memcmp(doc->source+block.language_offset,"mermaid",7);
+}
+struct NativeDraw {EtchStr source;float font;bool diagram;};
+void draw_native(EtchRect,void* user) {
+ const auto& draw=*static_cast<NativeDraw*>(user);
+ if(draw.diagram){auto desc=inlay_diagram_desc_default();desc.font_size_px=draw.font;inlay_diagram_view(draw.source,&desc);}
+ else {auto desc=inlay_math_desc_default();desc.font_size_px=draw.font;inlay_draw_math(draw.source,&desc);}
+}
+void native_box(EtchStr source,float font,bool diagram,uint32_t id,float max_width) {
+ float width=0,height=0;
+ if(diagram){auto desc=inlay_diagram_desc_default();desc.font_size_px=font;const auto metrics=inlay_diagram_layout(source,&desc);if(!metrics.valid){etch_text(source,nullptr);return;}width=metrics.width;height=metrics.height;}
+ else {const auto metrics=inlay_measure_math(source,font);if(!metrics.valid){etch_text(source,nullptr);return;}width=metrics.width;height=metrics.height;}
+ auto box=etch_box_desc_default();box.id=id;box.width=etch_sizing_fixed(std::fmin(width,max_width));box.height=etch_sizing_fixed(std::fmin(height+8,4096.f));box.scroll_y=height+8>4096;box.scroll_x=width>max_width;box.clip_children=true;
+ etch_begin_box(&box);
+ auto content=etch_box_desc_default();content.width=etch_sizing_fixed(width);content.height=etch_sizing_fixed(height+8);etch_begin_box(&content);
+ auto* draw=static_cast<NativeDraw*>(etch_frame_arena_alloc(etch_current_context(),sizeof(NativeDraw),alignof(NativeDraw)));
+ if(draw){
+  auto* copy=static_cast<char*>(etch_frame_arena_alloc(etch_current_context(),source.length,1));
+  if(copy){std::memcpy(copy,source.chars,source.length);*draw={{copy,source.length,false},font,diagram};etch_draw_after_layout(draw_native,draw,false);}
+ }
+ etch_end_box();etch_end_box();
+}
 float block_height(uint32_t index,void* user) {
  const auto& m=*static_cast<InlayMeasure*>(user);
  // Etch can request a row between a document mutation and the next view build.
@@ -21,6 +44,12 @@ float block_height(uint32_t index,void* user) {
  auto b=*inlay_doc_block(m.doc,m.rows[index].block);
  if(m.heights[index]>0)return m.heights[index];
  b.content_offset=m.rows[index].offset;b.content_length=m.rows[index].length;
+ if(b.kind==INLAY_MATH_BLOCK || diagram_block(m.doc,b)) {
+  // Unseen rows use estimates. Native layout allocates frame scratch and must
+  // run only for visible rows; measured bounds replace this estimate below.
+  return b.kind==INLAY_MATH_BLOCK ? m.font*4+32 : 200;
+ }
+
  const EtchStr source=inlay_doc_source(m.doc);
  if(b.kind==INLAY_DETAILS) {
   if(!m.open[m.rows[index].block])return m.rows[index].first ? 56.f : 1.f;
@@ -49,10 +78,16 @@ bool cache_inline(InlayMeasure* m,EtchStr source) {
  uint32_t pos=tail;
  while(pos<source.length) {
   uint32_t end=pos;while(end<source.length && source.chars[end]!='\n')++end;
-  uint32_t bracket=pos,paren=pos;bool no_code=false,no_bold=false;
+  uint32_t bracket=pos,paren=pos;bool no_code=false,no_bold=false,no_dollar=false,no_paren_math=false;
   while(pos<end) {
    const uint32_t start=pos;InlayInline token={pos,1,0,0,0};
-   if(source.chars[pos]=='`' && !no_code) {
+   if(source.chars[pos]=='$' && !no_dollar) {
+    uint32_t close=pos+1;while(close<end && source.chars[close]!='$')++close;
+    if(close<end){token={pos+1,close-pos-1,pos,close+1-pos,4};pos=close+1;}else no_dollar=true;
+   } else if(!no_paren_math && pos+1<end && source.chars[pos]=='\\' && source.chars[pos+1]=='(') {
+    uint32_t close=pos+2;while(close+1<end && !(source.chars[close]=='\\' && source.chars[close+1]==')'))++close;
+    if(close+1<end){token={pos+2,close-pos-2,pos,close+2-pos,4};pos=close+2;}else no_paren_math=true;
+   } else if(source.chars[pos]=='`' && !no_code) {
     uint32_t close=pos+1;while(close<end && source.chars[close]!='`')++close;
     if(close<end) {token={pos+1,close-pos-1,0,0,1};pos=close+1;}else no_code=true;
    } else if(source.chars[pos]=='[') {
@@ -67,7 +102,7 @@ bool cache_inline(InlayMeasure* m,EtchStr source) {
     if(close+1<end) {token={pos+2,close-pos-2,0,0,3};pos=close+2;}else no_bold=true;
    }
    if(pos==start) {
-    ++pos;while(pos<end && source.chars[pos]!='`' && source.chars[pos]!='[' && source.chars[pos]!='*')++pos;
+    ++pos;while(pos<end && source.chars[pos]!='`' && source.chars[pos]!='[' && source.chars[pos]!='*' && source.chars[pos]!='$' && source.chars[pos]!='\\')++pos;
     token.length=pos-start;
    }
    if(m->token_count==m->token_capacity) {
@@ -85,20 +120,24 @@ uint32_t finish_inline_row(const InlayMeasure* m,uint32_t stop) {
  // A link destination has no rendered width. Keep it with the label's last row.
  uint32_t low=0,high=m->token_count;
  while(low<high) {const uint32_t mid=low+(high-low)/2;if(m->tokens[mid].offset<=stop)low=mid+1;else high=mid;}
+ if(low<m->token_count){const auto& t=m->tokens[low];if(t.kind==4 && stop>t.url_offset && stop<t.url_offset+t.url_length)return t.url_offset+t.url_length;}
  if(low) {
   const auto& t=m->tokens[low-1];
+  if(t.kind==4 && stop>t.url_offset && stop<t.url_offset+t.url_length)return t.url_offset+t.url_length;
   if(t.kind==2 && stop>=t.offset+t.length && stop<=t.url_offset+t.url_length)
    return t.url_offset+t.url_length+1;
  }
  return stop;
 }
-void rich_line(InlayMeasure* m,EtchStr line,uint32_t base_id,float font,InlayDocResult* result,uint32_t range_start=0,uint32_t range_end=UINT32_MAX) {
+void rich_line(InlayMeasure* m,EtchStr line,uint32_t base_id,float font,InlayDocResult* result,uint32_t range_start=0,uint32_t range_end=UINT32_MAX,float available_width=0) {
+ const float width=available_width>0 ? available_width : std::fmax(1.f,m->width-24);
  const auto source=inlay_doc_source(m->doc);const uint32_t offset=uint32_t(line.chars-source.chars);
  const uint32_t start=offset+range_start,end=offset+(range_end<line.length ? range_end : line.length);
  uint32_t low=0,high=m->token_count;
  while(low<high) {const uint32_t mid=low+(high-low)/2;const auto& t=m->tokens[mid];if(t.offset+t.length<=start)low=mid+1;else high=mid;}
  uint32_t count=0;for(uint32_t i=low;i<m->token_count && m->tokens[i].offset<end;++i)++count;
  if(!count)return;
+ bool math=false;for(uint32_t i=0;i<count;++i)math |= m->tokens[low+i].kind==4;
  auto* spans=static_cast<EtchTextSpan*>(etch_frame_arena_alloc(etch_current_context(),size_t(count)*sizeof(EtchTextSpan),alignof(EtchTextSpan)));if(!spans)return;
  for(uint32_t i=0;i<count;++i) {
   const auto& t=m->tokens[low+i];auto span=etch_text_span_default();span.font_size_px=font;
@@ -110,7 +149,11 @@ void rich_line(InlayMeasure* m,EtchStr line,uint32_t base_id,float font,InlayDoc
   spans[i]=span;
  }
  auto desc=etch_rich_text_desc_default();desc.id=base_id;desc.selectable=true;desc.font_size_px=font;desc.line_height_px=font*1.5f;
- etch_text_spans(spans,count,&desc);
+ if(math) {
+  auto row=etch_box_desc_default();row.width=etch_sizing_fixed(width);row.wrap=true;row.align_y=ETCH_ALIGN_Y_CENTER;etch_begin_box(&row);
+  for(uint32_t i=0;i<count;++i){desc.id=etch_id_index(base_id,i+1);if(m->tokens[low+i].kind==4)native_box(spans[i].text,font,false,desc.id,width);else etch_text_spans(spans+i,1,&desc);}
+  etch_end_box();
+ } else etch_text_spans(spans,count,&desc);
 }
 void code_line(EtchStr line,uint32_t id,float font) {
  if(!line.length) {auto spacer=etch_box_desc_default();spacer.height=etch_sizing_fixed(font*1.5f);etch_box(&spacer);return;}
@@ -148,7 +191,7 @@ void block_lines(InlayMeasure* measure,const InlayBlock& b,EtchStr source,uint32
   const bool continuation=pos>content_start && source.chars[pos-1]!='\n';
   if(b.kind==INLAY_HEADING && !continuation) {uint32_t trim=b.offset;while(trim<logical_end && source.chars[trim]==' ')++trim;trim+=b.level+1;if(logical<trim)logical=trim;}
   EtchStr line=slice(source,logical,logical_end-logical);const uint32_t line_id=etch_id_index(id,++line_index);
-  const auto render_rich=[&](EtchStr text) {const uint32_t offset=uint32_t(text.chars-source.chars);rich_line(measure,text,line_id,font,result,pos>offset ? pos-offset : 0,next>offset ? next-offset : 0);};
+  const auto render_rich=[&](EtchStr text) {const uint32_t offset=uint32_t(text.chars-source.chars);rich_line(measure,text,line_id,font,result,pos>offset ? pos-offset : 0,next>offset ? next-offset : 0,(b.kind==INLAY_LIST || b.kind==INLAY_TASK_LIST) ? std::fmax(1.f,measure->width-32-font) : std::fmax(1.f,measure->width-24));};
   if(b.kind==INLAY_CODE_BLOCK)code_line(line,line_id,font);
   else if(b.kind==INLAY_TABLE) {
    bool delimiter=true;for(uint32_t j=0;j<line.length;++j)if(!std::strchr("|:- \t\r",line.chars[j]))delimiter=false;
@@ -161,7 +204,7 @@ void block_lines(InlayMeasure* measure,const InlayBlock& b,EtchStr source,uint32
      uint32_t stop=start;while(stop<line.length && line.chars[stop]!='|')++stop;
      auto cell=etch_box_desc_default();cell.width=etch_sizing_fixed(cell_width);cell.axis=ETCH_AXIS_COL;etch_begin_box(&cell);
      const uint32_t cell_offset=logical+start;
-     rich_line(measure,{line.chars+start,stop-start,false},etch_id_index(line_id,++cell_index),font,result,pos>cell_offset ? pos-cell_offset : 0,next>cell_offset ? next-cell_offset : 0);etch_end_box();
+     rich_line(measure,{line.chars+start,stop-start,false},etch_id_index(line_id,++cell_index),font,result,pos>cell_offset ? pos-cell_offset : 0,next>cell_offset ? next-cell_offset : 0,cell_width);etch_end_box();
      start=stop<line.length ? stop+1 : line.length;
     }
     etch_end_box();
@@ -216,7 +259,7 @@ extern "C" InlayDocResult inlay_doc_view(InlayDoc* doc,const InlayDocViewDesc* i
   uint32_t needed=0;
   for(uint32_t block=0;block<doc->block_count;++block) {
    const auto& b=doc->blocks[block];uint32_t pos=b.content_offset,end=pos+b.content_length;
-   do {uint32_t stop=(b.kind==INLAY_DETAILS && !measure->open[block]) ? end : pos;while(stop<end && doc->source[stop]!='\n' && (b.kind==INLAY_CODE_BLOCK || b.kind==INLAY_TABLE || stop-pos<limit))++stop;
+   do {uint32_t stop=((b.kind==INLAY_DETAILS && !measure->open[block]) || b.kind==INLAY_MATH_BLOCK || diagram_block(doc,b)) ? end : pos;while(stop<end && doc->source[stop]!='\n' && (b.kind==INLAY_CODE_BLOCK || b.kind==INLAY_TABLE || stop-pos<limit))++stop;
     if(b.kind!=INLAY_CODE_BLOCK && b.kind!=INLAY_TABLE)stop=finish_inline_row(measure,stop);
     while(stop<end && (uint8_t(doc->source[stop])&0xc0)==0x80)++stop;
     if(stop<end && doc->source[stop]=='\n')++stop;
@@ -234,7 +277,7 @@ extern "C" InlayDocResult inlay_doc_view(InlayDoc* doc,const InlayDocViewDesc* i
   uint32_t row=0;
   for(uint32_t block=0;block<doc->block_count;++block) {
    const auto& b=doc->blocks[block];uint32_t pos=b.content_offset,end=pos+b.content_length;
-   do {uint32_t stop=(b.kind==INLAY_DETAILS && !measure->open[block]) ? end : pos;while(stop<end && doc->source[stop]!='\n' && (b.kind==INLAY_CODE_BLOCK || b.kind==INLAY_TABLE || stop-pos<limit))++stop;
+   do {uint32_t stop=((b.kind==INLAY_DETAILS && !measure->open[block]) || b.kind==INLAY_MATH_BLOCK || diagram_block(doc,b)) ? end : pos;while(stop<end && doc->source[stop]!='\n' && (b.kind==INLAY_CODE_BLOCK || b.kind==INLAY_TABLE || stop-pos<limit))++stop;
     if(b.kind!=INLAY_CODE_BLOCK && b.kind!=INLAY_TABLE)stop=finish_inline_row(measure,stop);
     while(stop<end && (uint8_t(doc->source[stop])&0xc0)==0x80)++stop;
     if(stop<end && doc->source[stop]=='\n')++stop;
@@ -266,6 +309,9 @@ extern "C" InlayDocResult inlay_doc_view(InlayDoc* doc,const InlayDocViewDesc* i
   if(b.kind==INLAY_CODE_BLOCK || b.kind==INLAY_ALERT || b.kind==INLAY_BLOCKQUOTE) {box.background=etch_rgba8(24,33,48,255);box.radius=etch_corners_all(8);}
   etch_begin_box(&box);
   if(b.kind==INLAY_THEMATIC_BREAK) {auto rule=etch_box_desc_default();rule.width=etch_sizing_grow(0,0);rule.height=etch_sizing_fixed(1);rule.background=etch_rgba8(80,95,110,255);etch_box(&rule);}
+  else if(b.kind==INLAY_MATH_BLOCK || diagram_block(doc,b)) {
+   native_box(slice(source,b.content_offset,b.content_length),view.font_size_px,b.kind!=INLAY_MATH_BLOCK,etch_id_index(row_id,7),view.width_px-24);
+  }
   else if(b.kind==INLAY_DETAILS) {
    const auto& range=measure->details[measure->rows[i].block];const uint32_t summary=range.summary,summary_end=range.summary_end,body=range.body,end=range.end;
    if(measure->rows[i].first) {

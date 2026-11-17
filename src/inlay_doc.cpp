@@ -36,6 +36,7 @@ InlayBlock classify(const char* text,uint32_t start,uint32_t length) noexcept {
   while(b.level<n && s[b.level]==s[0])++b.level;
   b.language_offset=start+indent+b.level;b.language_length=n-b.level;b.content_offset=start+length;
  }
+ else if(starts(s,n,"$$") || starts(s,n,"\\[")) {b.kind=INLAY_MATH_BLOCK;b.level=s[0]=='$' ? 0u : 1u;b.content_offset=start+indent+2;}
  else if(starts(s,n,"> [!")) {b.kind=INLAY_ALERT;b.content_offset=start+indent+2;}
  else if(starts(s,n,"> ")) {b.kind=INLAY_BLOCKQUOTE;b.content_offset=start+indent+2;}
  else if(starts(s,n,"<details")) {b.kind=INLAY_DETAILS;}
@@ -80,6 +81,13 @@ void parse_tail(InlayDoc* d) noexcept {
     current->length=after-current->offset;current->content_length=pos-current->content_offset;
     if(full) {current->complete=true;d->frozen_count=d->block_count;d->tail_start=after;current=nullptr;}
    } else {current->length=after-current->offset;current->content_length=after-current->content_offset;}
+  } else if(current && current->kind==INLAY_MATH_BLOCK) {
+   const char* close=current->level ? "\\]" : "$$";
+   uint32_t indent=0;while(indent<length && indent<3 && line[indent]==' ')++indent;
+   if(starts(line+indent,length-indent,close)) {
+    current->length=after-current->offset;current->content_length=pos-current->content_offset;
+    if(full){current->complete=true;d->frozen_count=d->block_count;d->tail_start=after;current=nullptr;}
+   } else {current->length=after-current->offset;current->content_length=after-current->content_offset;}
   } else if(current && current->kind==INLAY_DETAILS) {
    current->length=after-current->offset;current->content_length=current->length;
    if(starts(line,length,"</details>") && full) {
@@ -99,6 +107,14 @@ void parse_tail(InlayDoc* d) noexcept {
     d->blocks[d->block_count++]=b;current=&d->blocks[d->block_count-1];
     current->length=after-pos;
     if(b.kind==INLAY_CODE_BLOCK && full) {current->content_offset=after;current->content_length=0;}
+    uint32_t trimmed=length;while(trimmed && (line[trimmed-1]==' ' || line[trimmed-1]=='\t'))--trimmed;
+    if(b.kind==INLAY_MATH_BLOCK && trimmed>=current->content_offset-pos+2) {
+     const char* close=b.level ? "\\]" : "$$";
+     if(!std::memcmp(line+trimmed-2,close,2)) {
+      current->content_length=pos+trimmed-2-current->content_offset;
+      if(full){current->complete=true;d->frozen_count=d->block_count;d->tail_start=after;current=nullptr;}
+     }
+    }
     if(full && (b.kind==INLAY_HEADING || b.kind==INLAY_THEMATIC_BREAK)) {
      current->complete=true;d->frozen_count=d->block_count;d->tail_start=after;current=nullptr;
     }

@@ -2,14 +2,17 @@
 #include <cstdio>
 #include <cstring>
 int main(int argc,char** argv) {
+ const bool diagram=argc>1 && !std::strcmp(argv[1],"--diagram");
+ const bool math=argc>1 && !std::strcmp(argv[1],"--math");
  const bool stress=argc>1 && !std::strcmp(argv[1],"--stress");
- if(argc<2 || (!stress && std::strcmp(argv[1],"--headless"))) {std::puts("Use --headless [output.png]");return 1;}
+ if(argc<2 || (!stress && !math && !diagram && std::strcmp(argv[1],"--headless"))) {std::puts("Use --headless [output.png]");return 1;}
  auto config=etch_context_desc_default();config.headless=true;
  auto* ctx=etch_create_context(&config);if(!ctx)return 1;
  auto* doc=inlay_doc_create(ctx,nullptr);if(!doc) {etch_destroy_context(ctx);return 1;}
  bool ok=inlay_doc_set_utf8(doc,ETCH_STR_LIT(
  "# Inlay / streamed documents\n\nA native document built on **Etch**, with `inline code` and [source links](https://example.org).\n\n"
  "> [!NOTE]\n> Unicode streams retain partial codepoints: 中文 / 😀\n\n"
+ "Inline $x_1^2+x_2^2$ and \\(E=mc^2\\).\n\n$$\n\\frac{a+b}{\\sqrt{x}}\n$$\n\n```mermaid\nflowchart LR\nA[Input] --> B[Output]\n```\n\n"
  "## One surface, many blocks\n\n- [x] UTF-8 carry across chunks\n- [ ] Ship the full document milestone\n\n"
  "```cpp\nconst auto document = stream.next();\n\nint 变量 = 1;\nrender(document);\n```\n\n"
  "| Stage | Status |\n| --- | --- |\n| Streaming | Verified |\n| Rendering | In development |\n\n"
@@ -28,7 +31,14 @@ int main(int argc,char** argv) {
  for(int frame=0;frame<12;++frame) {
   auto desc=etch_frame_desc_default();desc.viewport_w=920;desc.viewport_h=760;etch_begin_frame(ctx,&desc);
   auto box=etch_box_desc_default();box.width=etch_sizing_fixed(920);box.height=etch_sizing_fixed(760);box.padding=etch_padding_all(30);box.background=etch_rgba8(12,18,28,255);
-  etch_begin_box(&box);const auto result=inlay_doc_view(doc,&view);ok &= result.visible_end>result.visible_first;
+  etch_begin_box(&box);
+  if(math) {
+   auto md=inlay_math_desc_default();md.pos={24,36};md.font_size_px=32;
+   const EtchStr samples[]={ETCH_STR_LIT("E=mc^2"),ETCH_STR_LIT("\\frac{a+b}{\\sqrt{x_1^2+x_2^2}}"),ETCH_STR_LIT("\\sum_{i=1}^n i=\\frac{n(n+1)}{2}"),ETCH_STR_LIT("\\begin{matrix}a&b\\\\c&d\\end{matrix}"),ETCH_STR_LIT("\\hat{x}+\\vec{v}+\\overline{AB}"),ETCH_STR_LIT("\\alpha+\\beta=\\gamma")};
+   for(const auto sample:samples){const auto metrics=inlay_draw_math(sample,&md);ok &= metrics.valid;md.pos.y+=metrics.height+30;}
+  }
+  if(diagram){auto dd=inlay_diagram_desc_default();dd.pos={60,40};const auto dg=inlay_diagram_view(ETCH_STR_LIT("flowchart TD\nA[Stream] --> B[Parse]\nA --> C[Validate]\nB --> D[Render]\nC --> D\nD --> A"),&dd);ok &= dg.valid;}
+  const auto result=(math || diagram) ? InlayDocResult{{},0,1,1} : inlay_doc_view(doc,&view);ok &= result.visible_end>result.visible_first;
   total_rows=result.total_rows;last_end=result.visible_end;etch_end_box();etch_end_frame(ctx);
   if(stress && frame==2)etch_virtual_list_scroll_to_row(view.id,total_rows-1,24,ETCH_ALIGN_Y_BOTTOM);
  }
