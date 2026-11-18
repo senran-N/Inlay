@@ -17,29 +17,31 @@ void details_range(EtchStr source,const InlayBlock& b,uint32_t* summary,uint32_t
 bool diagram_block(const InlayDoc* doc,const InlayBlock& block) {
  return block.kind==INLAY_CODE_BLOCK && block.language_length==7 && !std::memcmp(doc->source+block.language_offset,"mermaid",7);
 }
-struct NativeDraw {EtchStr source;float font;bool diagram;EtchTheme theme;};
+struct NativeDraw {EtchStr source;InlayDiagramResult diagram_result;float font;bool diagram;EtchTheme theme;};
 void draw_native(EtchRect,void* user) {
  const auto& draw=*static_cast<NativeDraw*>(user);
  etch_push_theme(&draw.theme);
- if(draw.diagram){auto desc=inlay_diagram_desc_default();desc.font_size_px=draw.font;inlay_diagram_view(draw.source,&desc);}
+ if(draw.diagram){auto desc=inlay_diagram_desc_default();desc.font_size_px=draw.font;inlay_diagram_draw(draw.diagram_result,desc);}
  else {auto desc=inlay_math_desc_default();desc.font_size_px=draw.font;inlay_draw_math(draw.source,&desc);}
  etch_pop_theme();
 }
 void native_box(EtchStr source,float font,bool diagram,uint32_t id,float max_width) {
+ auto* ctx=etch_current_context();
+ auto* copy=source.length ? static_cast<char*>(etch_frame_arena_alloc(ctx,source.length,1)) : nullptr;
+ if(source.length && !copy){etch_text(source,nullptr);return;}
+ if(copy)std::memcpy(copy,source.chars,source.length);
+ const EtchStr copied={copy,source.length,false};
  float width=0,height=0;
- if(diagram){auto desc=inlay_diagram_desc_default();desc.font_size_px=font;const auto metrics=inlay_diagram_layout(source,&desc);if(!metrics.valid){etch_text(source,nullptr);return;}width=metrics.width;height=metrics.height;}
- else {const auto metrics=inlay_measure_math(source,font);if(!metrics.valid){etch_text(source,nullptr);return;}width=metrics.width;height=metrics.height;}
+ InlayDiagramResult diagram_result={};
+ if(diagram){auto desc=inlay_diagram_desc_default();desc.font_size_px=font;diagram_result=inlay_diagram_layout(copied,&desc);if(!diagram_result.valid){etch_text(copied,nullptr);return;}width=diagram_result.width;height=diagram_result.height;}
+ else {const auto metrics=inlay_measure_math(copied,font);if(!metrics.valid){etch_text(copied,nullptr);return;}width=metrics.width;height=metrics.height;}
  auto box=etch_box_desc_default();box.id=id;box.width=etch_sizing_fixed(std::fmin(width,max_width));box.height=etch_sizing_fixed(std::fmin(height+8,4096.f));box.scroll_y=height+8>4096;box.scroll_x=width>max_width;box.clip_children=true;
  etch_begin_box(&box);
  auto content=etch_box_desc_default();content.width=etch_sizing_fixed(width);content.height=etch_sizing_fixed(height+8);etch_begin_box(&content);
- auto* draw=static_cast<NativeDraw*>(etch_frame_arena_alloc(etch_current_context(),sizeof(NativeDraw),alignof(NativeDraw)));
+ auto* draw=static_cast<NativeDraw*>(etch_frame_arena_alloc(ctx,sizeof(NativeDraw),alignof(NativeDraw)));
  if(draw){
-  auto* copy=static_cast<char*>(etch_frame_arena_alloc(etch_current_context(),source.length,1));
-  if(copy){
-   std::memcpy(copy,source.chars,source.length);
-   *draw={{copy,source.length,false},font,diagram,etch_get_theme(etch_current_context())};
-   etch_draw_after_layout(draw_native,draw,false);
-  }
+  *draw={copied,diagram_result,font,diagram,etch_get_theme(ctx)};
+  etch_draw_after_layout(draw_native,draw,false);
  }
  etch_end_box();etch_end_box();
 }
@@ -748,7 +750,7 @@ extern "C" InlayDocResult inlay_doc_view(InlayDoc* doc,const InlayDocViewDesc* i
   const auto& info=measure->rows[i];
   auto b=doc->blocks[info.block];
   b.content_offset=info.offset;b.content_length=info.length;
-  const uint32_t row_id=etch_id_index(etch_id_index(view.id,b.content_offset+1),b.content_length+1);
+  const uint32_t row_id=etch_id_index(etch_id_index(view.id,info.block+1),info.offset-doc->blocks[info.block].content_offset+1);
   if(flow && info.first) {
    if(group_open)etch_end_box();
    auto group=etch_box_desc_default();group.axis=ETCH_AXIS_COL;

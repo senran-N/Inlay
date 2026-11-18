@@ -8,8 +8,8 @@ namespace {
 bool str_equal(EtchStr text,EtchStr expected) {
  return text.length==expected.length && !std::memcmp(text.chars,expected.chars,text.length);
 }
-uint32_t doc_row_id(uint32_t view,const InlayRow& row) {
- return etch_id_index(etch_id_index(view,row.offset+1),row.length+1);
+uint32_t doc_row_id(const InlayDoc* doc,uint32_t view,const InlayRow& row) {
+ return etch_id_index(etch_id_index(view,row.block+1),row.offset-doc->blocks[row.block].content_offset+1);
 }
 bool contains_label(EtchContext* ctx,EtchStr text) {
  for(uint32_t i=0;i<etch_a11y_node_count(ctx,nullptr);++i) {
@@ -77,7 +77,7 @@ bool markdown_and_scroll(EtchContext* ctx,InlayDoc* doc) {
  }
  ok &= table_rows==4;
  const auto& row=cached->rows[cached->count-1];
- const uint32_t id=doc_row_id(view.id,row),scroll_id=etch_id_index(id,2);
+ const uint32_t id=doc_row_id(doc,view.id,row),scroll_id=etch_id_index(id,2);
  const uint32_t copy_id=etch_id_index(id,1),code_id=etch_id_index(scroll_id,1);
  const uint32_t next_line_id=etch_id_index(scroll_id,2);
  const auto card=etch_element_bounds(id),pane=etch_element_bounds(scroll_id);
@@ -322,7 +322,7 @@ bool flow_document(const char* png) {
  const auto settled=frame();
  const auto flow=etch_element_bounds(view.id),footer=etch_element_bounds(etch_id("flow-footer"));
  const auto& cached=doc->views[0];
- const auto bounds=[&](uint32_t index){return etch_element_bounds(doc_row_id(view.id,cached.rows[index]));};
+ const auto bounds=[&](uint32_t index){return etch_element_bounds(doc_row_id(doc,view.id,cached.rows[index]));};
  const auto header=bounds(0),body=bounds(2),last=bounds(3),italic=bounds(5);
  const auto code=etch_element_bounds(chips.code_id),link=etch_element_bounds(chips.link_id);
  ok &= estimate>0 && first.measured_height_px>0 && settled.total_rows==7 &&
@@ -333,7 +333,7 @@ bool flow_document(const char* png) {
  ok &= cached.rows[1].separator && cached.rows[3].last_in_block && bounds(1).h==0 &&
        std::fabs(header.y+header.h-body.y)<.1f && std::fabs(body.y+body.h-last.y)<.1f &&
        std::fabs(last.y+last.h+view.block_gap_px-bounds(4).y)<.1f;
- const auto bold_cell=etch_id_index(doc_row_id(view.id,cached.rows[2]),1);
+ const auto bold_cell=etch_id_index(doc_row_id(doc,view.id,cached.rows[2]),1);
  EtchRect cells[3]={};
  for(uint32_t i=0;i<3;++i)cells[i]=etch_element_bounds(etch_id_index(bold_cell,i+1));
  const float column=view.width_px/3;
@@ -345,7 +345,7 @@ bool flow_document(const char* png) {
        contains_label(ctx,ETCH_STR_LIT("Waffle words")) && italic.h>0 &&
        !contains_label(ctx,ETCH_STR_LIT("Copy code")) && contains_label(ctx,ETCH_STR_LIT("cpp"));
  const auto italic_width=etch_measure_text(ETCH_STR_LIT("Waffle words"),ETCH_FONT_ITALIC,view.font_size_px,0);
- const auto italic_text=etch_element_bounds(etch_id_index(doc_row_id(view.id,cached.rows[5]),1));
+ const auto italic_text=etch_element_bounds(etch_id_index(doc_row_id(doc,view.id,cached.rows[5]),1));
  ok &= italic_width.x>0 && std::fabs(italic_width.x-italic_text.w)<2;
  if(!etch_is_font_loaded(ctx,ETCH_FONT_ITALIC)) {
   const auto fallback=etch_measure_text(ETCH_STR_LIT("Waffle words"),ETCH_FONT_SANS,view.font_size_px,0);
@@ -423,8 +423,8 @@ bool theme_pixels(const char* dark_png,const char* light_png) {
   etch_end_box();etch_end_box();
   etch_pop_theme();etch_end_frame(ctx);
   ok &= graph.valid && etch_render_headless_png(ctx,520,360,paths[i],theme.bg_canvas);
-  const auto row=etch_element_bounds(doc_row_id(view.id,doc->views[0].rows[0]));
-  const auto native=etch_element_bounds(doc_row_id(view.id,doc->views[0].rows[2]));
+  const auto row=etch_element_bounds(doc_row_id(doc,view.id,doc->views[0].rows[0]));
+  const auto native=etch_element_bounds(doc_row_id(doc,view.id,doc->views[0].rows[2]));
   const auto diagram=etch_element_bounds(box.id);
   auto* img=SDL_LoadPNG(paths[i]);
   if(img) {
@@ -442,6 +442,73 @@ bool theme_pixels(const char* dark_png,const char* light_png) {
  std::printf("Document/diagram theme pixels: %s (panel %u/%u, node %u/%u, deferred node %u/%u)\n",
              ok ? "PASS" : "FAIL",panel_light[0],panel_light[1],node_light[0],node_light[1],
              native_light[0],native_light[1]);
+ return ok;
+}
+bool streaming_row_id_and_scroll(EtchContext* ctx,InlayDoc* doc) {
+ auto view=inlay_doc_view_desc_default();view.id=etch_id("stream-row-id-scroll");
+ view.width_px=240;view.height_px=300;
+ auto f=etch_frame_desc_default();f.viewport_w=300;f.viewport_h=320;
+ const auto frame=[&]() {
+  etch_begin_frame(ctx,&f);inlay_doc_view(doc,&view);etch_end_frame(ctx);
+ };
+ bool ok=inlay_doc_set_utf8(doc,ETCH_STR_LIT("Stream "));
+ frame();
+ const InlayMeasure* cached=nullptr;
+ for(const auto& m:doc->views)if(m.id==view.id)cached=&m;
+ if(!cached || !cached->count)return false;
+ const uint32_t para_row_id=doc_row_id(doc,view.id,cached->rows[0]);
+ for(int i=0;i<100;++i) {
+  ok &= inlay_doc_append_utf8(doc,ETCH_STR_LIT("a"));
+  frame();
+  ok &= cached->count>=1 && doc_row_id(doc,view.id,cached->rows[0])==para_row_id;
+ }
+ ok &= inlay_doc_set_utf8(doc,ETCH_STR_LIT(
+  "```cpp\nconst char* wide = \"012345678901234567890123456789012345678901234567890123456789\";\n"));
+ frame();frame();
+ if(!cached->count)return false;
+ const uint32_t code_row_id=doc_row_id(doc,view.id,cached->rows[0]);
+ const uint32_t scroll_id=etch_id_index(code_row_id,2);
+ etch_set_scroll_offset(scroll_id,{80,0},true);
+ frame();
+ const float initial_scroll=etch_scroll_offset(scroll_id).x;
+ ok &= initial_scroll>40.f;
+ for(int i=0;i<200;++i) {
+  const EtchStr token=(i%25==24) ? ETCH_STR_LIT("\n") : ETCH_STR_LIT("x");
+  ok &= inlay_doc_append_utf8(doc,token);
+  frame();
+  ok &= cached->count>=1 && doc_row_id(doc,view.id,cached->rows[0])==code_row_id;
+  ok &= etch_scroll_offset(scroll_id).x>40.f;
+ }
+ if(!ok)std::fprintf(stderr,"Streaming row_id/scroll: para=%u code=%u initial_scroll=%.1f final_scroll=%.1f\n",
+                     para_row_id,code_row_id,initial_scroll,etch_scroll_offset(scroll_id).x);
+ return ok;
+}
+bool mermaid_single_pass_arena(EtchContext* ctx,InlayDoc* doc) {
+ const auto diagram_src=ETCH_STR_LIT("flowchart TD\nA[Start] --> B[Middle]\nB --> C[Finish]\nC --> A");
+ auto f=etch_frame_desc_default();f.viewport_w=400;f.viewport_h=400;
+ etch_begin_frame(ctx,&f);etch_end_frame(ctx);
+ const size_t baseline=etch_frame_stats(ctx).arena_used_bytes;
+ etch_begin_frame(ctx,&f);
+ const auto ddesc=inlay_diagram_desc_default();
+ const auto layout=inlay_diagram_layout(diagram_src,&ddesc);
+ etch_end_frame(ctx);
+ const size_t single_layout_bytes=etch_frame_stats(ctx).arena_used_bytes-baseline;
+ if(!layout.valid || !single_layout_bytes) {
+  std::fprintf(stderr,"Mermaid single pass baseline failed: valid=%d bytes=%zu\n",layout.valid,single_layout_bytes);
+  return false;
+ }
+ auto view=inlay_doc_view_desc_default();view.id=etch_id("mermaid-single-pass");
+ view.width_px=360;view.height_px=0;
+ bool ok=inlay_doc_set_utf8(doc,ETCH_STR_LIT(
+  "```mermaid\nflowchart TD\nA[Start] --> B[Middle]\nB --> C[Finish]\nC --> A\n```\n"));
+ etch_begin_frame(ctx,&f);
+ inlay_doc_view(doc,&view);
+ // Mutate the document before end_frame to confirm deferred diagram draws use frame-arena copies.
+ inlay_doc_clear(doc);
+ etch_end_frame(ctx);
+ const size_t used=etch_frame_stats(ctx).arena_used_bytes;
+ ok &= used>single_layout_bytes && used<single_layout_bytes+single_layout_bytes/2;
+ if(!ok)std::fprintf(stderr,"Mermaid single pass arena: used=%zu single_layout=%zu\n",used,single_layout_bytes);
  return ok;
 }
 }
@@ -543,7 +610,7 @@ int main(int argc,char** argv) {
  ok &= inlay_doc_set_utf8(streamed,ETCH_STR_LIT("This ordinary paragraph has many short words and must wrap inside the narrow document viewport with every word readable."));
  for(int frame=0;frame<3;++frame) {etch_begin_frame(ctx,&f);inlay_doc_view(streamed,&view);etch_end_frame(ctx);}
  const auto rr=streamed->views[0].rows[0];
- const auto row_id=etch_id_index(etch_id_index(view.id,rr.offset+1),rr.length+1);
+ const auto row_id=doc_row_id(streamed,view.id,rr);
  const auto row_bounds=etch_element_bounds(row_id);
  const auto text_bounds=etch_element_bounds(etch_id_index(row_id,1));
  ok &= row_bounds.w<=view.width_px+.1f && text_bounds.h>view.font_size_px*1.5f;
@@ -666,6 +733,8 @@ int main(int argc,char** argv) {
  ok &= inline_decorator_wrapped_code(ctx,streamed);
  ok &= inline_decorator_replacement_height(ctx,streamed);
  ok &= flow_height_after_refresh(ctx,streamed);
+ ok &= streaming_row_id_and_scroll(ctx,streamed);
+ ok &= mermaid_single_pass_arena(ctx,streamed);
  inlay_doc_destroy(reference);inlay_doc_destroy(streamed);etch_destroy_context(ctx);
  ok &= flow_document(nullptr);
  std::printf("32KB streaming equivalence: %s\n",ok ? "PASS" : "FAIL");return ok ? 0 : 1;

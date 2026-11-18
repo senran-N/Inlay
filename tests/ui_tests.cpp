@@ -119,6 +119,104 @@ bool reactive_controls(EtchContext *ctx, const InlaySurfaceDesc &desc) {
     inlay_surface_destroy(surface);
     return ok;
 }
+bool has_rect_prim(EtchContext *ctx, EtchRect bounds, uint32_t fill_rgba, uint32_t border_rgba, bool want_radius) {
+    for (uint32_t i = 0; i < etch_frame_prim_count(ctx); ++i) {
+        EtchPrim prim = {};
+        if (!etch_get_frame_prim(ctx, i, &prim))
+            continue;
+        if (prim.bounds.x < bounds.x - 1.f || prim.bounds.y < bounds.y - 1.f ||
+            prim.bounds.x + prim.bounds.z > bounds.x + bounds.w + 1.f ||
+            prim.bounds.y + prim.bounds.w > bounds.y + bounds.h + 1.f)
+            continue;
+        const bool fill_ok = !fill_rgba || prim.style.y == fill_rgba;
+        const bool border_ok = !border_rgba || prim.style.z == border_rgba;
+        const bool rad_ok = !want_radius || prim.payload.z != 0;
+        if (fill_ok && border_ok && rad_ok)
+            return true;
+    }
+    return false;
+}
+bool has_text_prim(EtchContext *ctx, EtchRect bounds, uint32_t color_rgba) {
+    for (uint32_t i = 0; i < etch_frame_prim_count(ctx); ++i) {
+        EtchPrim prim = {};
+        if (!etch_get_frame_prim(ctx, i, &prim))
+            continue;
+        if (prim.bounds.x >= bounds.x - 1.f && prim.bounds.y >= bounds.y - 1.f &&
+            prim.bounds.x + prim.bounds.z <= bounds.x + bounds.w + 1.f &&
+            prim.bounds.y + prim.bounds.w <= bounds.y + bounds.h + 1.f &&
+            prim.style.y == color_rgba)
+            return true;
+    }
+    return false;
+}
+bool styled_surface_controls(EtchContext *ctx, const InlaySurfaceDesc &desc) {
+    auto *surface = inlay_surface_create(ctx, &desc);
+    if (!surface)
+        return false;
+    bool ok = check(inlay_surface_set_script(surface, ETCH_STR_LIT(
+        "function render(s){return h('box',{id:'root',axis:'column',width:320,height:240,"
+        "bg:'#123456',borderColor:'#abcdef',borderBottom:3,radius:12,alignY:'bottom',padding:10,gap:8},"
+        "h('button',{id:'btn',text:'Save',bg:'#224466',color:'#fefefe',borderColor:'#ff3366',borderWidth:2,"
+        "radius:10,width:140,height:44,fontSize:16,padding:8,onClick:'save'}),"
+        "h('button',{id:'flat',text:'Flat',bg:'#335577',color:'#11ffee',radius:6,width:110,height:36}),"
+        "h('input',{id:'inp',value:'abc',bg:'#102030',color:'#eeeeee',borderColor:'#44cc88',borderWidth:2,"
+        "radius:8,width:200,height:42,fontSize:14,padding:6}));}"
+        "function onEvent(n,v,s){if(n==='save')s.saved=(s.saved||0)+1;}")),
+        "styled surface script");
+    const InlaySurfaceViewDesc view = {etch_id("styled-surface"), 400, 300};
+    uint32_t count = 0;
+    const auto *nodes = inlay_surface_nodes(surface, &count);
+    if (count != 4) {
+        inlay_surface_destroy(surface);
+        return check(false, "styled node count");
+    }
+    const uint32_t root_id = etch_id_index(view.id, nodes[0].id);
+    const uint32_t btn_id = etch_id_index(root_id, nodes[1].id);
+    const uint32_t flat_id = etch_id_index(root_id, nodes[2].id);
+    const uint32_t inp_id = etch_id_index(root_id, nodes[3].id);
+    auto frame = etch_frame_desc_default();
+    frame.viewport_w = 400;
+    frame.viewport_h = 300;
+    etch_begin_frame(ctx, &frame);
+    inlay_surface_view(surface, &view);
+    etch_end_frame(ctx);
+    const auto root_b = etch_element_bounds(root_id);
+    const auto btn_b = etch_element_bounds(btn_id);
+    const auto flat_b = etch_element_bounds(flat_id);
+    const auto inp_b = etch_element_bounds(inp_id);
+    ok &= check(root_b.w == 320 && root_b.h == 240, "styled box dimensions");
+    ok &= check(btn_b.w == 140 && btn_b.h == 44, "styled bordered button dimensions");
+    ok &= check(flat_b.w == 110 && flat_b.h == 36, "styled flat button dimensions");
+    ok &= check(inp_b.w == 200 && inp_b.h == 42, "styled input dimensions");
+    ok &= check(inp_b.y + inp_b.h >= root_b.y + root_b.h - 11.f, "box alignY bottom positions last child at bottom");
+    const uint32_t box_bg = etch_color_pack_rgba8(etch_rgba8(0x12, 0x34, 0x56, 255));
+    const uint32_t box_border = etch_color_pack_rgba8(etch_rgba8(0xab, 0xcd, 0xef, 255));
+    const uint32_t btn_bg = etch_color_pack_rgba8(etch_rgba8(0x22, 0x44, 0x66, 255));
+    const uint32_t btn_fg = etch_color_pack_rgba8(etch_rgba8(0xfe, 0xfe, 0xfe, 255));
+    const uint32_t btn_border = etch_color_pack_rgba8(etch_rgba8(0xff, 0x33, 0x66, 255));
+    const uint32_t flat_bg = etch_color_pack_rgba8(etch_rgba8(0x33, 0x55, 0x77, 255));
+    const uint32_t flat_fg = etch_color_pack_rgba8(etch_rgba8(0x11, 0xff, 0xee, 255));
+    const uint32_t inp_bg = etch_color_pack_rgba8(etch_rgba8(0x10, 0x20, 0x30, 255));
+    const uint32_t inp_fg = etch_color_pack_rgba8(etch_rgba8(0xee, 0xee, 0xee, 255));
+    const uint32_t inp_border = etch_color_pack_rgba8(etch_rgba8(0x44, 0xcc, 0x88, 255));
+    ok &= check(has_rect_prim(ctx, root_b, box_bg, 0, true), "box bg and radius");
+    ok &= check(has_rect_prim(ctx, root_b, box_border, 0, false), "box borderBottom color");
+    ok &= check(has_rect_prim(ctx, btn_b, btn_bg, btn_border, true), "bordered button bg, border and radius");
+    ok &= check(has_text_prim(ctx, btn_b, btn_fg), "bordered button text color");
+    ok &= check(has_rect_prim(ctx, flat_b, flat_bg, 0, true), "flat button bg and radius");
+    ok &= check(has_text_prim(ctx, flat_b, flat_fg), "flat button text color");
+    ok &= check(has_rect_prim(ctx, inp_b, inp_bg, inp_border, true), "input bg, border and radius");
+    ok &= check(has_text_prim(ctx, inp_b, inp_fg), "input text color");
+    ok &= check(etch_perform_a11y_action(btn_id, ETCH_A11Y_ACT_PRESS, 0, {}, ctx, nullptr),
+                "press styled bordered button");
+    etch_begin_frame(ctx, &frame);
+    inlay_surface_view(surface, &view);
+    etch_end_frame(ctx);
+    const auto json = inlay_surface_state_json(surface);
+    ok &= check(json.chars && std::strstr(json.chars, "\"saved\":1"), "styled button onClick fires");
+    inlay_surface_destroy(surface);
+    return ok;
+}
 } // namespace
 int main(int argc, char **argv) {
     auto config = etch_context_desc_default();
@@ -135,6 +233,7 @@ int main(int argc, char **argv) {
         return 1;
     }
     bool ok = reactive_controls(context, functional_desc);
+    ok &= styled_surface_controls(context, functional_desc);
     const auto script = ETCH_STR_LIT(
         "function render(s){return "
         "h('box',{axis:'column',gap:8,padding:12,bg:'var(--etch-bg-elevated)',radius:'panel',"

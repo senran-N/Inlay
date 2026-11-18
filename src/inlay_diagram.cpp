@@ -1,4 +1,4 @@
-#include <inlay/inlay_c.h>
+#include "inlay_internal.h"
 #include <cmath>
 #include <cstring>
 namespace {
@@ -230,25 +230,21 @@ void draw_dashed(const EtchBezierDesc& b) {
 }
 
 }
-extern "C" {
-InlayDiagramDesc inlay_diagram_desc_default(void){return {{0,0},16,24,48,0,640,400};}
-InlayDiagramResult inlay_diagram_layout(EtchStr source,const InlayDiagramDesc* desc){return layout(source,desc);}
-InlayDiagramResult inlay_diagram_view(EtchStr source,const InlayDiagramDesc* input) {
- auto result=layout(source,input);if(!result.valid)return result;
+void inlay_diagram_draw(const InlayDiagramResult& result,const InlayDiagramDesc& input) {
  const auto theme=etch_get_theme(etch_current_context());
- if(input->canvas_id){auto canvas=etch_canvas_desc_default();canvas.id=input->canvas_id;canvas.width=etch_sizing_fixed(input->viewport_width_px);canvas.height=etch_sizing_fixed(input->viewport_height_px);etch_begin_canvas(&canvas); }
- if(result.sequence)for(uint32_t i=0;i<result.node_count;++i){const auto b=result.nodes[i].bounds;EtchLineDesc line={};line.from={b.x+b.w*.5f,b.y+b.h};line.to={line.from.x,input->pos.y+result.height};line.color=theme.border_line;line.thickness=1;etch_draw_line(&line);}
+ if(input.canvas_id){auto canvas=etch_canvas_desc_default();canvas.id=input.canvas_id;canvas.width=etch_sizing_fixed(input.viewport_width_px);canvas.height=etch_sizing_fixed(input.viewport_height_px);etch_begin_canvas(&canvas); }
+ if(result.sequence)for(uint32_t i=0;i<result.node_count;++i){const auto b=result.nodes[i].bounds;EtchLineDesc line={};line.from={b.x+b.w*.5f,b.y+b.h};line.to={line.from.x,input.pos.y+result.height};line.color=theme.border_line;line.thickness=1;etch_draw_line(&line);}
  for(uint32_t i=0;i<result.edge_count;++i) {
   const auto& edge=result.edges[i];const auto a=result.nodes[edge.from].bounds,b=result.nodes[edge.to].bounds;
   auto bezier=etch_bezier_desc_default();bezier.p0={a.x+a.w*.5f,a.y+a.h};bezier.p3={b.x+b.w*.5f,b.y};
   if(result.horizontal){bezier.p0={a.x+a.w,a.y+a.h*.5f};bezier.p3={b.x,b.y+b.h*.5f};}
-  if(result.sequence){const float y=input->pos.y+a.h+float(i+1)*input->rank_gap_px;bezier.p0={a.x+a.w*.5f,y};bezier.p3={b.x+b.w*.5f,y};}
+  if(result.sequence){const float y=input.pos.y+a.h+float(i+1)*input.rank_gap_px;bezier.p0={a.x+a.w*.5f,y};bezier.p3={b.x+b.w*.5f,y};}
   bezier.p1=result.horizontal ? EtchVec2{(bezier.p0.x+bezier.p3.x)*.5f,bezier.p0.y} : EtchVec2{bezier.p0.x,(bezier.p0.y+bezier.p3.y)*.5f};
   bezier.p2=result.horizontal ? EtchVec2{bezier.p1.x,bezier.p3.y} : EtchVec2{bezier.p3.x,bezier.p1.y};
   if(result.sequence){const float third=(bezier.p3.x-bezier.p0.x)/3;bezier.p1={bezier.p0.x+third,bezier.p0.y};bezier.p2={bezier.p3.x-third,bezier.p3.y};}
   if(edge.reversed) {
-   if(result.horizontal){const float route=input->pos.y+result.height;bezier.p0={a.x+a.w*.5f,a.y+a.h};bezier.p3={b.x+b.w*.5f,b.y+b.h};bezier.p1={bezier.p0.x,route};bezier.p2={bezier.p3.x,route};}
-   else {const float route=input->pos.x+result.width;bezier.p0={a.x+a.w,a.y+a.h*.5f};bezier.p3={b.x+b.w,b.y+b.h*.5f};bezier.p1={route,bezier.p0.y};bezier.p2={route,bezier.p3.y};}
+   if(result.horizontal){const float route=input.pos.y+result.height;bezier.p0={a.x+a.w*.5f,a.y+a.h};bezier.p3={b.x+b.w*.5f,b.y+b.h};bezier.p1={bezier.p0.x,route};bezier.p2={bezier.p3.x,route};}
+   else {const float route=input.pos.x+result.width;bezier.p0={a.x+a.w,a.y+a.h*.5f};bezier.p3={b.x+b.w,b.y+b.h*.5f};bezier.p1={route,bezier.p0.y};bezier.p2={route,bezier.p3.y};}
   }
   if(edge.from==edge.to){const float loop_y=result.sequence ? bezier.p0.y : a.y+a.h*.5f,loop_x=result.sequence ? a.x+a.w*.5f : a.x+a.w;bezier.p0={loop_x,loop_y-12};bezier.p3={loop_x,loop_y+12};bezier.p1={loop_x+40,bezier.p0.y};bezier.p2={loop_x+40,bezier.p3.y};}
   bezier.cubic=true;
@@ -259,13 +255,13 @@ InlayDiagramResult inlay_diagram_view(EtchStr source,const InlayDiagramDesc* inp
   const float len=std::sqrt(tangent.x*tangent.x+tangent.y*tangent.y);
   if(len>0){tangent.x/=len;tangent.y/=len;EtchVec2 points[]={bezier.p3,{bezier.p3.x-tangent.x*8-tangent.y*4,bezier.p3.y-tangent.y*8+tangent.x*4},{bezier.p3.x-tangent.x*8+tangent.y*4,bezier.p3.y-tangent.y*8-tangent.x*4}};EtchFilledPolygonDesc arrow={};arrow.points=points;arrow.point_count=3;arrow.fill=bezier.color_start;etch_draw_filled_polygon(&arrow);}
   if(edge.label.length) {
-   const float font=input->font_size_px;
+   const float font=input.font_size_px;
    const auto mid=curve_point(bezier,.5f);
    const auto size=etch_measure_text(edge.label,ETCH_FONT_SANS,font,0);
    const float half=size.x*.5f+4;
-   const float x=std::fmax(input->pos.x+half,std::fmin(mid.x,input->pos.x+result.width-half));
+   const float x=std::fmax(input.pos.x+half,std::fmin(mid.x,input.pos.x+result.width-half));
    const float lift=result.sequence || result.horizontal ? size.y+4 : size.y*.5f;
-   const float y=std::fmax(input->pos.y,mid.y-lift);
+   const float y=std::fmax(input.pos.y,mid.y-lift);
    auto plate=etch_rect_draw_desc_default();plate.rect={x-half,y,half*2,size.y};
    plate.fill=theme.bg_elevated;plate.radius=etch_corners_all(theme.radius_small_px);etch_draw_rect(&plate);
    auto text=etch_text_draw_desc_default();text.text=edge.label;text.pos={x,y};
@@ -275,9 +271,16 @@ InlayDiagramResult inlay_diagram_view(EtchStr source,const InlayDiagramDesc* inp
  }
  for(uint32_t i=0;i<result.node_count;++i) {
   const auto& n=result.nodes[i];auto rect=etch_rect_draw_desc_default();rect.rect=n.bounds;rect.fill=theme.bg_elevated;rect.border_color=theme.border_node;rect.border_width=1;rect.radius=etch_corners_all(theme.radius_control_px);rect.continuous_corners=true;etch_draw_rect(&rect);
-  auto text=etch_text_draw_desc_default();text.text=n.label;text.pos={n.bounds.x+16,n.bounds.y+12};text.size=input->font_size_px;text.color=theme.text_primary;etch_draw_text(&text);
+  auto text=etch_text_draw_desc_default();text.text=n.label;text.pos={n.bounds.x+16,n.bounds.y+12};text.size=input.font_size_px;text.color=theme.text_primary;etch_draw_text(&text);
  }
- if(input->canvas_id)etch_end_canvas();
+ if(input.canvas_id)etch_end_canvas();
+}
+extern "C" {
+InlayDiagramDesc inlay_diagram_desc_default(void){return {{0,0},16,24,48,0,640,400};}
+InlayDiagramResult inlay_diagram_layout(EtchStr source,const InlayDiagramDesc* desc){return layout(source,desc);}
+InlayDiagramResult inlay_diagram_view(EtchStr source,const InlayDiagramDesc* input) {
+ auto result=layout(source,input);if(!result.valid)return result;
+ inlay_diagram_draw(result,*input);
  return result;
 }
 }

@@ -2,6 +2,7 @@
 #include <SDL3/SDL_timer.h>
 #include <SDL3/SDL_filesystem.h>
 #include <SDL3/SDL_iostream.h>
+#include <SDL3/SDL_keycode.h>
 #include <SDL3/SDL_stdinc.h>
 #include <cmath>
 #include <cstdio>
@@ -13,9 +14,13 @@ namespace {
 constexpr uint32_t none = UINT32_MAX;
 constexpr uint32_t input_capacity = 8192;
 struct Style {
-    float width, height, gap, padding, size;
-    EtchStr background, color, radius, action, placeholder;
+    float width, height, gap, padding, size, border_width;
+    EtchPadding border_sides;
+    EtchAlignX align_x;
+    EtchAlignY align_y;
+    EtchStr background, color, border_color, radius, action, placeholder;
     bool column, animate, checked;
+    bool has_padding, has_size, has_border_width, has_align_x, has_align_y;
 };
 struct Action {
     char name[64];
@@ -160,17 +165,27 @@ EtchStr string_prop(InlaySurface *s, JSValueConst object, const char *name) {
     JS_FreeValue(s->js, v);
     return result;
 }
-float number_prop(InlaySurface *s, JSValueConst object, const char *name, float fallback) {
+bool opt_number_prop(InlaySurface *s, JSValueConst object, const char *name, float *out) {
     const auto v = JS_GetPropertyStr(s->js, object, name);
-    double value = fallback;
-    if (!JS_IsUndefined(v) && JS_ToFloat64(s->js, &value, v) < 0)
-        value = fallback;
+    if (JS_IsUndefined(v)) {
+        JS_FreeValue(s->js, v);
+        return false;
+    }
+    double value = *out;
+    if (JS_ToFloat64(s->js, &value, v) < 0)
+        value = *out;
     JS_FreeValue(s->js, v);
     if (!std::isfinite(value) || value < -1 || value > 16384) {
         JS_ThrowTypeError(s->js, "Invalid UI numeric property: %s", name);
-        return fallback;
+        return false;
     }
-    return float(value);
+    *out = float(value);
+    return true;
+}
+float number_prop(InlaySurface *s, JSValueConst object, const char *name, float fallback) {
+    float value = fallback;
+    opt_number_prop(s, object, name, &value);
+    return value;
 }
 bool bool_prop(InlaySurface *s, JSValueConst object, const char *name) {
     const auto v = JS_GetPropertyStr(s->js, object, name);
@@ -180,6 +195,65 @@ bool bool_prop(InlaySurface *s, JSValueConst object, const char *name) {
 }
 bool equal(EtchStr value, const char *text) {
     return value.length == std::strlen(text) && !std::memcmp(value.chars, text, value.length);
+}
+bool parse_align_x(EtchStr value, EtchAlignX *out) {
+    if (equal(value, "left") || equal(value, "start")) {
+        *out = ETCH_ALIGN_X_LEFT;
+        return true;
+    }
+    if (equal(value, "center")) {
+        *out = ETCH_ALIGN_X_CENTER;
+        return true;
+    }
+    if (equal(value, "right") || equal(value, "end")) {
+        *out = ETCH_ALIGN_X_RIGHT;
+        return true;
+    }
+    return false;
+}
+bool parse_align_y(EtchStr value, EtchAlignY *out) {
+    if (equal(value, "top") || equal(value, "start")) {
+        *out = ETCH_ALIGN_Y_TOP;
+        return true;
+    }
+    if (equal(value, "center")) {
+        *out = ETCH_ALIGN_Y_CENTER;
+        return true;
+    }
+    if (equal(value, "bottom") || equal(value, "end")) {
+        *out = ETCH_ALIGN_Y_BOTTOM;
+        return true;
+    }
+    return false;
+}
+void parse_style(InlaySurface *s, JSValueConst props, InlayUiKind kind, Style &style) {
+    style.width = number_prop(s, props, "width", 0);
+    style.height = number_prop(s, props, "height", 0);
+    style.gap = number_prop(s, props, "gap", 0);
+    style.has_padding = opt_number_prop(s, props, "padding", &style.padding);
+    style.size = 15;
+    style.has_size = opt_number_prop(s, props, "fontSize", &style.size);
+    style.background = string_prop(s, props, "bg");
+    style.color = string_prop(s, props, "color");
+    style.border_color = string_prop(s, props, "borderColor");
+    style.has_border_width = opt_number_prop(s, props, "borderWidth", &style.border_width);
+    style.border_sides.top = std::fmax(0.f, number_prop(s, props, "borderTop", 0));
+    style.border_sides.right = std::fmax(0.f, number_prop(s, props, "borderRight", 0));
+    style.border_sides.bottom = std::fmax(0.f, number_prop(s, props, "borderBottom", 0));
+    style.border_sides.left = std::fmax(0.f, number_prop(s, props, "borderLeft", 0));
+    style.radius = string_prop(s, props, "radius");
+    const auto align_x = string_prop(s, props, "alignX");
+    style.has_align_x =
+        parse_align_x(align_x.length ? align_x : string_prop(s, props, "justifyContent"), &style.align_x);
+    const auto align_y = string_prop(s, props, "alignY");
+    style.has_align_y =
+        parse_align_y(align_y.length ? align_y : string_prop(s, props, "alignItems"), &style.align_y);
+    if (kind == INLAY_UI_INPUT || kind == INLAY_UI_TOGGLE)
+        style.action = string_prop(s, props, "onChange");
+    else if (kind == INLAY_UI_BUTTON)
+        style.action = string_prop(s, props, "onClick");
+    style.column = equal(string_prop(s, props, "axis"), "column");
+    style.animate = bool_prop(s, props, "animateLayout");
 }
 uint32_t build(InlaySurface *s, JSValueConst value, uint32_t depth) {
     if (interrupt(s->js, s)) {
@@ -220,21 +294,8 @@ uint32_t build(InlaySurface *s, JSValueConst value, uint32_t depth) {
         JS_ThrowTypeError(s->js, "UI props must be an object");
         return none;
     }
+    parse_style(s, props, n.kind, s->styles[index]);
     auto &style = s->styles[index];
-    style.width = number_prop(s, props, "width", 0);
-    style.height = number_prop(s, props, "height", 0);
-    style.gap = number_prop(s, props, "gap", 0);
-    style.padding = number_prop(s, props, "padding", 0);
-    style.size = number_prop(s, props, "fontSize", 15);
-    style.background = string_prop(s, props, "bg");
-    style.color = string_prop(s, props, "color");
-    style.radius = string_prop(s, props, "radius");
-    if (n.kind == INLAY_UI_INPUT || n.kind == INLAY_UI_TOGGLE)
-        style.action = string_prop(s, props, "onChange");
-    else if (n.kind == INLAY_UI_BUTTON)
-        style.action = string_prop(s, props, "onClick");
-    style.column = equal(string_prop(s, props, "axis"), "column");
-    style.animate = bool_prop(s, props, "animateLayout");
     const auto id = string_prop(s, props, "id");
     if (id.length) {
         n.id = 2166136261u;
@@ -573,19 +634,39 @@ EtchColor color(EtchStr value, EtchTheme theme, EtchColor fallback) {
         return theme.bg_surface;
     if (equal(value, "var(--etch-bg-canvas)"))
         return theme.bg_canvas;
+    if (equal(value, "var(--etch-bg-input)"))
+        return theme.bg_input;
+    if (equal(value, "var(--etch-surface-control)"))
+        return theme.surface_control;
     if (equal(value, "var(--etch-accent)"))
         return theme.accent;
+    if (equal(value, "var(--etch-accent-primary)"))
+        return theme.accent_primary;
     if (equal(value, "var(--etch-text-primary)"))
         return theme.text_primary;
     if (equal(value, "var(--etch-text-secondary)"))
         return theme.text_secondary;
+    if (equal(value, "var(--etch-text-body)"))
+        return theme.text_body;
     if (equal(value, "var(--etch-border-subtle)"))
         return theme.border_subtle;
+    if (equal(value, "var(--etch-border-line)"))
+        return theme.border_line;
+    if (equal(value, "var(--etch-border-input)"))
+        return theme.border_input;
+    if (equal(value, "var(--etch-border-control)"))
+        return theme.border_control;
     if (equal(value, "var(--etch-text-muted)"))
         return theme.text_muted;
-    if (value.length == 7 && value.chars[0] == '#') {
-        uint32_t rgb = 0;
-        for (uint32_t i = 1; i < 7; ++i) {
+    if (equal(value, "var(--etch-danger)"))
+        return theme.danger;
+    if (equal(value, "var(--etch-on-primary)"))
+        return theme.on_primary;
+    if (equal(value, "transparent"))
+        return etch_rgba8(0, 0, 0, 0);
+    if ((value.length == 7 || value.length == 9) && value.chars[0] == '#') {
+        uint32_t rgba = 0;
+        for (uint32_t i = 1; i < value.length; ++i) {
             const char c = value.chars[i];
             const int digit = c >= '0' && c <= '9'   ? c - '0'
                               : c >= 'a' && c <= 'f' ? c - 'a' + 10
@@ -593,11 +674,40 @@ EtchColor color(EtchStr value, EtchTheme theme, EtchColor fallback) {
                                                      : -1;
             if (digit < 0)
                 return fallback;
-            rgb = (rgb << 4) | uint32_t(digit);
+            rgba = (rgba << 4) | uint32_t(digit);
         }
-        return etch_rgba8(uint8_t(rgb >> 16), uint8_t(rgb >> 8), uint8_t(rgb), 255);
+        if (value.length == 7)
+            return etch_rgba8(uint8_t(rgba >> 16), uint8_t(rgba >> 8), uint8_t(rgba), 255);
+        return etch_rgba8(uint8_t(rgba >> 24), uint8_t(rgba >> 16), uint8_t(rgba >> 8),
+                          uint8_t(rgba));
     }
     return fallback;
+}
+float parse_radius(EtchStr value, const EtchTheme &theme, float fallback) {
+    if (!value.length)
+        return fallback;
+    if (equal(value, "panel"))
+        return theme.radius_panel_px;
+    if (equal(value, "control"))
+        return theme.radius_control_px;
+    if (equal(value, "input"))
+        return theme.radius_input_px;
+    if (equal(value, "small"))
+        return theme.radius_small_px;
+    if (equal(value, "pill"))
+        return theme.radius_pill_px;
+    char buf[32] = {};
+    if (value.length < sizeof(buf)) {
+        std::memcpy(buf, value.chars, value.length);
+        char *end = nullptr;
+        const float r = std::strtof(buf, &end);
+        if (end != buf && *end == '\0' && std::isfinite(r) && r >= 0 && r <= 16384)
+            return r;
+    }
+    return fallback;
+}
+bool has_border_sides(EtchPadding sides) {
+    return sides.left > 0 || sides.right > 0 || sides.top > 0 || sides.bottom > 0;
 }
 EtchStr frame_text(InlaySurface *s, EtchStr text) {
     return etch_frame_arena_push_str(s->etch, text.chars, text.length);
@@ -652,6 +762,7 @@ void draw_node(InlaySurface *s, uint32_t index, uint32_t parent, const EtchTheme
     const auto &n = s->nodes[index];
     const auto &st = s->styles[index];
     const uint32_t id = etch_id_index(parent, n.id);
+    const bool sides = has_border_sides(st.border_sides);
     if (n.kind == INLAY_UI_BOX) {
         auto box = etch_box_desc_default();
         box.id = id;
@@ -663,22 +774,111 @@ void draw_node(InlaySurface *s, uint32_t index, uint32_t parent, const EtchTheme
                      : st.height > 0 ? etch_sizing_fixed(st.height)
                                      : etch_sizing_fit(0, 0);
         box.gap = st.gap;
-        box.padding = etch_padding_all(st.padding);
+        box.padding = etch_padding_all(std::fmax(0.f, st.padding));
+        box.align_x = st.align_x;
+        box.align_y = st.align_y;
         box.background = color(st.background, theme, {});
-        box.radius = etch_corners_all(equal(st.radius, "panel")     ? theme.radius_panel_px
-                                      : equal(st.radius, "control") ? theme.radius_control_px
-                                                                    : 0);
+        box.border_width = st.has_border_width ? std::fmax(0.f, st.border_width) : 0.f;
+        box.border_sides = st.border_sides;
+        if (st.border_color.length || box.border_width > 0 || sides)
+            box.border_color = color(st.border_color, theme, theme.border_subtle);
+        box.radius = etch_corners_all(parse_radius(st.radius, theme, 0));
         box.animate_layout = st.animate;
         etch_begin_box(&box);
         for (uint32_t at = n.first_child; at != none; at = s->nodes[at].next_sibling)
             draw_node(s, at, id, theme, events);
         etch_end_box();
     } else if (n.kind == INLAY_UI_BUTTON) {
-        auto button = etch_button_desc_default();
-        button.id = id;
-        button.label = frame_text(s, n.text);
-        if (etch_button(&button))
-            queue_event(s, events, st.action, ETCH_STR_LIT("null"));
+        const EtchStr label = frame_text(s, n.text);
+        const float border_w = st.has_border_width ? std::fmax(0.f, st.border_width) : 0.f;
+        if (border_w > 0 || sides) {
+            auto box = etch_box_desc_default();
+            box.id = id;
+            if (st.width < 0)
+                box.width = etch_sizing_grow(0, 0);
+            else if (st.width > 0)
+                box.width = etch_sizing_fixed(st.width);
+            if (st.height < 0)
+                box.height = etch_sizing_grow(0, 0);
+            else
+                box.height = etch_sizing_fixed(st.height > 0 ? st.height : 32.f);
+            box.padding = st.has_padding ? etch_padding_all(std::fmax(0.f, st.padding))
+                                         : etch_padding_xy(14, 0);
+            box.gap = 8;
+            box.align_x = st.has_align_x ? st.align_x : ETCH_ALIGN_X_CENTER;
+            box.align_y = st.has_align_y ? st.align_y : ETCH_ALIGN_Y_CENTER;
+            box.background = st.background.length
+                                 ? color(st.background, theme, theme.surface_control)
+                                 : theme.surface_control;
+            box.hover_background = etch_color_blend_over(
+                box.background,
+                {theme.text_primary.r, theme.text_primary.g, theme.text_primary.b, 26});
+            box.border_color = color(st.border_color, theme, theme.border_subtle);
+            box.border_width = border_w;
+            box.border_sides = st.border_sides;
+            box.radius = etch_corners_all(parse_radius(st.radius, theme, theme.radius_control_px));
+            box.focusable = true;
+            etch_begin_box(&box);
+            EtchA11yOverrideDesc ov = {};
+            ov.element_id = id;
+            ov.role = ETCH_A11Y_BUTTON;
+            ov.label = label;
+            ov.actions_mask = 3u;
+            ov.has_role = true;
+            ov.has_label = true;
+            ov.has_actions_mask = true;
+            etch_set_a11y_override(&ov);
+            auto text = etch_text_desc_default();
+            text.font_size_px = st.has_size && st.size > 0 ? st.size : 13.f;
+            text.color =
+                st.color.length ? color(st.color, theme, theme.text_primary) : theme.text_primary;
+            text.wrap = false;
+            etch_text(label, &text);
+            etch_end_box();
+            if (etch_hovered(id))
+                etch_set_cursor(ETCH_CURSOR_HAND);
+            if (etch_clicked(id) ||
+                (etch_focused(id) && (etch_key_pressed(SDLK_RETURN, false) ||
+                                      etch_key_pressed(SDLK_KP_ENTER, false) ||
+                                      etch_key_pressed(SDLK_SPACE, false))))
+                queue_event(s, events, st.action, ETCH_STR_LIT("null"));
+        } else {
+            auto button = etch_button_desc_default();
+            button.id = id;
+            button.label = label;
+            if (st.width < 0)
+                button.width = etch_sizing_grow(0, 0);
+            else if (st.width > 0)
+                button.width = etch_sizing_fixed(st.width);
+            if (st.height < 0)
+                button.height = etch_sizing_grow(0, 0);
+            else if (st.height > 0)
+                button.height = etch_sizing_fixed(st.height);
+            if (st.has_padding)
+                button.padding = etch_padding_all(std::fmax(0.f, st.padding));
+            if (st.has_size && st.size > 0)
+                button.font_size_px = st.size;
+            if (st.radius.length)
+                button.radius =
+                    etch_corners_all(parse_radius(st.radius, theme, theme.radius_control_px));
+            if (st.has_align_x)
+                button.align_x = st.align_x;
+            const bool custom_theme = st.background.length || st.color.length;
+            if (custom_theme) {
+                auto btn_theme = theme;
+                if (st.background.length)
+                    btn_theme.surface_control =
+                        color(st.background, theme, theme.surface_control);
+                if (st.color.length)
+                    btn_theme.text_primary = color(st.color, theme, theme.text_primary);
+                etch_push_theme(&btn_theme);
+            }
+            const bool pressed = etch_button(&button);
+            if (custom_theme)
+                etch_pop_theme();
+            if (pressed)
+                queue_event(s, events, st.action, ETCH_STR_LIT("null"));
+        }
     } else if (n.kind == INLAY_UI_INPUT) {
         auto input = etch_text_input_desc_default();
         input.id = id;
@@ -687,7 +887,23 @@ void draw_node(InlaySurface *s, uint32_t index, uint32_t parent, const EtchTheme
             input.width = etch_sizing_grow(0, 0);
         else if (st.width > 0)
             input.width = etch_sizing_fixed(st.width);
-        input.font_size_px = st.size;
+        if (st.height < 0)
+            input.height = etch_sizing_grow(0, 0);
+        else if (st.height > 0)
+            input.height = etch_sizing_fixed(st.height);
+        if (st.has_padding)
+            input.padding = etch_padding_all(std::fmax(0.f, st.padding));
+        input.font_size_px = st.size > 0 ? st.size : 15;
+        if (st.background.length)
+            input.background = color(st.background, theme, input.background);
+        if (st.color.length)
+            input.text_color = color(st.color, theme, input.text_color);
+        if (st.border_color.length)
+            input.border_color = color(st.border_color, theme, input.border_color);
+        if (st.has_border_width)
+            input.border_width = std::fmax(0.f, st.border_width);
+        if (st.radius.length)
+            input.radius = etch_corners_all(parse_radius(st.radius, theme, theme.radius_input_px));
         // Etch keeps editing, selection, and IME state by ID and copies the
         // display text during the call. Each widget supplies its controlled value.
         uint32_t length = n.text.length;

@@ -49,3 +49,4 @@ struct InlayDoc {
  InlayMeasure views[16];
  char utf8_carry[4];uint8_t utf8_carry_len;
 };
+void inlay_diagram_draw(const InlayDiagramResult& result,const InlayDiagramDesc& input);

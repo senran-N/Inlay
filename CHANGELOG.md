@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.8.0] - 2026-11-19
+
+- Require Etch 0.20 and stabilize streaming document `row_id` without `content_length` so chunked appends preserve `StateMap` and code-block horizontal scroll.
+- Evaluate Mermaid diagram layout once per frame in document views while keeping frame-arena source copies safe for deferred drawing.
+- Forward full box, button, and text-input style properties (`bg`, `color`, `borderColor`, `borderWidth`, `borderTop`/`Right`/`Bottom`/`Left`, `radius`, `width`, `height`, `padding`, `fontSize`, `alignX`/`justifyContent`, `alignY`/`alignItems`) in `InlaySurface`.
+
 ## [0.7.0] - 2026-11-18
 
 - Require Etch 0.19 and add auto-height document flow with a cached height query.
