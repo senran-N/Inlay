@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.6.0] - 2026-11-18
+
+- Follow the active Etch theme in documents and diagrams, reserve scrollbar
+  clearance, and make unwrapped code content horizontally scrollable.
+- Support nested inline styles, strikethrough, emphasis, and escaped table pipes.
+- Add Mermaid edge labels, dashed arrows, and flowchart subgraph syntax.
+- Add controlled input and toggle nodes with JSON change events and zero idle JS ticks.
+- Add Release CI for CPU tests, C99, guardrails, and downstream consumers.
+
 ## [0.5.0] - 2026-11-18
 
 - Require Etch 0.18 for the pre-1.0 cross-repository release candidate.

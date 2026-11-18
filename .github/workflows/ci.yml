@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-release:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: Inlay
+    env:
+      VSLANG: "1033"
+      VCPKG_DEFAULT_TRIPLET: x64-windows
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: Inlay
+      - uses: actions/checkout@v4
+        with:
+          repository: senran-N/Etch
+          ref: v0.18.1
+          path: Etch
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Install build dependencies
+        run: |
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) {
+            choco install ninja --yes --no-progress
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          }
+          & "$env:VCPKG_INSTALLATION_ROOT/vcpkg.exe" install sdl3:x64-windows harfbuzz:x64-windows
+      - name: Configure Release
+        run: >-
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+          -DVCPKG_TARGET_TRIPLET=x64-windows -DETCH_COMPILE_SHADERS=OFF
+          -DINLAY_BUILD_EXAMPLES=ON -DINLAY_BUILD_TESTS=ON -DINLAY_INSTALL=ON
+      - name: Build
+        run: cmake --build build --parallel
+      - name: CPU, C99 ABI, guardrails, and downstream consumers
+        run: >-
+          ctest --test-dir build --output-on-failure --no-tests=error
+          -R '^(streaming_equivalence|inlay_c_abi_smoke|inlay_repo_guardrails|inlay_downstream_consumers)$'
+      - name: Verify workspace cleanliness
+        if: always()
+        run: |
+          foreach ($repo in @('.', '../Etch')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $repo '.git'))) { continue }
+            $status = git -C $repo status --porcelain
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+            $pngs = Get-ChildItem -LiteralPath $repo -Filter '*.png' -File -Force
+            if ($status -or $pngs) {
+              $status
+              $pngs | ForEach-Object { $_.FullName }
+              throw "Build or tests left artifacts in $repo"
+            }
+          }

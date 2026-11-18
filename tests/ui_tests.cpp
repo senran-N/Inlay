@@ -1,5 +1,6 @@
 #include <inlay/inlay_c.h>
 #include <SDL3/SDL_timer.h>
+#include <SDL3/SDL_events.h>
 #include <SDL3/SDL_iostream.h>
 #include <cstdio>
 #include <cstring>
@@ -41,6 +42,83 @@ void action(InlaySurface *surface, EtchStr payload, void *user) {
     if (payload.length)
         inlay_surface_set_state_json(surface, ETCH_STR_LIT("{\"count\":9}"));
 }
+bool reactive_controls(EtchContext *ctx, const InlaySurfaceDesc &desc) {
+    auto *surface = inlay_surface_create(ctx, &desc);
+    if (!surface)
+        return false;
+    bool ok = check(inlay_surface_set_script(surface, ETCH_STR_LIT(
+        "function render(s){return h('box',{axis:'column',width:200,bg:'var(--etch-border-subtle)'},"
+        "h('input',{value:s.query||'',placeholder:'Filter...',onChange:'setQuery',width:-1}),"
+        "h('input',{value:'other'}),h('toggle',{label:'Live',checked:!!s.live,onChange:'setLive'}),"
+        "h('text',{text:'status',color:'var(--etch-text-muted)'}));}"
+        "function onEvent(n,v,s){if(n==='setQuery')s.query=v;if(n==='setLive')s.live=v;}")),
+        "input and toggle script");
+    uint32_t count = 0;
+    const auto *nodes = inlay_surface_nodes(surface, &count);
+    if (count != 5 || nodes[1].kind != INLAY_UI_INPUT || nodes[3].kind != INLAY_UI_TOGGLE) {
+        inlay_surface_destroy(surface);
+        return check(false, "input and toggle cached nodes");
+    }
+    const InlaySurfaceViewDesc view = {etch_id("reactive-controls"), 300, 200};
+    const uint32_t root = etch_id_index(view.id,nodes[0].id);
+    const uint32_t input = etch_id_index(root,nodes[1].id);
+    const uint32_t toggle = etch_id_index(root,nodes[3].id);
+    auto frame = etch_frame_desc_default();
+    frame.viewport_w = 300;frame.viewport_h = 200;
+    const auto step = [&] {
+        etch_begin_frame(ctx, &frame);
+        inlay_surface_view(surface, &view);
+        etch_end_frame(ctx);
+    };
+    const auto ticks = [&] { return inlay_surface_stats(surface).js_ticks; };
+    const auto before = ticks();
+    step();step();
+    ok &= check(ticks() == before, "idle controls run zero JS ticks");
+    ok &= check(etch_element_bounds(input).w >= 199, "input grow width");
+    ok &= check(etch_perform_a11y_action(input, ETCH_A11Y_ACT_FOCUS, 0, {}, ctx, nullptr),
+                "focus input");
+    step();
+    SDL_Event event = {};
+    event.type = SDL_EVENT_TEXT_EDITING;
+    event.edit.text = "拼";
+    event.edit.start = 1;
+    etch_process_event(ctx, &event);
+    step();
+    ok &= check(ticks() == before, "IME composition runs zero JS ticks");
+    event = {};
+    event.type = SDL_EVENT_TEXT_INPUT;
+    event.text.text = "拼\"\\";
+    etch_process_event(ctx, &event);
+    step();
+    ok &= check(ticks() == before+1, "committed edit dispatched once");
+    auto json = inlay_surface_state_json(surface);
+    ok &= check(json.chars && !std::strcmp(json.chars, "{\"query\":\"拼\\\"\\\\\"}"),
+                "JSON quotes, backslash and UTF-8 survive input");
+    event.text.text = "字";
+    etch_process_event(ctx, &event);
+    step();
+    json = inlay_surface_state_json(surface);
+    ok &= check(ticks() == before+2 && json.chars &&
+                !std::strcmp(json.chars, "{\"query\":\"拼\\\"\\\\字\"}"),
+                "successive controlled edits preserve caret and text");
+    ok &= check(etch_perform_a11y_action(toggle, ETCH_A11Y_ACT_PRESS, 0, {}, ctx, nullptr),
+                "activate toggle");
+    step();step();
+    json = inlay_surface_state_json(surface);
+    ok &= check(ticks() == before+3 && json.chars && std::strstr(json.chars, "\"live\":true"),
+                "toggle dispatches true once");
+    ok &= check(etch_perform_a11y_action(toggle, ETCH_A11Y_ACT_PRESS, 0, {}, ctx, nullptr),
+                "activate toggle again");
+    step();step();
+    json = inlay_surface_state_json(surface);
+    ok &= check(ticks() == before+4 && json.chars && std::strstr(json.chars, "\"live\":false"),
+                "toggle dispatches false once");
+    for (uint32_t i = 0; i < 16; ++i)
+        step();
+    ok &= check(ticks() == before+4, "controls return to idle without JS ticks");
+    inlay_surface_destroy(surface);
+    return ok;
+}
 } // namespace
 int main(int argc, char **argv) {
     auto config = etch_context_desc_default();
@@ -56,7 +134,7 @@ int main(int argc, char **argv) {
         etch_destroy_context(context);
         return 1;
     }
-    bool ok = true;
+    bool ok = reactive_controls(context, functional_desc);
     const auto script = ETCH_STR_LIT(
         "function render(s){return "
         "h('box',{axis:'column',gap:8,padding:12,bg:'var(--etch-bg-elevated)',radius:'panel',"

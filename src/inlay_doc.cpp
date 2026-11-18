@@ -53,14 +53,6 @@ InlayBlock classify(const char* text,uint32_t start,uint32_t length) noexcept {
  }
  b.content_length=start+length-b.content_offset;return b;
 }
-bool table_rule(const char* s,uint32_t n) noexcept {
- uint32_t dashes=0;bool pipe=false;
- for(uint32_t i=0;i<n;++i) {
-  if(s[i]=='-')++dashes;else if(s[i]=='|')pipe=true;
-  else if(s[i]!=':' && s[i]!=' ' && s[i]!='\t')return false;
- }
- return pipe && dashes>=3;
-}
 void parse_tail(InlayDoc* d) noexcept {
  d->block_count=d->frozen_count;
  uint32_t pos=d->tail_start;InlayBlock* current=nullptr;
@@ -98,7 +90,7 @@ void parse_tail(InlayDoc* d) noexcept {
    d->frozen_count=d->block_count;d->tail_start=after;current=nullptr;
   } else if(!blank) {
    InlayBlock b=classify(line,pos,length);
-   if(current && current->kind==INLAY_PARAGRAPH && table_rule(line,length))current->kind=INLAY_TABLE;
+   if(current && current->kind==INLAY_PARAGRAPH && inlay_table_rule(line,length))current->kind=INLAY_TABLE;
    const bool continuing=current && (current->kind==b.kind || (current->kind==INLAY_ALERT && b.kind==INLAY_BLOCKQUOTE) || (current->kind==INLAY_TABLE && std::memchr(line,'|',length)));
    if(continuing) {
     current->length=after-current->offset;current->content_length=after-current->content_offset;

@@ -1,9 +1,154 @@
 #include <inlay/inlay.h>
 #include <cstdio>
+#include <SDL3/SDL_surface.h>
 #include "../src/inlay_internal.h"
 #include <cmath>
 #include <cstring>
-int main() {
+namespace {
+bool str_equal(EtchStr text,EtchStr expected) {
+ return text.length==expected.length && !std::memcmp(text.chars,expected.chars,text.length);
+}
+uint32_t doc_row_id(uint32_t view,const InlayRow& row) {
+ return etch_id_index(etch_id_index(view,row.offset+1),row.length+1);
+}
+bool contains_label(EtchContext* ctx,EtchStr text) {
+ for(uint32_t i=0;i<etch_a11y_node_count(ctx,nullptr);++i) {
+  EtchA11yNode node={};
+  if(etch_get_a11y_node(i,&node,ctx,nullptr) && str_equal(node.label,text))return true;
+ }
+ return false;
+}
+bool markdown_and_scroll(EtchContext* ctx,InlayDoc* doc) {
+ const auto input=ETCH_STR_LIT(
+  "**bold with `code` and [link](https://example.org) and *emphasis* and ~~strike~~**\n\n"
+  "***both*** and ~~*both again*~~\n"
+  "**one****two** and ***nested** outside*\n"
+  "***solo** remains\n"
+  "Literal runs a~b a~~~b a****b\n\n"
+  "| Key | Value |\n| --- | --- |\n| x\\|y | `a\\|b` |\n| **strong** | *soft* |\n\n"
+  "```cpp\nconst auto first = \"abcdefghijklmnopqrstuvwxyz abcdefghijklmnopqrstuvwxyz abcdefghijklmnopqrstuvwxyz\";\n"
+  "return abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz;\n```\n");
+ inlay_doc_clear(doc);
+ bool ok=true;
+ const InlayDocViewDesc view={etch_id("rich-markdown"),320,720,15};
+ auto f=etch_frame_desc_default();f.viewport_w=360;f.viewport_h=720;
+ const auto frame=[&](){
+  etch_begin_frame(ctx,&f);inlay_doc_view(doc,&view);etch_end_frame(ctx);
+ };
+ for(uint32_t pos=0;pos<input.length;) {
+  const uint32_t left=input.length-pos,n=left<7 ? left : 7;
+  ok &= inlay_doc_append_utf8(doc,{input.chars+pos,n,false});
+  pos+=n;frame();
+ }
+ for(uint32_t i=0;i<3;++i)frame();
+ const InlayMeasure* cached=nullptr;
+ for(const auto& m:doc->views)if(m.id==view.id)cached=&m;
+ if(!cached)return false;
+ uint32_t previous_end=0,found=0;
+ for(uint32_t i=0;i<cached->token_count;++i) {
+  const auto& t=cached->tokens[i];
+  ok &= t.offset>=previous_end;
+  previous_end=t.offset+t.length;
+  const EtchStr text={input.chars+t.offset,t.length,false};
+  if(str_equal(text,ETCH_STR_LIT("code")) && t.flags==(InlayInlineCode|InlayInlineBold))found|=1;
+  if(str_equal(text,ETCH_STR_LIT("link")) && t.flags==(InlayInlineLink|InlayInlineBold) &&
+     str_equal({input.chars+t.url_offset,t.url_length,false},ETCH_STR_LIT("https://example.org")))found|=2;
+  if(str_equal(text,ETCH_STR_LIT("emphasis")) && t.flags==(InlayInlineEmphasis|InlayInlineBold))found|=4;
+  if(str_equal(text,ETCH_STR_LIT("strike")) && t.flags==(InlayInlineStrike|InlayInlineBold))found|=8;
+  if(str_equal(text,ETCH_STR_LIT("both")) && t.flags==(InlayInlineBold|InlayInlineEmphasis))found|=16;
+  if(str_equal(text,ETCH_STR_LIT("both again")) && t.flags==(InlayInlineStrike|InlayInlineEmphasis))found|=32;
+  if(str_equal(text,ETCH_STR_LIT("one")) && t.flags==InlayInlineBold)found|=64;
+  if(str_equal(text,ETCH_STR_LIT("two")) && t.flags==InlayInlineBold)found|=128;
+  if(str_equal(text,ETCH_STR_LIT("nested")) && t.flags==(InlayInlineBold|InlayInlineEmphasis))found|=256;
+  if(str_equal(text,ETCH_STR_LIT(" outside")) && t.flags==InlayInlineEmphasis)found|=512;
+  if(str_equal(text,ETCH_STR_LIT("*")) && !t.flags)found|=1024;
+  if(str_equal(text,ETCH_STR_LIT("solo")) && t.flags==InlayInlineBold)found|=2048;
+  if(str_equal(text,ETCH_STR_LIT("Literal runs a~b a~~~b a****b")) && !t.flags)found|=4096;
+ }
+ ok &= found==8191 && str_equal(inlay_doc_source(doc),input);
+ ok &= contains_label(ctx,ETCH_STR_LIT(" x|y ")) && contains_label(ctx,ETCH_STR_LIT(" a|b "));
+ uint32_t table_rows=0;
+ for(uint32_t i=0;i<cached->count;++i) {
+  const auto& table=cached->rows[i];
+  if(table.kind!=INLAY_TABLE)continue;
+  ok &= table.first==(table_rows==0) && table.separator==(table_rows==1) &&
+        table.zebra==(table_rows==3);
+  ++table_rows;
+ }
+ ok &= table_rows==4;
+ const auto& row=cached->rows[cached->count-1];
+ const uint32_t id=doc_row_id(view.id,row),scroll_id=etch_id_index(id,2);
+ const uint32_t copy_id=etch_id_index(id,1),code_id=etch_id_index(scroll_id,1);
+ const uint32_t next_line_id=etch_id_index(scroll_id,2);
+ const auto card=etch_element_bounds(id),pane=etch_element_bounds(scroll_id);
+ const auto copy=etch_element_bounds(copy_id),line=etch_element_bounds(code_id),next=etch_element_bounds(next_line_id);
+ ok &= row.kind==INLAY_CODE_BLOCK && row.first && std::fabs(card.w-308)<.1f;
+ ok &= pane.w>0 && pane.w<card.w && copy.y+copy.h<=pane.y && line.w>pane.w && next.y>line.y;
+ etch_set_scroll_offset(scroll_id,{100,0},true);
+ frame();frame();
+ const auto scrolled_line=etch_element_bounds(code_id),scrolled_next=etch_element_bounds(next_line_id);
+ ok &= etch_scroll_offset(scroll_id).x>0 && scrolled_line.x<line.x-50 && scrolled_next.x<next.x-50;
+ ok &= std::fabs(etch_element_bounds(copy_id).x-copy.x)<.1f;
+ if(!ok)std::printf("Markdown/scroll: styles=%u, card=%.1f, pane=%.1f, line=%.1f, x=%.1f / %.1f\n",
+                    found,card.w,pane.w,line.w,line.x,scrolled_line.x);
+ return ok;
+}
+bool sample_pixel(SDL_Surface* img,int x,int y,EtchColor expected,unsigned* brightness) {
+ EtchColor pixel={};
+ if(!SDL_ReadSurfacePixel(img,x,y,&pixel.r,&pixel.g,&pixel.b,&pixel.a))return false;
+ *brightness=unsigned(pixel.r)+pixel.g+pixel.b;
+ return std::abs(int(pixel.r)-expected.r)<=8 && std::abs(int(pixel.g)-expected.g)<=8 &&
+        std::abs(int(pixel.b)-expected.b)<=8;
+}
+bool theme_pixels(const char* dark_png,const char* light_png) {
+ auto cfg=etch_context_desc_default();cfg.headless=true;
+ auto* ctx=etch_create_context(&cfg);if(!ctx)return false;
+ auto* doc=inlay_doc_create(ctx,nullptr);
+ bool ok=inlay_doc_set_utf8(doc,ETCH_STR_LIT(
+  "> [!NOTE]\n> Check panel contrast\n\n```mermaid\nflowchart TD\nA[Plan] --> B[Run]\n```\n"));
+ const InlayDocViewDesc view={etch_id("theme-document"),232,360,15};
+ const char* paths[]={dark_png,light_png};
+ const EtchTheme themes[]={etch_theme_dark(),etch_theme_light()};
+ unsigned panel_light[2]={},node_light[2]={},native_light[2]={};
+ for(uint32_t i=0;i<2;++i) {
+  const auto& theme=themes[i];etch_set_theme(&themes[1-i],ctx);
+  auto f=etch_frame_desc_default();f.viewport_w=520;f.viewport_h=360;
+  etch_begin_frame(ctx,&f);
+  etch_push_theme(&theme);
+  auto layout=etch_box_desc_default();layout.width=etch_sizing_fixed(520);layout.gap=40;
+  etch_begin_box(&layout);inlay_doc_view(doc,&view);
+  auto box=etch_box_desc_default();box.id=etch_id("theme-diagram");
+  box.width=etch_sizing_fixed(220);box.height=etch_sizing_fixed(220);etch_begin_box(&box);
+  auto desc=inlay_diagram_desc_default();desc.pos={12,12};
+  const auto graph=inlay_diagram_view(ETCH_STR_LIT("flowchart TD\nA[Plan] -->|ship| B[Run]\nB -. retry .-> A"),&desc);
+  const auto node=graph.valid ? graph.nodes[0].bounds : EtchRect{};
+  etch_end_box();etch_end_box();
+  etch_pop_theme();etch_end_frame(ctx);
+  ok &= graph.valid && etch_render_headless_png(ctx,520,360,paths[i],theme.bg_canvas);
+  const auto row=etch_element_bounds(doc_row_id(view.id,doc->views[0].rows[0]));
+  const auto native=etch_element_bounds(doc_row_id(view.id,doc->views[0].rows[2]));
+  const auto diagram=etch_element_bounds(box.id);
+  auto* img=SDL_LoadPNG(paths[i]);
+  if(img) {
+   ok &= sample_pixel(img,int(row.x+row.w-20),int(row.y+18),theme.bg_elevated,&panel_light[i]);
+   ok &= sample_pixel(img,int(diagram.x+node.x+node.w-10),int(diagram.y+node.y+18),
+                      theme.bg_elevated,&node_light[i]);
+   ok &= sample_pixel(img,int(native.x+22),int(native.y+30),theme.bg_elevated,&native_light[i]);
+   SDL_DestroySurface(img);
+  } else ok=false;
+ }
+ ok &= panel_light[1]>panel_light[0]+300 && node_light[1]>node_light[0]+300 &&
+       native_light[1]>native_light[0]+300;
+ ok &= etch_frame_stats(ctx).draw_call_count<=3;
+ inlay_doc_destroy(doc);etch_destroy_context(ctx);
+ std::printf("Document/diagram theme pixels: %s (panel %u/%u, node %u/%u, deferred node %u/%u)\n",
+             ok ? "PASS" : "FAIL",panel_light[0],panel_light[1],node_light[0],node_light[1],
+             native_light[0],native_light[1]);
+ return ok;
+}
+}
+int main(int argc,char** argv) {
+ if(argc==3)return theme_pixels(argv[1],argv[2]) ? 0 : 1;
  auto config=etch_context_desc_default();config.headless=true;
  auto* ctx=etch_create_context(&config);if(!ctx)return 1;
  auto* reference=inlay_doc_create(ctx,nullptr);auto* streamed=inlay_doc_create(ctx,nullptr);
@@ -159,7 +304,7 @@ int main() {
  // Inline math tokens and Mermaid blocks render in a virtualized native view.
  ok &= inlay_doc_set_utf8(streamed,ETCH_STR_LIT("Inline $x^2$ and \\(y_1\\).\n\n```mermaid\nflowchart LR\nA --> B\n```\n"));
  etch_begin_frame(ctx,&f);const auto native=inlay_doc_view(streamed,&view);etch_end_frame(ctx);
- bool math_token=false;for(uint32_t i=0;i<streamed->views[0].token_count;++i)math_token |= streamed->views[0].tokens[i].kind==4;
+ bool math_token=false;for(uint32_t i=0;i<streamed->views[0].token_count;++i)math_token |= (streamed->views[0].tokens[i].flags&InlayInlineMath)!=0;
  ok &= math_token && native.total_rows>=2;
  // Row splits retain both bytes of parenthesized inline-math delimiters.
  ok &= inlay_doc_set_utf8(streamed,ETCH_STR_LIT("\\(abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz\\)"));
@@ -192,8 +337,21 @@ int main() {
  const auto graph=inlay_diagram_layout(ETCH_STR_LIT("flowchart TD\nA[Start] --> B[Middle]\nB --> C[Finish]\nC --> A"),&diagram_desc);
  ok &= graph.valid && graph.node_count==3 && graph.edge_count==3;
  for(uint32_t i=0;i<graph.node_count;++i)for(uint32_t j=i+1;j<graph.node_count;++j){const auto a=graph.nodes[i].bounds,b=graph.nodes[j].bounds;ok &= a.x+a.w<=b.x || b.x+b.w<=a.x || a.y+a.h<=b.y || b.y+b.h<=a.y;}
- const auto sequence=inlay_diagram_layout(ETCH_STR_LIT("sequenceDiagram\nparticipant A as Client\nparticipant B as Server\nA->>B:Request\nB->>A:Reply"),&diagram_desc);
+ const auto sequence=inlay_diagram_layout(ETCH_STR_LIT("sequenceDiagram\nparticipant A as Client\nparticipant B as Server\nA->>B:Request\nB-->>A:Reply"),&diagram_desc);
  ok &= sequence.valid && sequence.sequence && sequence.node_count==2 && sequence.edge_count==2;
+ if(sequence.valid && sequence.edge_count==2)ok &= !sequence.edges[0].dashed && sequence.edges[1].dashed;
+ const auto labeled=inlay_diagram_layout(ETCH_STR_LIT(
+  "flowchart LR\nsubgraph Outer\nA -->|fetch data| B\nsubgraph Inner\n"
+  "B -- parse data --> C -.-> D\nend\nD -. retry .-> A\nend"),&diagram_desc);
+ ok &= labeled.valid && labeled.node_count==4 && labeled.edge_count==4;
+ if(labeled.valid && labeled.edge_count==4) {
+  ok &= str_equal(labeled.edges[0].label,ETCH_STR_LIT("fetch data")) && !labeled.edges[0].dashed;
+  ok &= str_equal(labeled.edges[1].label,ETCH_STR_LIT("parse data")) && !labeled.edges[1].dashed;
+  ok &= labeled.edges[2].dashed && !labeled.edges[2].label.length;
+  ok &= labeled.edges[3].dashed && labeled.edges[3].reversed &&
+        str_equal(labeled.edges[3].label,ETCH_STR_LIT("retry"));
+ }
+ ok &= !inlay_diagram_layout(ETCH_STR_LIT("flowchart TD\nsubgraph Open\nA --> B"),&diagram_desc).valid;
  const auto self_graph=inlay_diagram_layout(ETCH_STR_LIT("flowchart TD\nA --> A"),&diagram_desc);
  ok &= self_graph.valid && self_graph.width>=self_graph.nodes[0].bounds.w+40;
  const auto horizontal=inlay_diagram_layout(ETCH_STR_LIT("flowchart LR\nA --> B --> C"),&diagram_desc);
@@ -201,6 +359,7 @@ int main() {
  bool feedback=false;for(uint32_t i=0;i<graph.edge_count;++i)feedback |= graph.edges[i].reversed;
  ok &= feedback && !inlay_diagram_layout(ETCH_STR_LIT("flowchart TD\nA -->"),&diagram_desc).valid;
  etch_end_frame(ctx);
+ ok &= markdown_and_scroll(ctx,streamed);
  inlay_doc_destroy(reference);inlay_doc_destroy(streamed);etch_destroy_context(ctx);
  std::printf("32KB streaming equivalence: %s\n",ok ? "PASS" : "FAIL");return ok ? 0 : 1;
 }

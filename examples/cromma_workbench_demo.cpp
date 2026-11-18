@@ -187,11 +187,12 @@ int main(int argc, char **argv) {
   if (app.document) {
     const char *chunks[] = {
         "# A native research loop\n\n",
-        "**Plan:** stream evidence into a document, then inspect the live "
-        "tool.\n\n",
+        "**Plan with `evidence` and [sources](https://example.org)**, then "
+        "inspect the *live* tool. ~~Manual refresh~~\n\n",
+        "| Evidence | Status |\n| --- | --- |\n| Search \\| verify | **Ready** |\n\n",
+        "```mermaid\nflowchart TD\nsubgraph Research\nA[Plan] -->|query| B[Browser]\n"
+        "B -- evidence --> C[Inspect]\nC -. refine .-> A\nend\n```\n\n",
         "## Confidence model\n\n$$\\frac{a+b}{\\sqrt{x_1^2+x_2^2}}$$\n\n",
-        "```mermaid\nflowchart TD\nA[Plan] --> B[Browser]\nB --> C[Inspect]\nC "
-        "--> A\n```\n\n",
         "- [x] Native math and diagrams\n- [x] Sandboxed inspector\n- [x] "
         "Zoomed portal\n\n"};
     for (const auto *chunk : chunks)
@@ -203,12 +204,14 @@ int main(int argc, char **argv) {
     ok &= inlay_surface_set_script(
         app.inspector,
         ETCH_STR_LIT(
-            "function render(){return "
-            "h('box',{axis:'column',gap:16},h('text',{text:'Agent / "
-            "browser'}),h('text',{text:'Runtime: "
-            "QuickJS-NG'}),h('text',{text:'Memory limit: 8 "
-            "MiB'}),h('text',{text:'Tick budget: 4 ms'}),h('text',{text:'Idle: "
-            "cached native tree'}))}"));
+            "function render(s){return "
+            "h('box',{axis:'column',width:-1,gap:12},h('text',{text:'Runtime: QuickJS-NG'}),"
+            "h('input',{value:s.query||'',placeholder:'Filter...',onChange:'setQuery',width:-1}),"
+            "h('toggle',{label:'Live',checked:!!s.live,onChange:'setLive'}),"
+            "h('text',{color:'var(--etch-text-muted)',text:s.query||'All evidence'}),"
+            "h('text',{text:'Tick budget: 4 ms'}),h('text',{text:'Idle: cached native tree'}))}"
+            "function onEvent(name,payload,s){if(name==='setLive')s.live=payload;"
+            "if(name==='setQuery')s.query=payload;}"));
   const char *lines[] = {"$ cromma open native-workbench",
                          "[doc] streaming UTF-8 / math / mermaid",
                          "[ui] sandbox inspector mounted",

@@ -11,10 +11,11 @@
 #include <quickjs.h>
 namespace {
 constexpr uint32_t none = UINT32_MAX;
+constexpr uint32_t input_capacity = 8192;
 struct Style {
     float width, height, gap, padding, size;
-    EtchStr background, color, radius, action;
-    bool column, animate;
+    EtchStr background, color, radius, action, placeholder;
+    bool column, animate, checked;
 };
 struct Action {
     char name[64];
@@ -38,6 +39,7 @@ struct InlaySurface {
     uint32_t node_count, text_used;
     char *state;
     char *json_scratch;
+    char edit_buffer[input_capacity];
     char *source;
     uint32_t source_capacity, state_size, state_capacity;
     char error[1024], path[1024];
@@ -193,7 +195,8 @@ uint32_t build(InlaySurface *s, JSValueConst value, uint32_t depth) {
     const uint32_t index = s->node_count++;
     auto &n = s->nodes[index];
     n = {INLAY_UI_TEXT, index + 1, none, none, {}};
-    s->styles[index] = {0, 0, 0, 0, 15, {}, {}, {}, {}, false, false};
+    s->styles[index] = {};
+    s->styles[index].size = 15;
     if (!JS_IsObject(value)) {
         n.text = copy_text(s, value);
         return index;
@@ -203,6 +206,10 @@ uint32_t build(InlaySurface *s, JSValueConst value, uint32_t depth) {
         n.kind = INLAY_UI_BOX;
     else if (equal(tag, "button"))
         n.kind = INLAY_UI_BUTTON;
+    else if (equal(tag, "input"))
+        n.kind = INLAY_UI_INPUT;
+    else if (equal(tag, "toggle"))
+        n.kind = INLAY_UI_TOGGLE;
     else if (!equal(tag, "text")) {
         JS_ThrowTypeError(s->js, "Unknown UI tag");
         return none;
@@ -222,7 +229,10 @@ uint32_t build(InlaySurface *s, JSValueConst value, uint32_t depth) {
     style.background = string_prop(s, props, "bg");
     style.color = string_prop(s, props, "color");
     style.radius = string_prop(s, props, "radius");
-    style.action = string_prop(s, props, "onClick");
+    if (n.kind == INLAY_UI_INPUT || n.kind == INLAY_UI_TOGGLE)
+        style.action = string_prop(s, props, "onChange");
+    else if (n.kind == INLAY_UI_BUTTON)
+        style.action = string_prop(s, props, "onClick");
     style.column = equal(string_prop(s, props, "axis"), "column");
     style.animate = bool_prop(s, props, "animateLayout");
     const auto id = string_prop(s, props, "id");
@@ -231,7 +241,14 @@ uint32_t build(InlaySurface *s, JSValueConst value, uint32_t depth) {
         for (uint32_t i = 0; i < id.length; ++i)
             n.id = (n.id ^ uint8_t(id.chars[i])) * 16777619u;
     }
-    n.text = string_prop(s, props, "text");
+    if (n.kind == INLAY_UI_INPUT) {
+        n.text = string_prop(s, props, "value");
+        style.placeholder = string_prop(s, props, "placeholder");
+    } else if (n.kind == INLAY_UI_TOGGLE) {
+        n.text = string_prop(s, props, "label");
+        style.checked = bool_prop(s, props, "checked");
+    } else
+        n.text = string_prop(s, props, "text");
     JS_FreeValue(s->js, props);
     const auto children = JS_GetPropertyStr(s->js, value, "children");
     if (JS_IsArray(children)) {
@@ -562,6 +579,10 @@ EtchColor color(EtchStr value, EtchTheme theme, EtchColor fallback) {
         return theme.text_primary;
     if (equal(value, "var(--etch-text-secondary)"))
         return theme.text_secondary;
+    if (equal(value, "var(--etch-border-subtle)"))
+        return theme.border_subtle;
+    if (equal(value, "var(--etch-text-muted)"))
+        return theme.text_muted;
     if (value.length == 7 && value.chars[0] == '#') {
         uint32_t rgb = 0;
         for (uint32_t i = 1; i < 7; ++i) {
@@ -581,7 +602,53 @@ EtchColor color(EtchStr value, EtchTheme theme, EtchColor fallback) {
 EtchStr frame_text(InlaySurface *s, EtchStr text) {
     return etch_frame_arena_push_str(s->etch, text.chars, text.length);
 }
-void draw_node(InlaySurface *s, uint32_t index, uint32_t parent, EtchTheme theme, char *clicked) {
+struct WidgetEvent {
+    WidgetEvent *next;
+    EtchStr name, payload;
+};
+struct WidgetEvents { WidgetEvent *first, *last; };
+
+void queue_event(InlaySurface *s, WidgetEvents *events, EtchStr name, EtchStr payload) {
+    if (!name.length || name.length >= 64 || !payload.length)
+        return;
+    auto *event = static_cast<WidgetEvent *>(
+        etch_frame_arena_alloc(s->etch, sizeof(WidgetEvent), alignof(WidgetEvent)));
+    if (!event)
+        return;
+    const auto copy = frame_text(s, name);
+    if (!copy.chars)
+        return;
+    *event = {nullptr, copy, payload};
+    if (events->last)
+        events->last->next = event;
+    else
+        events->first = event;
+    events->last = event;
+}
+EtchStr input_json(EtchContext *ctx, const char *text, uint32_t length) {
+    auto *json = static_cast<char *>(etch_frame_arena_alloc(ctx, size_t(length)*6+2, 1));
+    if (!json)
+        return {};
+    constexpr char hex[] = "0123456789abcdef";
+    uint32_t out = 0;
+    json[out++] = '"';
+    for (uint32_t i = 0; i < length; ++i) {
+        const auto c = uint8_t(text[i]);
+        if (c == '"' || c == '\\') {
+            json[out++] = '\\';
+            json[out++] = char(c);
+        } else if (c < 32) {
+            std::memcpy(json+out, "\\u00", 4);
+            out += 4;
+            json[out++] = hex[c>>4];
+            json[out++] = hex[c&15];
+        } else
+            json[out++] = char(c);
+    }
+    json[out++] = '"';
+    return {json, out, false};
+}
+void draw_node(InlaySurface *s, uint32_t index, uint32_t parent, const EtchTheme &theme, WidgetEvents *events) {
     const auto &n = s->nodes[index];
     const auto &st = s->styles[index];
     const uint32_t id = etch_id_index(parent, n.id);
@@ -604,16 +671,48 @@ void draw_node(InlaySurface *s, uint32_t index, uint32_t parent, EtchTheme theme
         box.animate_layout = st.animate;
         etch_begin_box(&box);
         for (uint32_t at = n.first_child; at != none; at = s->nodes[at].next_sibling)
-            draw_node(s, at, id, theme, clicked);
+            draw_node(s, at, id, theme, events);
         etch_end_box();
     } else if (n.kind == INLAY_UI_BUTTON) {
         auto button = etch_button_desc_default();
         button.id = id;
         button.label = frame_text(s, n.text);
-        if (etch_button(&button) && st.action.length < 64) {
-            std::memcpy(clicked, st.action.chars, st.action.length);
-            clicked[st.action.length] = 0;
+        if (etch_button(&button))
+            queue_event(s, events, st.action, ETCH_STR_LIT("null"));
+    } else if (n.kind == INLAY_UI_INPUT) {
+        auto input = etch_text_input_desc_default();
+        input.id = id;
+        input.placeholder = frame_text(s, st.placeholder);
+        if (st.width < 0)
+            input.width = etch_sizing_grow(0, 0);
+        else if (st.width > 0)
+            input.width = etch_sizing_fixed(st.width);
+        input.font_size_px = st.size;
+        // Etch keeps editing, selection, and IME state by ID and copies the
+        // display text during the call. Each widget supplies its controlled value.
+        uint32_t length = n.text.length;
+        if (length >= input_capacity) {
+            length = input_capacity-1;
+            while ((uint8_t(n.text.chars[length]) & 0xc0) == 0x80)
+                --length;
         }
+        if (length)
+            std::memcpy(s->edit_buffer, n.text.chars, length);
+        s->edit_buffer[length] = 0;
+        input.buffer = s->edit_buffer;
+        input.capacity = input_capacity;
+        const auto edit = etch_text_input(&input);
+        if (edit.changed && st.action.length)
+            queue_event(s, events, st.action, input_json(s->etch, s->edit_buffer, edit.byte_length));
+    } else if (n.kind == INLAY_UI_TOGGLE) {
+        auto toggle = etch_toggle_switch_desc_default();
+        bool checked = st.checked;
+        toggle.id = id;
+        toggle.label = frame_text(s, n.text);
+        toggle.value = &checked;
+        toggle.font_size_px = st.size;
+        if (etch_toggle_switch(&toggle))
+            queue_event(s, events, st.action, checked ? ETCH_STR_LIT("true") : ETCH_STR_LIT("false"));
     } else {
         auto text = etch_text_desc_default();
         text.id = id;
@@ -821,7 +920,7 @@ void inlay_surface_view(InlaySurface *s, const InlaySurfaceViewDesc *input) {
     box.height = etch_sizing_fixed(input->height_px);
     box.clip_children = true;
     etch_begin_box(&box);
-    char clicked[64] = {};
+    WidgetEvents events = {};
     if (s->stats.has_error) {
         auto card = etch_box_desc_default();
         card.padding = etch_padding_all(12);
@@ -835,11 +934,10 @@ void inlay_surface_view(InlaySurface *s, const InlaySurfaceViewDesc *input) {
         etch_text(frame_text(s, {s->error, uint32_t(std::strlen(s->error)), false}), &text);
         etch_end_box();
     } else if (s->node_count)
-        draw_node(s, 0, input->id, theme, clicked);
+        draw_node(s, 0, input->id, theme, &events);
     etch_end_box();
-    if (clicked[0])
-        inlay_surface_dispatch(s, {clicked, uint32_t(std::strlen(clicked)), false},
-                               ETCH_STR_LIT("null"));
+    for (auto *event = events.first; event; event = event->next)
+        inlay_surface_dispatch(s, event->name, event->payload);
 }
 InlaySurfaceStats inlay_surface_stats(const InlaySurface *s) {
     return s ? s->stats : InlaySurfaceStats{};

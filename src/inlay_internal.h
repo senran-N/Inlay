@@ -1,7 +1,22 @@
 #pragma once
 #include <inlay/inlay_c.h>
-struct InlayRow {uint32_t block,offset,length;bool first;InlayBlockKind kind=INLAY_PARAGRAPH;};
-struct InlayInline {uint32_t offset,length,url_offset,url_length;uint8_t kind;};
+struct InlayRow {uint32_t block,offset,length;bool first,zebra,separator;InlayBlockKind kind;};
+enum InlayInlineStyle : uint32_t {
+ InlayInlineCode=1u<<0, InlayInlineLink=1u<<1, InlayInlineMath=1u<<2,
+ InlayInlineBold=1u<<3, InlayInlineEmphasis=1u<<4, InlayInlineStrike=1u<<5
+};
+struct InlayInline {uint32_t offset,length,url_offset,url_length,flags;};
+inline bool inlay_table_rule(const char* text,uint32_t length) noexcept {
+ if(length && text[length-1]=='\n')--length;
+ uint32_t dashes=0;bool pipe=false;
+ for(uint32_t i=0;i<length;++i) {
+  const char c=text[i];
+  if(c=='-')++dashes;
+  else if(c=='|')pipe=true;
+  else if(c!=':' && c!=' ' && c!='\t' && c!='\r')return false;
+ }
+ return pipe && dashes>=3;
+}
 struct InlayDetails {uint32_t summary,summary_end,body,end;};
 struct InlayMeasure {InlayDoc* doc;uint32_t id;float width,font;uint32_t revision;InlayRow* rows;float* heights;uint32_t count,capacity,frozen_count;InlayDetails* details;bool* open;uint32_t open_capacity;InlayInline* tokens;uint32_t token_count,token_capacity,parsed_tail;};
 struct InlayDoc {

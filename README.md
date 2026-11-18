@@ -1,6 +1,6 @@
 # Inlay
 Native streamed documents on Etch, through its public C99 API. Build with CMake
-and Ninja in `build/`; a sibling `../Etch` is used when Etch 0.16.1 is not installed.
+and Ninja in `build/`; a sibling `../Etch` is used when Etch 0.18 is not installed. Inlay 0.6.0 was verified against Etch 0.18.1.
 C99 includes `<inlay/inlay_c.h>`; C++20 may include `<inlay/inlay.h>`.
 
 Create a document with an Etch context, append UTF-8 chunks, and call
@@ -12,13 +12,15 @@ block pointers are borrowed until the next mutation. The context must outlive
 documents; do not mutate documents during a view call. Up to 16 view IDs per
 document retain stable virtual-list measurement slots.
 
-Views provide selectable text, code pills, bold spans, clickable links, headings,
-quoted alerts, task/list markers, native table rows, code-copy buttons with basic
-syntax colors, thematic rules and details disclosures. The document model is a
-bounded GFM subset, not a general HTML interpreter. Code uses unwrapped lines;
-long lines are currently clipped. Nested inline markup and escaped table pipes
-are not yet supported. Render rows adapt to view width and font size. Frozen row measurements survive
-tail appends; persistent per-view pools grow geometrically as the document grows.
+Document and diagram rendering follows the active Etch theme, including code,
+alerts, tables, syntax highlighting, diagram nodes, and feedback edges.
+Document views support selectable rich text, nested bold, emphasis and
+strikethrough, inline code, clickable links, headings, alerts, lists, tables
+with escaped pipes (`\|`), and details disclosures. Wider rows leave a gutter
+for the virtual-list scrollbar. Code lines scroll horizontally with the copy
+button and language label above the scrolling content. Long fences remain
+virtualized in groups of up to 16 lines. Frozen measurements survive tail
+appends, and persistent per-view pools grow geometrically.
 
 `inlay_document --headless output.png` renders a deterministic document sample.
 `inlay_document --stress output.png` checks a 100KiB paragraph and 900-line code block.
@@ -30,22 +32,36 @@ and `baseline` is measured from that top. Supported commands include Greek/opera
 symbols, fractions, roots, scripts, accents, matrix/aligned environments and
 stretchy delimiters. Unsupported syntax reports `valid=false`; document views
 show the original source. Inline `$...$` and `\(...\)` and display `$$` / `\[` fences
-render natively. These APIs require Etch 0.16.1 or newer for native font metrics.
+render natively. These APIs use Etch 0.18 font metrics.
 
 `inlay_diagram_layout` returns frame-lifetime node/edge spans; `inlay_diagram_view`
-draws them with native geometry and text. Flowcharts accept TD/TB/LR, named nodes,
-labels in brackets, directed `-->` chains and cycles; sequence diagrams accept
-participants, `as` names and `->>` messages. Inputs are bounded to 16KiB, 256 nodes
-and 1024 edges. Use `canvas_id` for an interactive pan/zoom canvas, or call inside
-an existing Etch canvas. This is a documented Mermaid subset, not the complete grammar.
+draws them with native geometry and text. The supported Mermaid subset includes
+flowcharts in TD/TB/LR, bracketed node labels, directed chains, cycles, edge labels
+(`A -->|label| B` or `A -- label --> B`), and dashed edges (`A -.-> B` or
+`A -. label .-> B`). Nodes and edges inside matched `subgraph` / `end` lines
+participate in the main layout. Sequence diagrams support participants, `as`
+names, solid `->>` messages and dashed `-->>` messages. Inputs are bounded to
+16 KiB, 256 nodes and 1024 edges. Use `canvas_id` for an interactive pan/zoom
+canvas or call inside an existing Etch canvas.
 `inlay_document --math` and `--diagram` render standalone native examples.
 
 
 Reactive surfaces use optional QuickJS-NG (`INLAY_ENABLE_SCRIPT=ON`). Create an
 `InlaySurface`, set JSON state, and install a script defining `render(state)`.
 `h("box", {axis:"column", gap:8, bg:"var(--etch-bg-elevated)", radius:"panel"},
-h("text", {text:"Hello"}))` builds cached native nodes. Supported tags are box,
-text and button; buttons dispatch their `onClick` action name to `onEvent`.
+h("text", {text:"Hello"}))` builds cached native nodes. Buttons dispatch
+`onClick` to `onEvent`. Text inputs and toggles are controlled by script state.
+
+```js
+h("input", {value: s.query, placeholder: "Filter...", onChange: "setQuery", width: -1})
+h("toggle", {label: "Live", checked: !!s.live, onChange: "setLive"})
+```
+
+An edit dispatches a string to `onEvent(name, payload, state)` and a toggle
+dispatches a boolean. Update the corresponding state field in `onEvent` to
+keep the new value. Input supports IME and up to 8191 UTF-8 bytes. Idle views
+reuse the cached nodes without running JavaScript. Color props also accept
+`var(--etch-border-subtle)` and `var(--etch-text-muted)`.
 Scripts may invoke explicitly bound host `action(name,payload)` callbacks.
 There are no std/os, filesystem or network globals. Defaults are 8MiB VM memory,
 512KiB stack and a 4ms tick budget. Errors display a themed inline card; a new
