@@ -1,6 +1,6 @@
 # Inlay
 Native streamed documents on Etch, through its public C99 API. Build with CMake
-and Ninja in `build/`; a sibling `../Etch` is used when Etch 0.18 is not installed. Inlay 0.6.0 was verified against Etch 0.18.1.
+and Ninja in `build/`; a sibling `../Etch` is used when Etch 0.19 is not installed. Inlay 0.7.0 requires Etch 0.19.
 C99 includes `<inlay/inlay_c.h>`; C++20 may include `<inlay/inlay.h>`.
 
 Create a document with an Etch context, append UTF-8 chunks, and call
@@ -22,6 +22,13 @@ button and language label above the scrolling content. Long fences remain
 virtualized in groups of up to 16 lines. Frozen measurements survive tail
 appends, and persistent per-view pools grow geometrically.
 
+Set `height_px` to zero for an auto-height document inside a parent layout. Use
+`inlay_doc_measure_height` with the same ID, width and font size to retrieve the
+cached height or a pre-layout estimate. Begin with `inlay_doc_view_desc_default`
+to get the default block and table spacing. Tables share borders and honor GFM
+column alignment rules. Inline code and links can be styled with an inline
+decorator, including Etch stroke icons, pill padding and custom click IDs.
+
 `inlay_document --headless output.png` renders a deterministic document sample.
 `inlay_document --stress output.png` checks a 100KiB paragraph and 900-line code block.
 Run CTest to verify streaming equivalence, C99, guardrails and downstream builds.
@@ -32,7 +39,7 @@ and `baseline` is measured from that top. Supported commands include Greek/opera
 symbols, fractions, roots, scripts, accents, matrix/aligned environments and
 stretchy delimiters. Unsupported syntax reports `valid=false`; document views
 show the original source. Inline `$...$` and `\(...\)` and display `$$` / `\[` fences
-render natively. These APIs use Etch 0.18 font metrics.
+render natively. These APIs use Etch font metrics.
 
 `inlay_diagram_layout` returns frame-lifetime node/edge spans; `inlay_diagram_view`
 draws them with native geometry and text. The supported Mermaid subset includes
@@ -107,8 +114,11 @@ Windows native web hosting is optional: configure `INLAY_ENABLE_PORTAL_WEBVIEW2=
 and `INLAY_WEBVIEW2_INCLUDE_DIR` pointing at the official WebView2 SDK include folder.
 The loader/runtime is dynamically probed at creation, with no redistribution or
 link-time browser dependency. Select `inlay_portal_webview2_backend()` and pass
-`InlayPortalWebView2Options` through `backend_user_data`, including absolute UTF-8
-loader/profile paths. The caller initializes STA COM and pumps Windows messages.
+`InlayPortalWebView2Options` through `backend_user_data`, including an absolute UTF-8
+profile path and an optional absolute loader path. A null or empty loader path
+searches the application and default DLL directories for WebView2Loader.dll.
+Create and destroy on the window thread. The backend initializes STA COM and
+the host pumps Windows messages.
 The completion callback reports asynchronous creation failures; it must not reenter
 or destroy the portal. Destroy may precede completion; pending callbacks remain safe.
 
@@ -122,7 +132,7 @@ can implement the same public vtable; the built-in web accessor returns NULL whe
 disabled or unsupported. No unimplemented native feature is silently mocked.
 Set `INLAY_WEBVIEW2_LOADER` to enable the real-runtime async/destruction smoke test.
 
-Release candidate scope: Inlay 0.5 requires Etch 0.18 and remains pre-1.0.
+Release candidate scope: Inlay 0.7.0 requires Etch 0.19 and remains pre-1.0.
 Local release checks cover Windows Vulkan/D3D12, installed/subproject C99 and
 C++20 consumers, script/browser enabled and disabled configurations, bounded
 portal scratch memory and idle uploads. Metal and Linux browser/compositor

@@ -30,7 +30,7 @@ bool markdown_and_scroll(EtchContext* ctx,InlayDoc* doc) {
   "return abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz;\n```\n");
  inlay_doc_clear(doc);
  bool ok=true;
- const InlayDocViewDesc view={etch_id("rich-markdown"),320,720,15};
+ auto view=inlay_doc_view_desc_default();view.id=etch_id("rich-markdown");view.width_px=320;view.height_px=720;
  auto f=etch_frame_desc_default();f.viewport_w=360;f.viewport_h=720;
  const auto frame=[&](){
   etch_begin_frame(ctx,&f);inlay_doc_view(doc,&view);etch_end_frame(ctx);
@@ -100,13 +100,311 @@ bool sample_pixel(SDL_Surface* img,int x,int y,EtchColor expected,unsigned* brig
  return std::abs(int(pixel.r)-expected.r)<=8 && std::abs(int(pixel.g)-expected.g)<=8 &&
         std::abs(int(pixel.b)-expected.b)<=8;
 }
+struct Chips {uint16_t icon;uint32_t code_id,link_id;bool code_seen,link_seen;};
+bool decorate_chip(InlayInlineKind kind,EtchStr text,EtchStr url,EtchTextSpan* span,void* user) {
+ auto& chips=*static_cast<Chips*>(user);
+ if(kind==INLAY_INLINE_CODE) {
+  chips.code_seen=str_equal(text,ETCH_STR_LIT("Chip")) && !url.length;
+  span->id=chips.code_id;
+ } else if(kind==INLAY_INLINE_LINK) {
+  chips.link_seen=str_equal(text,ETCH_STR_LIT("Link")) && str_equal(url,ETCH_STR_LIT("https://example.org"));
+  span->id=chips.link_id;
+ } else return false;
+ span->icon_id=chips.icon;span->icon_size_px=24;span->icon_gap_px=5;
+ span->icon_color=etch_rgba8(255,16,220,255);
+ span->background=etch_rgba8(40,55,80,255);span->hover_background=etch_rgba8(65,85,110,255);
+ span->border_color=etch_rgba8(100,120,160,255);
+ span->padding_x=8;span->padding_y=5;span->bg_radius=8;
+ return true;
+}
+bool inline_decorator_row_boundaries(EtchContext* ctx,InlayDoc* doc) {
+ struct Probe {InlayInlineKind kind;EtchStr text;uint32_t calls;bool matched;};
+ Probe probe={};
+ auto view=inlay_doc_view_desc_default();view.id=etch_id("inline-decorator-row-boundaries");
+ view.width_px=64;view.height_px=0;
+ view.inline_decorator_user_data=&probe;
+ view.inline_decorator_fn=[](InlayInlineKind kind,EtchStr text,EtchStr,EtchTextSpan*,void* user) {
+  auto& p=*static_cast<Probe*>(user);
+  ++p.calls;p.matched &= kind==p.kind && str_equal(text,p.text);
+  return false;
+ };
+ auto f=etch_frame_desc_default();f.viewport_w=240;f.viewport_h=400;
+ const auto check=[&](EtchStr source,InlayInlineKind kind,EtchStr text) {
+  if(!inlay_doc_set_utf8(doc,source))return false;
+  probe={kind,text,0,true};
+  etch_begin_frame(ctx,&f);
+  const auto result=inlay_doc_view(doc,&view);
+  etch_end_frame(ctx);
+  const bool ok=result.total_rows==1 && probe.calls==1 && probe.matched;
+  if(!ok)std::fprintf(stderr,"Inline decoration: kind=%u, text bytes=%u, rows=%u, calls=%u, full text=%d\n",
+                      unsigned(kind),text.length,result.total_rows,probe.calls,probe.matched);
+  return ok;
+ };
+ bool ok=check(ETCH_STR_LIT("aaaaaaaaaaaaaaaaaaaaaaaaaaaa `Chip`"),INLAY_INLINE_CODE,ETCH_STR_LIT("Chip"));
+ ok &= check(ETCH_STR_LIT("aaaaaaaaaaaaaaaaaaaaaaaaaaaa [Link](https://example.org)"),
+             INLAY_INLINE_LINK,ETCH_STR_LIT("Link"));
+ const auto oversized=ETCH_STR_LIT("`abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz`");
+ ok &= check(oversized,INLAY_INLINE_CODE,{oversized.chars+1,oversized.length-2,false});
+ return ok;
+}
+bool inline_decorator_wrapped_code(EtchContext* ctx,InlayDoc* doc) {
+ const auto source=ETCH_STR_LIT("`abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz`");
+ const EtchStr original={source.chars+1,source.length-2,false};
+ static const EtchStr replacement=ETCH_STR_LIT("REPLACED");
+ static const auto foreground=etch_rgba8(32,212,144,255),background=etch_rgba8(61,39,108,255),
+                   icon_color=etch_rgba8(255,16,220,255);
+ struct Probe {uint16_t icon;bool replace;};
+ Probe probe={etch_register_svg_stroke_icon(ctx,ETCH_STR_LIT("M 3 12 L 9 18 L 21 5"),nullptr),false};
+ auto view=inlay_doc_view_desc_default();view.id=etch_id("inline-decorator-wrapped-code");
+ view.width_px=64;view.height_px=0;
+ view.inline_decorator_user_data=&probe;
+ view.inline_decorator_fn=[](InlayInlineKind,EtchStr,EtchStr,EtchTextSpan* span,void* user) {
+  const auto& p=*static_cast<Probe*>(user);
+  span->id=etch_id("wrapped-code");span->color=foreground;span->background=background;
+  if(p.replace)span->text=replacement;
+  else {span->icon_id=p.icon;span->icon_color=icon_color;}
+  return true;
+ };
+ auto f=etch_frame_desc_default();f.viewport_w=240;f.viewport_h=400;
+ const auto frame=[&]() {
+  etch_begin_frame(ctx,&f);
+  const auto result=inlay_doc_view(doc,&view);
+  etch_end_frame(ctx);
+  return result;
+ };
+ bool ok=probe.icon!=ETCH_INVALID_ICON && inlay_doc_set_utf8(doc,source);
+ const bool replacements[]={true,false};
+ for(bool replace:replacements) {
+  probe.replace=replace;
+  f.pointer_pos={0,0};
+  const auto result=frame();
+  const auto expected=replace ? replacement : original;
+  uint32_t labels=0,bytes=0,icons=0;
+  bool labels_match=true,styled=true;
+  EtchRect hit={};
+  for(uint32_t i=0;i<etch_a11y_node_count(ctx,nullptr);++i) {
+   EtchA11yNode node={};
+   if(!etch_get_a11y_node(i,&node,ctx,nullptr) || node.role!=ETCH_A11Y_STATIC_TEXT)continue;
+   ++labels;
+   labels_match &= bytes+node.label.length<=expected.length &&
+                   !std::memcmp(node.label.chars,expected.chars+bytes,node.label.length);
+   bytes+=node.label.length;
+   bool has_foreground=false,has_background=false;
+   uint32_t row_icons=0;
+   for(uint32_t j=0;j<etch_frame_prim_count(ctx);++j) {
+    EtchPrim prim={};
+    if(!etch_get_frame_prim(ctx,j,&prim) || prim.bounds.y<node.bounds.y ||
+       prim.bounds.y>=node.bounds.y+node.bounds.h)continue;
+    has_foreground |= prim.style.y==etch_color_pack_rgba8(foreground);
+    if(prim.style.y==etch_color_pack_rgba8(background)) {
+     has_background=true;
+     hit={prim.bounds.x,prim.bounds.y,prim.bounds.z,prim.bounds.w};
+    }
+    if(prim.style.y==etch_color_pack_rgba8(icon_color))++row_icons;
+   }
+   styled &= has_foreground && has_background && row_icons==(!replace && labels==1 ? 1u : 0u);
+   icons+=row_icons;
+  }
+  f.pointer_pos={hit.x+2,hit.y+hit.h*.5f};
+  f.pointer_down=true;const auto pressed=frame();
+  f.pointer_down=false;const auto released=frame();
+  const bool clicked=str_equal(pressed.clicked_link,expected) || str_equal(released.clicked_link,expected);
+  const bool pass=result.total_rows==1 && labels==1 &&
+                  labels_match && bytes==expected.length && styled && clicked;
+  if(!pass)std::fprintf(stderr,"Wrapped code (replace=%d): rows=%u, labels=%u, bytes=%u, icons=%u, styled=%d, clicked=%d\n",
+                        replace,result.total_rows,labels,bytes,icons,styled,clicked);
+  ok &= pass;
+ }
+ ok &= inlay_doc_set_utf8(doc,ETCH_STR_LIT("`one two three four five six`"));
+ const auto wrapped=frame();
+ ok &= wrapped.total_rows==1 && etch_element_bounds(view.id).h>view.font_size_px*1.5f+2*view.block_padding_px;
+ return ok;
+}
+bool inline_decorator_replacement_height(EtchContext* ctx,InlayDoc* doc) {
+ auto view=inlay_doc_view_desc_default();view.id=etch_id("inline-decorator-replacement-height");
+ view.width_px=64;view.height_px=0;
+ view.inline_decorator_fn=[](InlayInlineKind,EtchStr,EtchStr,EtchTextSpan* span,void*) {
+  span->text=ETCH_STR_LIT("X");
+  return true;
+ };
+ auto f=etch_frame_desc_default();f.viewport_w=240;f.viewport_h=400;
+ bool ok=true;
+ const auto settled_height=[&](EtchStr source) {
+  ok &= inlay_doc_set_utf8(doc,source);
+  InlayDocResult result={};
+  for(uint32_t i=0;i<3;++i) {
+   etch_begin_frame(ctx,&f);
+   result=inlay_doc_view(doc,&view);
+   etch_end_frame(ctx);
+  }
+  const float height=etch_element_bounds(view.id).h;
+  const float measured=inlay_doc_measure_height(doc,view.id,view.width_px,view.font_size_px);
+  const bool pass=result.total_rows==1 && height>0 && result.measured_height_px==height && measured==height;
+  if(!pass)std::fprintf(stderr,"Replacement height: bytes=%u, rows=%u, bounds=%.1f, view=%.1f, measure=%.1f\n",
+                        source.length,result.total_rows,height,result.measured_height_px,measured);
+  ok &= pass;
+  return height;
+ };
+ const float short_height=settled_height(ETCH_STR_LIT("`short`"));
+ char code[16385+2];code[0]='`';
+ const uint32_t lengths[]={800,16385};
+ for(uint32_t length:lengths) {
+  std::memset(code+1,'a',length);code[length+1]='`';
+  const float long_height=settled_height({code,length+2,false});
+  if(long_height!=short_height)std::fprintf(stderr,"Code replacement (%u bytes): height=%.1f, short=%.1f\n",
+                                            length,long_height,short_height);
+  ok &= long_height==short_height;
+ }
+ const char link_end[]="](https://example.org)";
+ char link[801+sizeof(link_end)-1];link[0]='[';
+ std::memset(link+1,'a',800);std::memcpy(link+801,link_end,sizeof(link_end)-1);
+ const float link_height=settled_height({link,sizeof(link),false});
+ if(link_height!=short_height)std::fprintf(stderr,"Link replacement: height=%.1f, short=%.1f\n",link_height,short_height);
+ ok &= link_height==short_height;
+ return ok;
+}
+bool flow_height_after_refresh(EtchContext* ctx,InlayDoc* doc) {
+ auto view=inlay_doc_view_desc_default();view.id=etch_id("flow-height-refresh");view.height_px=0;
+ auto f=etch_frame_desc_default();f.viewport_w=800;f.viewport_h=480;
+ const auto measure=[&]() {return inlay_doc_measure_height(doc,view.id,view.width_px,view.font_size_px);};
+ const auto check_frame=[&](const char* change) {
+  etch_begin_frame(ctx,&f);
+  const auto result=inlay_doc_view(doc,&view);
+  const float during=measure();
+  etch_end_frame(ctx);
+  const float after=measure();
+  const bool ok=result.measured_height_px>0 && std::fabs(during-result.measured_height_px)<.1f &&
+                std::fabs(after-result.measured_height_px)<.1f;
+  if(!ok)std::printf("Flow height after %s: view=%.1f, during=%.1f, after=%.1f\n",
+                     change,result.measured_height_px,during,after);
+  return ok;
+ };
+ bool ok=inlay_doc_set_utf8(doc,ETCH_STR_LIT("one\ntwo\nthree"));
+ etch_begin_frame(ctx,&f);inlay_doc_view(doc,&view);etch_end_frame(ctx);
+ const float original=etch_element_bounds(view.id).h;
+ ok &= inlay_doc_set_utf8(doc,ETCH_STR_LIT("one"));
+ ok &= check_frame("document replacement");
+ const float shorter=etch_element_bounds(view.id).h;
+ ok &= shorter>0 && shorter<original;
+ view.block_padding_px+=8;
+ ok &= check_frame("padding change");
+ return ok && etch_element_bounds(view.id).h>shorter;
+}
+bool flow_document(const char* png) {
+ auto cfg=etch_context_desc_default();cfg.headless=true;
+ auto* ctx=etch_create_context(&cfg);if(!ctx)return false;
+ auto* doc=inlay_doc_create(ctx,nullptr);
+ bool ok=inlay_doc_set_utf8(doc,ETCH_STR_LIT(
+  "| Word | Word | Word |\n| :--- | :---: | ---: |\n| Word | Word | Word |\n| end | two | three |\n\n"
+  "`Chip` [Link](https://example.org)\n\n*Waffle words*\n\n```cpp\nint x;\n```\n"));
+ Chips chips={etch_register_svg_stroke_icon(ctx,ETCH_STR_LIT("M 3 12 L 9 18 L 21 5"),nullptr),
+              etch_id("flow-code-chip"),etch_id("flow-link-chip"),false,false};
+ auto view=inlay_doc_view_desc_default();view.id=etch_id("flow-document");view.height_px=0;
+ view.width_px=340;view.block_padding_px=0;view.block_gap_px=11;view.table_cell_padding_x=10;
+ view.table_cell_padding_y=6;view.table_radius_px=7;view.hide_code_copy_button=true;
+ auto f=etch_frame_desc_default();f.viewport_w=380;f.viewport_h=360;
+ const auto frame=[&]() {
+  etch_begin_frame(ctx,&f);
+  auto parent=etch_box_desc_default();parent.id=etch_id("flow-parent");parent.axis=ETCH_AXIS_COL;
+  parent.width=etch_sizing_fixed(360);parent.height=etch_sizing_fit(0,0);parent.gap=3;
+  etch_begin_box(&parent);
+  const auto result=inlay_doc_view(doc,&view);
+  auto footer=etch_box_desc_default();footer.id=etch_id("flow-footer");
+  footer.width=etch_sizing_fixed(20);footer.height=etch_sizing_fixed(5);etch_box(&footer);
+  etch_end_box();etch_end_frame(ctx);
+  return result;
+ };
+ const float estimate=inlay_doc_measure_height(doc,view.id,view.width_px,view.font_size_px);
+ const auto first=frame();
+ const auto undecorated=etch_element_bounds(view.id);
+ view.inline_decorator_fn=decorate_chip;view.inline_decorator_user_data=&chips;
+ frame();
+ const auto settled=frame();
+ const auto flow=etch_element_bounds(view.id),footer=etch_element_bounds(etch_id("flow-footer"));
+ const auto& cached=doc->views[0];
+ const auto bounds=[&](uint32_t index){return etch_element_bounds(doc_row_id(view.id,cached.rows[index]));};
+ const auto header=bounds(0),body=bounds(2),last=bounds(3),italic=bounds(5);
+ const auto code=etch_element_bounds(chips.code_id),link=etch_element_bounds(chips.link_id);
+ ok &= estimate>0 && first.measured_height_px>0 && settled.total_rows==7 &&
+       settled.visible_first==0 && settled.visible_end==settled.total_rows && flow.w==view.width_px &&
+       std::fabs(flow.h-settled.measured_height_px)<.1f &&
+       std::fabs(flow.h-inlay_doc_measure_height(doc,view.id,view.width_px,view.font_size_px))<.1f &&
+       std::fabs(flow.y+flow.h+3-footer.y)<.1f && flow.h>undecorated.h+8;
+ ok &= cached.rows[1].separator && cached.rows[3].last_in_block && bounds(1).h==0 &&
+       std::fabs(header.y+header.h-body.y)<.1f && std::fabs(body.y+body.h-last.y)<.1f &&
+       std::fabs(last.y+last.h+view.block_gap_px-bounds(4).y)<.1f;
+ const auto bold_cell=etch_id_index(doc_row_id(view.id,cached.rows[2]),1);
+ EtchRect cells[3]={};
+ for(uint32_t i=0;i<3;++i)cells[i]=etch_element_bounds(etch_id_index(bold_cell,i+1));
+ const float column=view.width_px/3;
+ ok &= cells[0].w>10 && cells[1].w>10 && cells[2].w>10 &&
+       std::fabs(cells[0].x-body.x-view.table_cell_padding_x)<1.5f &&
+       std::fabs(cells[1].x+cells[1].w*.5f-body.x-column*1.5f)<1.5f &&
+       std::fabs(cells[2].x+cells[2].w-body.x-body.w+view.table_cell_padding_x)<1.5f;
+ ok &= chips.icon!=ETCH_INVALID_ICON && chips.code_seen && chips.link_seen && code.w>55 && link.h>=34 &&
+       contains_label(ctx,ETCH_STR_LIT("Waffle words")) && italic.h>0 &&
+       !contains_label(ctx,ETCH_STR_LIT("Copy code")) && contains_label(ctx,ETCH_STR_LIT("cpp"));
+ const auto italic_width=etch_measure_text(ETCH_STR_LIT("Waffle words"),ETCH_FONT_ITALIC,view.font_size_px,0);
+ const auto italic_text=etch_element_bounds(etch_id_index(doc_row_id(view.id,cached.rows[5]),1));
+ ok &= italic_width.x>0 && std::fabs(italic_width.x-italic_text.w)<2;
+ if(!etch_is_font_loaded(ctx,ETCH_FONT_ITALIC)) {
+  const auto fallback=etch_measure_text(ETCH_STR_LIT("Waffle words"),ETCH_FONT_SANS,view.font_size_px,0);
+  ok &= std::fabs(italic_width.x-fallback.x)<.1f;
+ }
+ if(png) {
+  const auto theme=etch_get_theme(ctx);
+  ok &= etch_render_headless_png(ctx,380,360,png,etch_rgba8(2,220,120,255));
+  auto* img=SDL_LoadPNG(png);
+  if(img) {
+   unsigned rgb=0,ink=0;
+   const int x=int(header.x+header.w-4);
+   const EtchColor clear=etch_rgba8(2,220,120,255);
+   for(int y=int(header.y+8);y<int(last.y+last.h-8);++y) {
+    EtchColor pixel={};
+    ok &= SDL_ReadSurfacePixel(img,x,y,&pixel.r,&pixel.g,&pixel.b,&pixel.a) &&
+          pixel.a>240 && (std::abs(int(pixel.r)-clear.r)>15 ||
+                          std::abs(int(pixel.g)-clear.g)>15 || std::abs(int(pixel.b)-clear.b)>15);
+   }
+   ok &= sample_pixel(img,x,int(header.y+8),theme.bg_elevated,&rgb) &&
+         sample_pixel(img,x,int(body.y+8),theme.bg_table,&rgb) &&
+         sample_pixel(img,x,int(last.y+8),etch_color_blend_over(theme.bg_table,theme.zebra_row),&rgb);
+   for(int y=int(code.y);y<int(code.y+code.h);++y)for(int px=int(code.x);px<int(code.x+32);++px) {
+    uint8_t r=0,g=0,b=0,a=0;
+    if(SDL_ReadSurfacePixel(img,px,y,&r,&g,&b,&a) && r>200 && b>160 && g<90)++ink;
+   }
+   ok &= ink>12;
+   SDL_DestroySurface(img);
+  } else ok=false;
+ }
+ const auto click=[&](EtchRect rect,EtchStr expected) {
+  f.pointer_pos={rect.x+rect.w*.5f,rect.y+rect.h*.5f};
+  f.pointer_down=true;const auto pressed=frame();
+  f.pointer_down=false;const auto released=frame();
+  return str_equal(pressed.clicked_link,expected) || str_equal(released.clicked_link,expected);
+ };
+ ok &= click(code,ETCH_STR_LIT("Chip"));
+ ok &= click(link,ETCH_STR_LIT("https://example.org"));
+ ok &= inlay_doc_set_utf8(doc,ETCH_STR_LIT("`Chip` [Link](https://example.org)"));
+ view.width_px=130;view.inline_decorator_fn=nullptr;view.inline_decorator_user_data=nullptr;
+ frame();
+ const auto short_line=etch_element_bounds(view.id);
+ view.inline_decorator_fn=decorate_chip;view.inline_decorator_user_data=&chips;
+ const auto estimate_chips=frame();
+ const auto wrapped=etch_element_bounds(view.id);
+ ok &= wrapped.h>short_line.h*2 && estimate_chips.measured_height_px>short_line.h*2;
+ if(!ok)std::printf("Flow: rows=%u, height %.1f / %.1f / %.1f; table y %.1f/%.1f/%.1f; cell x %.1f/%.1f/%.1f; chip %.1fx%.1f; italic %.1f/%.1f\n",
+  settled.total_rows,undecorated.h,flow.h,settled.measured_height_px,header.y,body.y,last.y,
+  cells[0].x,cells[1].x,cells[2].x,code.w,code.h,italic_width.x,italic_text.w);
+ inlay_doc_destroy(doc);etch_destroy_context(ctx);
+ return ok;
+}
 bool theme_pixels(const char* dark_png,const char* light_png) {
  auto cfg=etch_context_desc_default();cfg.headless=true;
  auto* ctx=etch_create_context(&cfg);if(!ctx)return false;
  auto* doc=inlay_doc_create(ctx,nullptr);
  bool ok=inlay_doc_set_utf8(doc,ETCH_STR_LIT(
   "> [!NOTE]\n> Check panel contrast\n\n```mermaid\nflowchart TD\nA[Plan] --> B[Run]\n```\n"));
- const InlayDocViewDesc view={etch_id("theme-document"),232,360,15};
+ auto view=inlay_doc_view_desc_default();view.id=etch_id("theme-document");view.width_px=232;view.height_px=360;
  const char* paths[]={dark_png,light_png};
  const EtchTheme themes[]={etch_theme_dark(),etch_theme_light()};
  unsigned panel_light[2]={},node_light[2]={},native_light[2]={};
@@ -148,7 +446,10 @@ bool theme_pixels(const char* dark_png,const char* light_png) {
 }
 }
 int main(int argc,char** argv) {
- if(argc==3)return theme_pixels(argv[1],argv[2]) ? 0 : 1;
+ if(argc==4) {
+  const bool theme=theme_pixels(argv[1],argv[2]);
+  return flow_document(argv[3]) && theme ? 0 : 1;
+ }
  auto config=etch_context_desc_default();config.headless=true;
  auto* ctx=etch_create_context(&config);if(!ctx)return 1;
  auto* reference=inlay_doc_create(ctx,nullptr);auto* streamed=inlay_doc_create(ctx,nullptr);
@@ -202,7 +503,8 @@ int main(int argc,char** argv) {
  // Persistent view rows preserve measured frozen content across tail growth.
  inlay_doc_clear(streamed);
  for(int i=0;i<300;++i)ok &= inlay_doc_append_utf8(streamed,ETCH_STR_LIT("Long **frozen paragraph** with `inline code` and 中文.\n\n"));
- const auto view=InlayDocViewDesc{etch_id("stream_view"),200,160,24};
+ auto view=inlay_doc_view_desc_default();view.id=etch_id("stream_view");
+ view.width_px=200;view.height_px=160;view.font_size_px=24;
  double scroll=0;
  for(int frame=0;frame<32;++frame) {
   if(frame==5)ok &= inlay_doc_append_utf8(streamed,ETCH_STR_LIT("Tail append\n\n"));
@@ -360,6 +662,11 @@ int main(int argc,char** argv) {
  ok &= feedback && !inlay_diagram_layout(ETCH_STR_LIT("flowchart TD\nA -->"),&diagram_desc).valid;
  etch_end_frame(ctx);
  ok &= markdown_and_scroll(ctx,streamed);
+ ok &= inline_decorator_row_boundaries(ctx,streamed);
+ ok &= inline_decorator_wrapped_code(ctx,streamed);
+ ok &= inline_decorator_replacement_height(ctx,streamed);
+ ok &= flow_height_after_refresh(ctx,streamed);
  inlay_doc_destroy(reference);inlay_doc_destroy(streamed);etch_destroy_context(ctx);
+ ok &= flow_document(nullptr);
  std::printf("32KB streaming equivalence: %s\n",ok ? "PASS" : "FAIL");return ok ? 0 : 1;
 }

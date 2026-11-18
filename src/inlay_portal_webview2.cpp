@@ -30,7 +30,7 @@ struct WebPortal {
   ICoreWebView2Controller *controller;
   ICoreWebView2 *web;
   wchar_t *navigation;
-  bool html, closed;
+  bool html, closed, com_initialized;
   void (*completed)(void *, int32_t);
   void *user;
   RECT bounds;
@@ -42,6 +42,8 @@ ULONG release(WebPortal *p) {
   if (!n) {
     std::free(p->navigation);
     FreeLibrary(p->loader);
+    if (p->com_initialized)
+      CoUninitialize();
     std::free(p);
   }
   return n;
@@ -160,24 +162,25 @@ ICoreWebView2CreateCoreWebView2ControllerCompletedHandlerVtbl
 void *create(void *user, uint32_t w, uint32_t h) {
   const auto *options = static_cast<const InlayPortalWebView2Options *>(user);
   if (!options || !IsWindow(static_cast<HWND>(options->underlay_hwnd)) ||
-      !options->loader_path || !options->user_data_path)
+      !options->user_data_path)
     return nullptr;
-  const size_t loader_len = std::strlen(options->loader_path),
+  const size_t loader_len = options->loader_path ? std::strlen(options->loader_path) : 0,
                data_len = std::strlen(options->user_data_path);
   if (loader_len > 32767 || data_len > 32767)
     return nullptr;
-  auto *loader_path =
-      wide(options->loader_path, static_cast<uint32_t>(loader_len));
+  auto *loader_path = loader_len
+      ? wide(options->loader_path, static_cast<uint32_t>(loader_len)) : nullptr;
   auto *data_path =
       wide(options->user_data_path, static_cast<uint32_t>(data_len));
-  if (!loader_path || !data_path) {
+  if ((loader_len && !loader_path) || !data_path) {
     std::free(loader_path);
     std::free(data_path);
     return nullptr;
   }
-  HMODULE module = LoadLibraryExW(loader_path, nullptr,
-                                  LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR |
-                                      LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+  const DWORD search = loader_path ? LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR
+                                   : LOAD_LIBRARY_SEARCH_APPLICATION_DIR;
+  HMODULE module = LoadLibraryExW(loader_path ? loader_path : L"WebView2Loader.dll",
+                                 nullptr, search | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
   std::free(loader_path);
   if (!module) {
     std::free(data_path);
@@ -206,6 +209,13 @@ void *create(void *user, uint32_t w, uint32_t h) {
   p->completed = options->completed;
   p->user = options->user_data;
   p->loader = module;
+  const HRESULT initialized = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+  if (FAILED(initialized)) {
+    std::free(data_path);
+    release(p);
+    return nullptr;
+  }
+  p->com_initialized = true;
   p->parent = static_cast<HWND>(options->underlay_hwnd);
   p->bounds = {0, 0, static_cast<LONG>(w), static_cast<LONG>(h)};
   p->environment_handler = {{&environment_vtable}, p};

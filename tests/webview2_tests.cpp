@@ -17,19 +17,25 @@ void completed(void *user, int32_t result) {
 int main(int argc, char **argv) {
   if (argc != 3)
     return 1;
-  const HRESULT init = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-  if (FAILED(init))
-    return 1;
   HWND window = CreateWindowExW(0, L"STATIC", L"Inlay native smoke",
                                 WS_OVERLAPPEDWINDOW, 0, 0, 640, 480, nullptr,
                                 nullptr, GetModuleHandleW(nullptr), nullptr);
   const auto *api = inlay_portal_webview2_backend();
   Completion state = {};
-  InlayPortalWebView2Options options = {window, argv[1], argv[2], completed,
+  InlayPortalWebView2Options options = {window, nullptr, argv[2], completed,
                                         &state};
-  void *backend = api ? api->create(&options, 640, 480) : nullptr;
-  bool ok =
-      backend &&
+  if (!window || !api)
+    return 1;
+  const HRESULT mta = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+  if (FAILED(mta))
+    return 1;
+  void *backend = api->create(&options, 640, 480);
+  bool ok = !backend && !state.called;
+  if (backend)
+    api->destroy(backend);
+  CoUninitialize();
+  backend = api->create(&options, 640, 480);
+  ok &= backend &&
       api->load_html(backend,
                      ETCH_STR_LIT("<!doctype html><input autofocus "
                                   "value='Native IME'><p>Inlay WebView2</p>"));
@@ -44,6 +50,9 @@ int main(int argc, char **argv) {
                                 MWMO_INPUTAVAILABLE);
   }
   ok &= state.called && state.result >= 0;
+  if (!ok)
+    std::printf("Default loader: started=%d called=%d HRESULT=0x%08lx\n",
+                backend != nullptr, state.called, static_cast<unsigned long>(state.result));
   if (backend) {
     api->set_underlay_bounds(backend, {0, 0, 640, 480}, {0, 0, 640, 480});
     api->destroy(backend);
@@ -51,9 +60,16 @@ int main(int argc, char **argv) {
   // Destruction during asynchronous creation must leave callbacks safe and
   // silent.
   state = {};
-  backend = api ? api->create(&options, 320, 240) : nullptr;
-  if (backend)
-    api->destroy(backend);
+  const HRESULT sta = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+  ok &= SUCCEEDED(sta);
+  const char* loaders[] = {argv[1], ""};
+  for (const char* loader : loaders) {
+    options.loader_path = loader;
+    backend = api->create(&options, 320, 240);
+    ok &= backend != nullptr;
+    if (backend)
+      api->destroy(backend);
+  }
   const ULONGLONG drain = GetTickCount64() + 1000;
   while (GetTickCount64() < drain) {
     MSG message;
@@ -65,8 +81,9 @@ int main(int argc, char **argv) {
                                 MWMO_INPUTAVAILABLE);
   }
   ok &= !state.called;
+  if (SUCCEEDED(sta))
+    CoUninitialize();
   DestroyWindow(window);
-  CoUninitialize();
   std::printf("WebView2 native async/lifetime: %s\n", ok ? "PASS" : "FAIL");
   return ok ? 0 : 1;
 }

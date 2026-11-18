@@ -27,7 +27,8 @@ int main(int argc,char** argv) {
   ok &= inlay_doc_append_utf8(doc,ETCH_STR_LIT("```\n\n# Last block\n"));
  }
  uint32_t total_rows=0,last_end=0;
- const auto view=InlayDocViewDesc{etch_id("document"),860,700,16};
+ auto view=inlay_doc_view_desc_default();view.id=etch_id("document");
+ view.width_px=860;view.height_px=700;view.font_size_px=16;
  for(int frame=0;frame<12;++frame) {
   auto desc=etch_frame_desc_default();desc.viewport_w=920;desc.viewport_h=760;etch_begin_frame(ctx,&desc);
   auto box=etch_box_desc_default();box.width=etch_sizing_fixed(920);box.height=etch_sizing_fixed(760);box.padding=etch_padding_all(30);box.background=etch_rgba8(12,18,28,255);
@@ -38,7 +39,7 @@ int main(int argc,char** argv) {
    for(const auto sample:samples){const auto metrics=inlay_draw_math(sample,&md);ok &= metrics.valid;md.pos.y+=metrics.height+30;}
   }
   if(diagram){auto dd=inlay_diagram_desc_default();dd.pos={60,40};const auto dg=inlay_diagram_view(ETCH_STR_LIT("flowchart TD\nA[Stream] --> B[Parse]\nA --> C[Validate]\nB --> D[Render]\nC --> D\nD --> A"),&dd);ok &= dg.valid;}
-  const auto result=(math || diagram) ? InlayDocResult{{},0,1,1} : inlay_doc_view(doc,&view);ok &= result.visible_end>result.visible_first;
+  const auto result=(math || diagram) ? InlayDocResult{{},0,1,1,0} : inlay_doc_view(doc,&view);ok &= result.visible_end>result.visible_first;
   total_rows=result.total_rows;last_end=result.visible_end;etch_end_box();etch_end_frame(ctx);
   if(stress && frame==2)etch_virtual_list_scroll_to_row(view.id,total_rows-1,24,ETCH_ALIGN_Y_BOTTOM);
  }

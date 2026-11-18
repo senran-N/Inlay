@@ -146,6 +146,12 @@ int main(int argc, char **argv) {
   auto fd = etch_frame_desc_default();
   fd.viewport_w = 700;
   fd.viewport_h = 500;
+  auto *doc = inlay_doc_create(ctx, nullptr);
+  ok &= inlay_doc_set_utf8(doc, ETCH_STR_LIT("Portal follows this document.\n\nFlow reserves its full height."));
+  auto flow = inlay_doc_view_desc_default();
+  flow.id = etch_id("portal-flow");
+  flow.width_px = 360;
+  flow.height_px = 0;
   for (int settle = 0; settle < 3; ++settle) {
     etch_begin_frame(ctx, &fd);
     auto root = etch_box_desc_default();
@@ -187,8 +193,11 @@ int main(int argc, char **argv) {
     auto parent = etch_box_desc_default();
     parent.width = etch_sizing_fixed(400);
     parent.height = etch_sizing_fixed(300);
+    parent.axis = ETCH_AXIS_COL;
     parent.opacity = hidden ? 0.f : 1.f;
     etch_begin_box(&parent);
+    const auto measured = inlay_doc_view(doc, &flow);
+    ok &= measured.visible_end == 2 && measured.measured_height_px > 0;
     const InlayPortalViewDesc view = {etch_id("native-visibility"), 240, 140, 0};
     inlay_portal_view(p, &view);
     etch_end_box();
@@ -196,9 +205,14 @@ int main(int argc, char **argv) {
     ok &= inlay_portal_sync_geometry(p);
     ok &= hidden ? native_visible.w == 0 && native_visible.h == 0
                  : native_visible.w > 0 && native_visible.h > 0;
+    if (!hidden) {
+      const auto bounds = etch_element_bounds(flow.id);
+      ok &= bounds.h > 0 && native_visible.y >= bounds.y + bounds.h;
+    }
     inlay_portal_frame_submitted(p);
   }
   ok &= inlay_portal_destroy(p);
+  inlay_doc_destroy(doc);
   etch_destroy_context(ctx);
   std::printf("Portal tiles/zoom/IME: %s\n", ok ? "PASS" : "FAIL");
   return ok ? 0 : 1;

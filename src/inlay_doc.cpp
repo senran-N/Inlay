@@ -118,7 +118,7 @@ void parse_tail(InlayDoc* d) noexcept {
 }
 extern "C" {
 InlayDocConfig inlay_doc_config_default(void) {return {4096,64};}
-InlayDocViewDesc inlay_doc_view_desc_default(void) {return {0,640,480,15};}
+InlayDocViewDesc inlay_doc_view_desc_default(void) {return {0,640,480,15,12,8,12,8,8,false,nullptr,nullptr};}
 InlayDoc* inlay_doc_create(EtchContext* context,const InlayDocConfig* config) {
  if(!context)return nullptr;
  const InlayDocConfig c=config ? *config : inlay_doc_config_default();

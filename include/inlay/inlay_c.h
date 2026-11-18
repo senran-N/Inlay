@@ -5,7 +5,7 @@
 #include <stdint.h>
 #include <etch/etch_c.h>
 #define INLAY_VERSION_MAJOR 0
-#define INLAY_VERSION_MINOR 6
+#define INLAY_VERSION_MINOR 7
 #define INLAY_VERSION_PATCH 0
 #define INLAY_STRING_DETAIL(x) #x
 #define INLAY_STRING(x) INLAY_STRING_DETAIL(x)
@@ -25,8 +25,31 @@ typedef struct InlayBlock {
  bool complete;
 } InlayBlock;
 typedef struct InlayDocConfig {uint32_t initial_source_bytes, initial_blocks;} InlayDocConfig;
-typedef struct InlayDocViewDesc {uint32_t id;float width_px,height_px,font_size_px;} InlayDocViewDesc;
-typedef struct InlayDocResult {EtchStr clicked_link;uint32_t visible_first,visible_end,total_rows;} InlayDocResult;
+typedef enum InlayInlineKind {
+ INLAY_INLINE_TEXT=0,
+ INLAY_INLINE_CODE=1,
+ INLAY_INLINE_LINK=2
+} InlayInlineKind;
+/* Called for code and links. Return true to apply edits. Replacement text must
+   live through the view call and any use of clicked_link. url is empty for
+   code; an identified code span reports its displayed text on click.
+   The callback must not mutate the document. */
+typedef bool (*InlayInlineDecoratorFn)(InlayInlineKind kind,EtchStr text,EtchStr url,
+                                      EtchTextSpan* inout_span,void* user_data);
+typedef struct InlayDocViewDesc {
+ uint32_t id;
+ float width_px,height_px,font_size_px; /* Zero height builds an auto-height view. */
+ float block_padding_px,block_gap_px;
+ float table_cell_padding_x,table_cell_padding_y,table_radius_px;
+ bool hide_code_copy_button;
+ InlayInlineDecoratorFn inline_decorator_fn;
+ void* inline_decorator_user_data;
+} InlayDocViewDesc;
+typedef struct InlayDocResult {
+ EtchStr clicked_link;
+ uint32_t visible_first,visible_end,total_rows;
+ float measured_height_px;
+} InlayDocResult;
 typedef struct InlayMathDesc {EtchVec2 pos;float font_size_px;EtchColor color;} InlayMathDesc;
 typedef struct InlayMathResult {float width,height,baseline;bool valid;} InlayMathResult;
 InlayMathDesc inlay_math_desc_default(void);
@@ -51,6 +74,9 @@ uint32_t inlay_doc_block_count(const InlayDoc*);
 const InlayBlock* inlay_doc_block(const InlayDoc*,uint32_t index);
 EtchStr inlay_doc_source(const InlayDoc*);
 InlayDocResult inlay_doc_view(InlayDoc*,const InlayDocViewDesc*);
+/* Total height in logical pixels. Uses matching view measurements or estimates
+   with default flow spacing. May be called outside a frame. */
+float inlay_doc_measure_height(InlayDoc*,uint32_t view_id,float width_px,float font_size_px);
 
 typedef struct InlaySurface InlaySurface;
 typedef struct InlaySurfaceDesc {size_t memory_limit_bytes,max_stack_bytes;float max_tick_ms;uint32_t max_nodes,max_text_bytes;} InlaySurfaceDesc;
@@ -140,12 +166,13 @@ bool inlay_portal_has_focus(const InlayPortal*);
 bool inlay_portal_mock_advance(InlayPortal*,uint32_t phase);
 /* Optional Windows native UNDERLAY backend. The host supplies a dedicated HWND
    BELOW its alpha-composited Etch surface, with the same client origin, and owns
-   STA COM initialization/message pumping/native keyboard and IME dispatch.
+   message pumping, native keyboard and IME dispatch. Create and destroy the
+   backend on the window's STA thread; the backend balances its own COM calls.
    No OSR texture support. NULL on unsupported/disabled builds. Paths are UTF-8.
    Options and strings need only survive create; native window outlives backend. */
 typedef struct InlayPortalWebView2Options {
  void* underlay_hwnd;
- const char* loader_path;
+ const char* loader_path; /* NULL or empty searches for WebView2Loader.dll. */
  const char* user_data_path;
 void (*completed)(void* user_data,int32_t hresult); /* async; no callback after destroy */
 void* user_data;

@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.0] - 2026-11-18
+
+- Require Etch 0.19 and add auto-height document flow with a cached height query.
+- Render contiguous GFM tables with column alignment and configurable spacing.
+- Add inline code and link decorators, optional code copy buttons, and italic emphasis.
+- Initialize WebView2 STA COM in the backend and support default DLL discovery.
+
 ## [0.6.0] - 2026-11-18
 
 - Follow the active Etch theme in documents and diagrams, reserve scrollbar

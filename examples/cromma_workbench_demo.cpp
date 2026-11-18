@@ -51,7 +51,10 @@ void build(Context *ctx, Workbench *app) {
              .background = Color::white(),
              .radius = Corners::all(16)});
   label("Research / streamed response", 16);
-  const InlayDocViewDesc doc_view = {id("research"), 308, 600, 15};
+  auto doc_view = inlay_doc_view_desc_default();
+  doc_view.id = id("research");
+  doc_view.width_px = 308;
+  doc_view.height_px = 600;
   inlay_doc_view(app->document, &doc_view);
   end_box();
   begin_box({.axis = Axis::Col,

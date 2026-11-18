@@ -15,4 +15,6 @@ using Doc=InlayDoc;
 using DocConfig=InlayDocConfig;
 using DocViewDesc=InlayDocViewDesc;
 using DocResult=InlayDocResult;
+using InlineKind=InlayInlineKind;
+using InlineDecoratorFn=InlayInlineDecoratorFn;
 }
