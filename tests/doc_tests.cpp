@@ -511,6 +511,184 @@ bool mermaid_single_pass_arena(EtchContext* ctx,InlayDoc* doc) {
  if(!ok)std::fprintf(stderr,"Mermaid single pass arena: used=%zu single_layout=%zu\n",used,single_layout_bytes);
  return ok;
 }
+bool has_prim_color(EtchContext* ctx,uint32_t rgba) {
+ for(uint32_t i=0;i<etch_frame_prim_count(ctx);++i) {
+  EtchPrim prim={};
+  if(etch_get_frame_prim(ctx,i,&prim) && (prim.style.y==rgba || prim.style.z==rgba))return true;
+ }
+ return false;
+}
+bool doc_style_customization(EtchContext* ctx,InlayDoc* doc) {
+ const InlayDocStyle def=inlay_doc_style_default();
+ bool ok=def.font_id==ETCH_INVALID_FONT && def.bold_font_id==ETCH_INVALID_FONT &&
+         def.mono_font_id==ETCH_INVALID_FONT && !def.has_background && def.line_height_scale==0.f;
+ ok &= inlay_doc_set_utf8(doc,ETCH_STR_LIT(
+  "# Styled Heading\n\n"
+  "Body with ==highlighted== and [styled link](https://example.org) and `code`.\n\n"
+  "> Quote block\n\n"
+  "| H | V |\n| --- | --- |\n| A | B |\n\n"
+  "```cpp\nint x = 1;\n```\n\n"
+  "[^n1]: Muted footnote.\n"));
+ InlayDocStyle style=inlay_doc_style_default();
+ style.has_background=true;
+ style.background=etch_rgba8(0,0,0,0);
+ style.text_color=etch_rgba8(210,220,230,255);
+ style.muted_color=etch_rgba8(130,140,150,255);
+ style.heading_color=etch_rgba8(255,180,64,255);
+ style.link_color=etch_rgba8(80,210,255,255);
+ style.code_bg=etch_rgba8(24,32,48,180);
+ style.code_border=etch_rgba8(70,95,130,255);
+ style.quote_bg=etch_rgba8(30,40,36,190);
+ style.quote_border=etch_rgba8(90,190,140,255);
+ style.table_header_bg=etch_rgba8(55,40,75,200);
+ style.table_border=etch_rgba8(120,90,160,255);
+ style.highlight_bg=etch_rgba8(255,220,60,120);
+ style.selection_color=etch_rgba8(90,140,255,100);
+ style.font_id=ETCH_FONT_SANS;
+ style.bold_font_id=ETCH_FONT_BOLD;
+ style.mono_font_id=ETCH_FONT_MONO;
+ style.line_height_scale=1.5f;
+ style.heading_scale[0]=1.6f;
+
+ auto view=inlay_doc_view_desc_default();
+ view.id=etch_id("doc-style-custom");
+ view.width_px=380;view.height_px=0;view.style=&style;
+ auto f=etch_frame_desc_default();f.viewport_w=420;f.viewport_h=800;
+ InlayDocResult res1={};
+ for(int i=0;i<2;++i){etch_begin_frame(ctx,&f);res1=inlay_doc_view(doc,&view);etch_end_frame(ctx);}
+ const float h1=res1.measured_height_px;
+ ok &= h1>0 && std::fabs(inlay_doc_measure_height(doc,view.id,view.width_px,view.font_size_px)-h1)<.1f;
+ const bool code_ok=has_prim_color(ctx,etch_color_pack_rgba8(style.code_bg)) && has_prim_color(ctx,etch_color_pack_rgba8(style.code_border));
+ const bool quote_ok=has_prim_color(ctx,etch_color_pack_rgba8(style.quote_bg)) && has_prim_color(ctx,etch_color_pack_rgba8(style.quote_border));
+ const bool table_ok=has_prim_color(ctx,etch_color_pack_rgba8(style.table_header_bg)) && has_prim_color(ctx,etch_color_pack_rgba8(style.table_border));
+ const bool hl_ok=has_prim_color(ctx,etch_color_pack_rgba8(style.highlight_bg));
+ const bool head_ok=has_prim_color(ctx,etch_color_pack_rgba8(style.heading_color));
+ const bool link_ok=has_prim_color(ctx,etch_color_pack_rgba8(style.link_color));
+ const bool text_ok=has_prim_color(ctx,etch_color_pack_rgba8(style.text_color));
+ const bool muted_ok=has_prim_color(ctx,etch_color_pack_rgba8(style.muted_color));
+ ok &= code_ok && quote_ok && table_ok && hl_ok && head_ok && link_ok && text_ok && muted_ok;
+
+ style.line_height_scale=2.2f;
+ style.heading_scale[0]=2.8f;
+ InlayDocResult res2={};
+ for(int i=0;i<2;++i){etch_begin_frame(ctx,&f);res2=inlay_doc_view(doc,&view);etch_end_frame(ctx);}
+ ok &= res2.measured_height_px>h1+40.f;
+ ok &= std::fabs(inlay_doc_measure_height(doc,view.id,view.width_px,view.font_size_px)-res2.measured_height_px)<.1f;
+ if(!ok)std::fprintf(stderr,"DocStyle check failed: h1=%.1f h2=%.1f code=%d quote=%d table=%d hl=%d head=%d link=%d text=%d muted=%d\n",
+                     h1,res2.measured_height_px,code_ok,quote_ok,table_ok,hl_ok,head_ok,link_ok,text_ok,muted_ok);
+ return ok;
+}
+bool doc_images_highlights_footnotes_tasks(EtchContext* ctx,InlayDoc* doc,InlayDoc* streamed) {
+ uint32_t pixels[16*8];
+ for(uint32_t& px:pixels)px=0xFFE08020u;
+ auto tdesc=etch_texture_desc_default();
+ tdesc.width=16;tdesc.height=8;tdesc.rgba_pixels=pixels;
+ auto tex=etch_create_texture_rgba(ctx,&tdesc);
+ if(!tex.texture)return false;
+
+ const auto md=ETCH_STR_LIT(
+  "![banner](hero.png)\n\n"
+  "![missing](nope.png)\n\n"
+  "See ==important== and [^fn1] and inline ![badge](hero.png)!\n\n"
+  "- [ ] First task\n"
+  "- [x] Second task\n\n"
+  "[^fn1]: Footnote explanation line one.\n"
+  "  Footnote explanation line two.\n");
+ bool ok=inlay_doc_set_utf8(doc,md);
+ inlay_doc_clear(streamed);
+ for(uint32_t i=0;i<md.length;++i)ok &= inlay_doc_append_utf8(streamed,{md.chars+i,1,false});
+ ok &= inlay_doc_block_count(doc)==5 && inlay_doc_block_count(streamed)==5;
+ for(uint32_t i=0;i<5;++i) {
+  const auto a=*inlay_doc_block(doc,i),b=*inlay_doc_block(streamed,i);
+  ok &= a.kind==b.kind && a.offset==b.offset && a.length==b.length &&
+        a.content_offset==b.content_offset && a.content_length==b.content_length &&
+        a.language_offset==b.language_offset && a.language_length==b.language_length;
+ }
+ ok &= inlay_doc_block(doc,0)->kind==INLAY_IMAGE && inlay_doc_block(doc,1)->kind==INLAY_IMAGE &&
+       inlay_doc_block(doc,3)->kind==INLAY_TASK_LIST && inlay_doc_block(doc,4)->kind==INLAY_FOOTNOTE;
+
+ struct ImageCtx {struct SDL_GPUTexture* tex;uint32_t hits;};
+ ImageCtx img_ctx={tex.texture,0};
+ struct TaskCtx {uint32_t calls,block,item;bool checked;};
+ TaskCtx task_ctx={0,999,999,false};
+
+ auto view=inlay_doc_view_desc_default();
+ view.id=etch_id("doc-v09-features");
+ view.width_px=240;view.height_px=0;
+ view.image_resolver_user_data=&img_ctx;
+ view.image_resolver_fn=[](EtchStr,EtchStr src,InlayImageResult* out,void* user) {
+  auto& c=*static_cast<ImageCtx*>(user);
+  ++c.hits;
+  if(!str_equal(src,ETCH_STR_LIT("hero.png")))return false;
+  out->texture=c.tex;out->width_px=800.f;out->height_px=400.f;out->radius_px=8.f;
+  return true;
+ };
+ view.task_toggle_user_data=&task_ctx;
+ view.task_toggle_fn=[](uint32_t block,uint32_t item,bool checked,void* user) {
+  auto& t=*static_cast<TaskCtx*>(user);
+  ++t.calls;t.block=block;t.item=item;t.checked=checked;
+ };
+
+ auto f=etch_frame_desc_default();f.viewport_w=320;f.viewport_h=720;
+ for(int i=0;i<2;++i){etch_begin_frame(ctx,&f);inlay_doc_view(doc,&view);etch_end_frame(ctx);}
+ ok &= img_ctx.hits>=2;
+ const InlayMeasure* found_view=nullptr;
+ for(const auto& m:doc->views)if(m.id==view.id)found_view=&m;
+ if(!found_view) {etch_destroy_loaded_texture(ctx,&tex);return false;}
+ const auto& cached=*found_view;
+ const uint32_t banner_id=etch_id_index(doc_row_id(doc,view.id,cached.rows[0]),1);
+ const auto banner_bounds=etch_element_bounds(banner_id);
+ const float expected_w=view.width_px-2*view.block_padding_px;
+ ok &= std::fabs(banner_bounds.w-expected_w)<.5f && std::fabs(banner_bounds.h-expected_w*0.5f)<.5f;
+ ok &= contains_label(ctx,ETCH_STR_LIT("[missing]"));
+ ok &= contains_label(ctx,ETCH_STR_LIT("[fn1]:"));
+ const InlayRow* fn_row=nullptr;
+ for(uint32_t i=0;i<cached.count;++i)if(cached.rows[i].kind==INLAY_FOOTNOTE){fn_row=&cached.rows[i];break;}
+ ok &= fn_row!=nullptr;
+ const uint32_t fn_block_row_id=fn_row ? doc_row_id(doc,view.id,*fn_row) : 0u;
+ const auto fn_l1=etch_element_bounds(etch_id_index(fn_block_row_id,1));
+ const auto fn_l2=etch_element_bounds(etch_id_index(fn_block_row_id,2));
+ ok &= fn_l1.h>0 && fn_l2.h>0 && fn_l2.y>=fn_l1.y+fn_l1.h;
+
+ // Click the [^fn1] footnote reference badge
+ const uint32_t para_row_id=doc_row_id(doc,view.id,cached.rows[2]);
+ const uint32_t para_line_id=etch_id_index(para_row_id,1);
+ uint32_t fn_offset=0;
+ for(uint32_t i=0;i<cached.token_count;++i) {
+  if(cached.tokens[i].flags&InlayInlineFootnote){fn_offset=cached.tokens[i].offset;break;}
+ }
+ ok &= fn_offset>0;
+ const uint32_t fn_span_id=etch_id_index(para_line_id,fn_offset+1);
+ const auto fn_bounds=etch_element_bounds(fn_span_id);
+ if(fn_bounds.w>0 && fn_bounds.h>0) {
+  f.pointer_pos={fn_bounds.x+fn_bounds.w*.5f,fn_bounds.y+fn_bounds.h*.5f};
+  f.pointer_down=true;
+  etch_begin_frame(ctx,&f);const auto p_res=inlay_doc_view(doc,&view);etch_end_frame(ctx);
+  f.pointer_down=false;
+  etch_begin_frame(ctx,&f);const auto r_res=inlay_doc_view(doc,&view);etch_end_frame(ctx);
+  ok &= str_equal(p_res.clicked_link,ETCH_STR_LIT("[^fn1]")) ||
+        str_equal(r_res.clicked_link,ETCH_STR_LIT("[^fn1]"));
+ } else ok=false;
+
+ // Click the first task-list checkbox (- [ ] First task)
+ const uint32_t task_row_id=doc_row_id(doc,view.id,cached.rows[3]);
+ const uint32_t cb_id=etch_id_index(etch_id_index(task_row_id,1),0x5441u);
+ ok &= etch_perform_a11y_action(cb_id,ETCH_A11Y_ACT_PRESS,0,{},ctx,nullptr);
+ f.pointer_pos={0,0};
+ etch_begin_frame(ctx,&f);inlay_doc_view(doc,&view);etch_end_frame(ctx);
+ ok &= task_ctx.calls==1 && task_ctx.block==3 && task_ctx.item==0 && task_ctx.checked;
+ const auto updated_src=inlay_doc_source(doc);
+ bool toggled_src=false;
+ const char* needle="- [x] First task";const uint32_t nlen=uint32_t(std::strlen(needle));
+ for(uint32_t i=0;i+nlen<=updated_src.length;++i)if(!std::memcmp(updated_src.chars+i,needle,nlen)){toggled_src=true;break;}
+ ok &= toggled_src;
+
+ etch_destroy_loaded_texture(ctx,&tex);
+ if(!ok)std::fprintf(stderr,"v0.9 features failed: banner=%.1fx%.1f fn=%.1fx%.1f task=%u/%u/%u/%d\n",
+                     banner_bounds.w,banner_bounds.h,fn_bounds.w,fn_bounds.h,
+                     task_ctx.calls,task_ctx.block,task_ctx.item,task_ctx.checked);
+ return ok;
+}
 }
 int main(int argc,char** argv) {
  if(argc==4) {
@@ -735,6 +913,8 @@ int main(int argc,char** argv) {
  ok &= flow_height_after_refresh(ctx,streamed);
  ok &= streaming_row_id_and_scroll(ctx,streamed);
  ok &= mermaid_single_pass_arena(ctx,streamed);
+ ok &= doc_style_customization(ctx,streamed);
+ ok &= doc_images_highlights_footnotes_tasks(ctx,reference,streamed);
  inlay_doc_destroy(reference);inlay_doc_destroy(streamed);etch_destroy_context(ctx);
  ok &= flow_document(nullptr);
  std::printf("32KB streaming equivalence: %s\n",ok ? "PASS" : "FAIL");return ok ? 0 : 1;

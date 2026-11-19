@@ -5,7 +5,7 @@
 #include <stdint.h>
 #include <etch/etch_c.h>
 #define INLAY_VERSION_MAJOR 0
-#define INLAY_VERSION_MINOR 8
+#define INLAY_VERSION_MINOR 9
 #define INLAY_VERSION_PATCH 0
 #define INLAY_STRING_DETAIL(x) #x
 #define INLAY_STRING(x) INLAY_STRING_DETAIL(x)
@@ -16,7 +16,8 @@ extern "C" {
 typedef struct InlayDoc InlayDoc;
 typedef enum InlayBlockKind {
  INLAY_PARAGRAPH, INLAY_HEADING, INLAY_CODE_BLOCK, INLAY_BLOCKQUOTE,
- INLAY_ALERT, INLAY_LIST, INLAY_TASK_LIST, INLAY_TABLE, INLAY_THEMATIC_BREAK, INLAY_DETAILS, INLAY_MATH_BLOCK
+ INLAY_ALERT, INLAY_LIST, INLAY_TASK_LIST, INLAY_TABLE, INLAY_THEMATIC_BREAK, INLAY_DETAILS, INLAY_MATH_BLOCK,
+ INLAY_IMAGE, INLAY_FOOTNOTE
 } InlayBlockKind;
 typedef struct InlayBlock {
  InlayBlockKind kind;
@@ -36,6 +37,21 @@ typedef enum InlayInlineKind {
    The callback must not mutate the document. */
 typedef bool (*InlayInlineDecoratorFn)(InlayInlineKind kind,EtchStr text,EtchStr url,
                                       EtchTextSpan* inout_span,void* user_data);
+typedef struct InlayDocStyle {
+ EtchColor background,text_color,muted_color,heading_color,link_color,
+  code_bg,code_border,quote_bg,quote_border,table_header_bg,
+  table_border,highlight_bg,selection_color;
+ bool has_background;
+ uint16_t font_id,bold_font_id,mono_font_id;
+ float line_height_scale;
+ float heading_scale[6];
+} InlayDocStyle;
+typedef struct InlayImageResult {
+ struct SDL_GPUTexture* texture;
+ float width_px,height_px,radius_px;
+} InlayImageResult;
+typedef bool (*InlayImageResolverFn)(EtchStr alt,EtchStr src,InlayImageResult* out_image,void* user_data);
+typedef void (*InlayTaskToggleFn)(uint32_t block_index,uint32_t item_index,bool checked,void* user_data);
 typedef struct InlayDocViewDesc {
  uint32_t id;
  float width_px,height_px,font_size_px; /* Zero height builds an auto-height view. */
@@ -44,6 +60,11 @@ typedef struct InlayDocViewDesc {
  bool hide_code_copy_button;
  InlayInlineDecoratorFn inline_decorator_fn;
  void* inline_decorator_user_data;
+ const InlayDocStyle* style;
+ InlayImageResolverFn image_resolver_fn;
+ void* image_resolver_user_data;
+ InlayTaskToggleFn task_toggle_fn;
+ void* task_toggle_user_data;
 } InlayDocViewDesc;
 typedef struct InlayDocResult {
  EtchStr clicked_link;
@@ -64,6 +85,7 @@ InlayDiagramDesc inlay_diagram_desc_default(void);
 InlayDiagramResult inlay_diagram_layout(EtchStr source,const InlayDiagramDesc* desc);
 InlayDiagramResult inlay_diagram_view(EtchStr source,const InlayDiagramDesc* desc);
 InlayDocConfig inlay_doc_config_default(void);
+InlayDocStyle inlay_doc_style_default(void);
 InlayDocViewDesc inlay_doc_view_desc_default(void);
 InlayDoc* inlay_doc_create(EtchContext*,const InlayDocConfig*);
 void inlay_doc_destroy(InlayDoc*);
@@ -80,7 +102,10 @@ float inlay_doc_measure_height(InlayDoc*,uint32_t view_id,float width_px,float f
 
 typedef struct InlaySurface InlaySurface;
 typedef struct InlaySurfaceDesc {size_t memory_limit_bytes,max_stack_bytes;float max_tick_ms;uint32_t max_nodes,max_text_bytes;} InlaySurfaceDesc;
-typedef enum InlayUiKind {INLAY_UI_BOX,INLAY_UI_TEXT,INLAY_UI_BUTTON,INLAY_UI_INPUT,INLAY_UI_TOGGLE} InlayUiKind;
+typedef enum InlayUiKind {
+ INLAY_UI_BOX, INLAY_UI_TEXT, INLAY_UI_BUTTON, INLAY_UI_INPUT, INLAY_UI_TOGGLE,
+ INLAY_UI_SCROLL, INLAY_UI_PROGRESS, INLAY_UI_SLIDER, INLAY_UI_BADGE, INLAY_UI_DIVIDER, INLAY_UI_IMAGE
+} InlayUiKind;
 typedef struct InlayUiNode {InlayUiKind kind;uint32_t id,first_child,next_sibling;EtchStr text;} InlayUiNode;
 typedef struct InlaySurfaceViewDesc {uint32_t id;float width_px,height_px;} InlaySurfaceViewDesc;
 /* last_reload_ms measures engine reload; total includes filesystem read latency. */

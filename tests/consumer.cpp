@@ -33,5 +33,30 @@ int main() {
  }
  inlay_doc_destroy(doc);
  etch_destroy_context(ctx);
+
+ // Zero-cast C++20 wrapper verification with etch::Context* directly
+ etch::Context* cpp_ctx=etch::create_context({.headless=true});
+ if(!cpp_ctx)return 1;
+ inlay::Doc* cpp_doc=inlay::create_doc(cpp_ctx);
+ inlay::Surface* cpp_surf=inlay::create_surface(cpp_ctx);
+ inlay::Portal* cpp_portal=inlay::create_portal(cpp_ctx);
+ inlay::DocStyle style=inlay::doc_style_default();
+ style.has_background=true;
+ style.highlight_bg=etch_rgba8(255,210,70,110);
+ auto cpp_view=inlay::doc_view_desc_default();
+ cpp_view.id=etch::id("cpp-zero-cast");cpp_view.width_px=240;cpp_view.height_px=0;
+ cpp_view.style=&style;
+ ok &= cpp_doc && cpp_surf && cpp_portal &&
+       inlay_doc_set_utf8(cpp_doc,ETCH_STR_LIT("Zero-cast ==C++20== wrapper"));
+ if(ok) {
+  etch::begin_frame(cpp_ctx,{.viewport_w=320,.viewport_h=240});
+  const inlay::DocResult r=inlay_doc_view(cpp_doc,&cpp_view);
+  etch::end_frame(cpp_ctx);
+  ok &= r.measured_height_px>0 && r.visible_end==1;
+ }
+ inlay_portal_destroy(cpp_portal);
+ inlay_surface_destroy(cpp_surf);
+ inlay_doc_destroy(cpp_doc);
+ etch::destroy_context(cpp_ctx);
  return ok ? 0 : 1;
 }

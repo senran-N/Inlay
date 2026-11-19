@@ -15,12 +15,17 @@ constexpr uint32_t none = UINT32_MAX;
 constexpr uint32_t input_capacity = 8192;
 struct Style {
     float width, height, gap, padding, size, border_width;
+    float opacity, value, min_val, max_val, step;
     EtchPadding border_sides;
     EtchAlignX align_x;
     EtchAlignY align_y;
-    EtchStr background, color, border_color, radius, action, placeholder;
-    bool column, animate, checked;
+    EtchStr background, color, border_color, track_color, radius, action, placeholder, src;
+    uint32_t sprite_id;
+    uint16_t icon_id;
+    bool column, animate, checked, scroll_x, scroll_y;
     bool has_padding, has_size, has_border_width, has_align_x, has_align_y;
+    bool has_opacity, has_value, has_min, has_max, has_step, has_scroll_x, has_scroll_y;
+    bool has_sprite, has_icon;
 };
 struct Action {
     char name[64];
@@ -165,7 +170,7 @@ EtchStr string_prop(InlaySurface *s, JSValueConst object, const char *name) {
     JS_FreeValue(s->js, v);
     return result;
 }
-bool opt_number_prop(InlaySurface *s, JSValueConst object, const char *name, float *out) {
+bool opt_number_prop(InlaySurface *s, JSValueConst object, const char *name, float *out, bool unbounded = false) {
     const auto v = JS_GetPropertyStr(s->js, object, name);
     if (JS_IsUndefined(v)) {
         JS_FreeValue(s->js, v);
@@ -175,11 +180,12 @@ bool opt_number_prop(InlaySurface *s, JSValueConst object, const char *name, flo
     if (JS_ToFloat64(s->js, &value, v) < 0)
         value = *out;
     JS_FreeValue(s->js, v);
-    if (!std::isfinite(value) || value < -1 || value > 16384) {
+    const float narrowed = float(value);
+    if (!std::isfinite(value) || !std::isfinite(narrowed) || (!unbounded && (value < -1 || value > 16384))) {
         JS_ThrowTypeError(s->js, "Invalid UI numeric property: %s", name);
         return false;
     }
-    *out = float(value);
+    *out = narrowed;
     return true;
 }
 float number_prop(InlaySurface *s, JSValueConst object, const char *name, float fallback) {
@@ -192,6 +198,33 @@ bool bool_prop(InlaySurface *s, JSValueConst object, const char *name) {
     const bool result = JS_ToBool(s->js, v) > 0;
     JS_FreeValue(s->js, v);
     return result;
+}
+bool opt_bool_prop(InlaySurface *s, JSValueConst object, const char *name, bool *out) {
+    const auto v = JS_GetPropertyStr(s->js, object, name);
+    if (JS_IsUndefined(v)) {
+        JS_FreeValue(s->js, v);
+        return false;
+    }
+    *out = JS_ToBool(s->js, v) > 0;
+    JS_FreeValue(s->js, v);
+    return true;
+}
+bool opt_uint_prop(InlaySurface *s, JSValueConst object, const char *name, uint32_t max_value, uint32_t *out) {
+    const auto v = JS_GetPropertyStr(s->js, object, name);
+    if (JS_IsUndefined(v)) {
+        JS_FreeValue(s->js, v);
+        return false;
+    }
+    double value = -1.0;
+    const int rc = JS_ToFloat64(s->js, &value, v);
+    JS_FreeValue(s->js, v);
+    if (rc < 0 || !std::isfinite(value) || value < 0.0 || value > double(max_value) ||
+        std::trunc(value) != value) {
+        JS_ThrowTypeError(s->js, "Invalid UI integer property: %s", name);
+        return false;
+    }
+    *out = uint32_t(value);
+    return true;
 }
 bool equal(EtchStr value, const char *text) {
     return value.length == std::strlen(text) && !std::memcmp(value.chars, text, value.length);
@@ -233,9 +266,21 @@ void parse_style(InlaySurface *s, JSValueConst props, InlayUiKind kind, Style &s
     style.has_padding = opt_number_prop(s, props, "padding", &style.padding);
     style.size = 15;
     style.has_size = opt_number_prop(s, props, "fontSize", &style.size);
+    style.opacity = 1.f;
+    style.has_opacity = opt_number_prop(s, props, "opacity", &style.opacity);
+    if (style.has_opacity)
+        style.opacity = std::fmin(1.f, std::fmax(0.f, style.opacity));
+    if (kind == INLAY_UI_PROGRESS || kind == INLAY_UI_SLIDER) {
+        style.has_value = opt_number_prop(s, props, "value", &style.value, true);
+        style.has_min = opt_number_prop(s, props, "min", &style.min_val, true);
+        style.has_max = opt_number_prop(s, props, "max", &style.max_val, true);
+        style.has_step = opt_number_prop(s, props, "step", &style.step, true);
+    }
     style.background = string_prop(s, props, "bg");
     style.color = string_prop(s, props, "color");
     style.border_color = string_prop(s, props, "borderColor");
+    style.track_color = string_prop(s, props, "trackColor");
+    style.src = string_prop(s, props, "src");
     style.has_border_width = opt_number_prop(s, props, "borderWidth", &style.border_width);
     style.border_sides.top = std::fmax(0.f, number_prop(s, props, "borderTop", 0));
     style.border_sides.right = std::fmax(0.f, number_prop(s, props, "borderRight", 0));
@@ -248,11 +293,29 @@ void parse_style(InlaySurface *s, JSValueConst props, InlayUiKind kind, Style &s
     const auto align_y = string_prop(s, props, "alignY");
     style.has_align_y =
         parse_align_y(align_y.length ? align_y : string_prop(s, props, "alignItems"), &style.align_y);
-    if (kind == INLAY_UI_INPUT || kind == INLAY_UI_TOGGLE)
+    style.has_scroll_x = opt_bool_prop(s, props, "scrollX", &style.scroll_x) ||
+                         opt_bool_prop(s, props, "scroll_x", &style.scroll_x);
+    style.has_scroll_y = opt_bool_prop(s, props, "scrollY", &style.scroll_y) ||
+                         opt_bool_prop(s, props, "scroll_y", &style.scroll_y);
+    if (kind == INLAY_UI_IMAGE) {
+        uint32_t icon = 0;
+        style.has_sprite = opt_uint_prop(s, props, "spriteId", UINT32_MAX, &style.sprite_id);
+        if (opt_uint_prop(s, props, "iconId", uint32_t(ETCH_INVALID_ICON - 1u), &icon)) {
+            style.has_icon = true;
+            style.icon_id = uint16_t(icon);
+        }
+    }
+    if (kind == INLAY_UI_INPUT || kind == INLAY_UI_TOGGLE || kind == INLAY_UI_SLIDER) {
         style.action = string_prop(s, props, "onChange");
-    else if (kind == INLAY_UI_BUTTON)
+        if (!style.action.length)
+            style.action = string_prop(s, props, "action");
+    } else if (kind == INLAY_UI_BUTTON) {
         style.action = string_prop(s, props, "onClick");
-    style.column = equal(string_prop(s, props, "axis"), "column");
+        if (!style.action.length)
+            style.action = string_prop(s, props, "action");
+    }
+    const auto axis = string_prop(s, props, "axis");
+    style.column = kind == INLAY_UI_SCROLL ? !equal(axis, "row") : equal(axis, "column");
     style.animate = bool_prop(s, props, "animateLayout");
 }
 uint32_t build(InlaySurface *s, JSValueConst value, uint32_t depth) {
@@ -271,6 +334,7 @@ uint32_t build(InlaySurface *s, JSValueConst value, uint32_t depth) {
     n = {INLAY_UI_TEXT, index + 1, none, none, {}};
     s->styles[index] = {};
     s->styles[index].size = 15;
+    s->styles[index].opacity = 1.f;
     if (!JS_IsObject(value)) {
         n.text = copy_text(s, value);
         return index;
@@ -284,6 +348,18 @@ uint32_t build(InlaySurface *s, JSValueConst value, uint32_t depth) {
         n.kind = INLAY_UI_INPUT;
     else if (equal(tag, "toggle"))
         n.kind = INLAY_UI_TOGGLE;
+    else if (equal(tag, "scroll"))
+        n.kind = INLAY_UI_SCROLL;
+    else if (equal(tag, "progress"))
+        n.kind = INLAY_UI_PROGRESS;
+    else if (equal(tag, "slider"))
+        n.kind = INLAY_UI_SLIDER;
+    else if (equal(tag, "badge"))
+        n.kind = INLAY_UI_BADGE;
+    else if (equal(tag, "divider"))
+        n.kind = INLAY_UI_DIVIDER;
+    else if (equal(tag, "image"))
+        n.kind = INLAY_UI_IMAGE;
     else if (!equal(tag, "text")) {
         JS_ThrowTypeError(s->js, "Unknown UI tag");
         return none;
@@ -308,8 +384,19 @@ uint32_t build(InlaySurface *s, JSValueConst value, uint32_t depth) {
     } else if (n.kind == INLAY_UI_TOGGLE) {
         n.text = string_prop(s, props, "label");
         style.checked = bool_prop(s, props, "checked");
-    } else
+    } else if (n.kind == INLAY_UI_SLIDER) {
+        n.text = string_prop(s, props, "label");
+        if (!n.text.length)
+            n.text = string_prop(s, props, "text");
+    } else if (n.kind == INLAY_UI_IMAGE) {
+        n.text = string_prop(s, props, "alt");
+        if (!n.text.length)
+            n.text = string_prop(s, props, "text");
+    } else {
         n.text = string_prop(s, props, "text");
+        if (n.kind == INLAY_UI_PROGRESS && !n.text.length)
+            n.text = string_prop(s, props, "label");
+    }
     JS_FreeValue(s->js, props);
     const auto children = JS_GetPropertyStr(s->js, value, "children");
     if (JS_IsArray(children)) {
@@ -335,7 +422,7 @@ uint32_t build(InlaySurface *s, JSValueConst value, uint32_t depth) {
             }
     }
     JS_FreeValue(s->js, children);
-    if (n.kind != INLAY_UI_BOX && !n.text.length && n.first_child != none)
+    if (n.kind != INLAY_UI_BOX && n.kind != INLAY_UI_SCROLL && !n.text.length && n.first_child != none)
         n.text = s->nodes[n.first_child].text;
     return index;
 }
@@ -599,8 +686,12 @@ bool load(InlaySurface *s, EtchStr script, bool reuse = false) {
                           JS_NewCFunction(s->js, clear_timeout, "clearTimeout", 1));
         JS_SetPropertyStr(s->js, global, "Atomics", JS_UNDEFINED);
         JS_SetPropertyStr(s->js, global, "SharedArrayBuffer", JS_UNDEFINED);
-        static const char bootstrap[] = "globalThis.h=(tag,props,...children)=>({tag,props:props||{"
-                                        "},children:children.flat()});";
+        static const char bootstrap[] =
+            "globalThis.h=(tag,props,...children)=>({tag,props:props||{},children:children.flat()});"
+            "(()=>{const m=t=>(p,...c)=>(p&&typeof p==='object'&&typeof p.tag==='string')?h(t,{},p,...c):h(t,p,...c),"
+            "x=t=>(p,...c)=>typeof p==='string'?h(t,{text:p},...c):h(t,p,...c);"
+            "globalThis.ui={box:m('box'),text:x('text'),button:m('button'),input:m('input'),toggle:m('toggle'),"
+            "scroll:m('scroll'),progress:m('progress'),slider:m('slider'),badge:x('badge'),divider:m('divider'),image:m('image')};})();";
         auto bootstrap_result =
             JS_Eval(s->js, bootstrap, sizeof(bootstrap) - 1, "<inlay>", JS_EVAL_TYPE_GLOBAL);
         JS_FreeValue(s->js, bootstrap_result);
@@ -763,7 +854,14 @@ void draw_node(InlaySurface *s, uint32_t index, uint32_t parent, const EtchTheme
     const auto &st = s->styles[index];
     const uint32_t id = etch_id_index(parent, n.id);
     const bool sides = has_border_sides(st.border_sides);
-    if (n.kind == INLAY_UI_BOX) {
+    const bool use_layer = st.has_opacity && st.opacity < 1.f &&
+        n.kind != INLAY_UI_BOX && n.kind != INLAY_UI_SCROLL && n.kind != INLAY_UI_BADGE && n.kind != INLAY_UI_DIVIDER;
+    if (use_layer) {
+        auto layer = etch_layer_desc_default();
+        layer.opacity = st.opacity;
+        etch_push_layer(&layer);
+    }
+    if (n.kind == INLAY_UI_BOX || n.kind == INLAY_UI_SCROLL) {
         auto box = etch_box_desc_default();
         box.id = id;
         box.axis = st.column ? ETCH_AXIS_COL : ETCH_AXIS_ROW;
@@ -784,6 +882,19 @@ void draw_node(InlaySurface *s, uint32_t index, uint32_t parent, const EtchTheme
             box.border_color = color(st.border_color, theme, theme.border_subtle);
         box.radius = etch_corners_all(parse_radius(st.radius, theme, 0));
         box.animate_layout = st.animate;
+        if (st.has_opacity)
+            box.opacity = st.opacity;
+        if (n.kind == INLAY_UI_SCROLL) {
+            box.scroll_x = st.has_scroll_x ? st.scroll_x : false;
+            box.scroll_y = st.has_scroll_y ? st.scroll_y : true;
+            box.clip_children = true;
+            box.show_scrollbar = true;
+        } else if (st.has_scroll_x || st.has_scroll_y) {
+            box.scroll_x = st.scroll_x;
+            box.scroll_y = st.scroll_y;
+            if (box.scroll_x || box.scroll_y)
+                box.clip_children = true;
+        }
         etch_begin_box(&box);
         for (uint32_t at = n.first_child; at != none; at = s->nodes[at].next_sibling)
             draw_node(s, at, id, theme, events);
@@ -929,6 +1040,151 @@ void draw_node(InlaySurface *s, uint32_t index, uint32_t parent, const EtchTheme
         toggle.font_size_px = st.size;
         if (etch_toggle_switch(&toggle))
             queue_event(s, events, st.action, checked ? ETCH_STR_LIT("true") : ETCH_STR_LIT("false"));
+    } else if (n.kind == INLAY_UI_PROGRESS) {
+        auto pb = etch_progress_bar_desc_default();
+        pb.id = id;
+        const float min_v = st.has_min ? st.min_val : 0.f;
+        const float max_v = st.has_max ? st.max_val : 1.f;
+        const float denom = max_v - min_v;
+        const float raw = st.has_value ? st.value : 0.f;
+        pb.fraction = denom > 0.f ? std::fmin(1.f, std::fmax(0.f, (raw - min_v) / denom)) : 0.f;
+        pb.overlay_text = frame_text(s, n.text);
+        if (st.width < 0)
+            pb.width = etch_sizing_grow(0, 0);
+        else if (st.width > 0)
+            pb.width = etch_sizing_fixed(st.width);
+        if (st.height > 0)
+            pb.height = etch_sizing_fixed(st.height);
+        if (st.radius.length)
+            pb.radius = etch_corners_all(parse_radius(st.radius, theme, theme.radius_pill_px));
+        if (st.track_color.length)
+            pb.track_color = color(st.track_color, theme, pb.track_color);
+        else if (st.background.length)
+            pb.track_color = color(st.background, theme, pb.track_color);
+        if (st.color.length)
+            pb.fill_color = color(st.color, theme, pb.fill_color);
+        if (st.has_size && st.size > 0)
+            pb.font_size_px = st.size;
+        etch_progress_bar(&pb);
+    } else if (n.kind == INLAY_UI_SLIDER) {
+        auto sl = etch_slider_desc_default();
+        float val = st.has_value ? st.value : 0.f;
+        sl.id = id;
+        sl.label = frame_text(s, n.text);
+        sl.value = &val;
+        sl.min_value = st.has_min ? st.min_val : 0.f;
+        sl.max_value = st.has_max ? st.max_val : 1.f;
+        if (sl.max_value <= sl.min_value)
+            sl.max_value = sl.min_value + 1.f;
+        sl.step = st.has_step && st.step >= 0.f ? st.step : 0.f;
+        if (st.width < 0)
+            sl.width = etch_sizing_grow(0, 0);
+        else if (st.width > 0)
+            sl.width = etch_sizing_fixed(st.width);
+        if (st.height > 0)
+            sl.height_px = st.height;
+        if (st.background.length)
+            sl.background = color(st.background, theme, sl.background);
+        if (st.color.length)
+            sl.fill_color = color(st.color, theme, sl.fill_color);
+        if (etch_slider(&sl) && st.action.length) {
+            char buf[32] = {};
+            const int len = std::snprintf(buf, sizeof(buf), "%.9g", double(val));
+            if (len > 0)
+                queue_event(s, events, st.action, frame_text(s, {buf, uint32_t(len), false}));
+        }
+    } else if (n.kind == INLAY_UI_BADGE) {
+        auto box = etch_box_desc_default();
+        box.id = id;
+        box.width = st.width < 0   ? etch_sizing_grow(0, 0)
+                    : st.width > 0 ? etch_sizing_fixed(st.width)
+                                   : etch_sizing_fit(0, 0);
+        box.height = st.height < 0   ? etch_sizing_grow(0, 0)
+                     : st.height > 0 ? etch_sizing_fixed(st.height)
+                                     : etch_sizing_fit(0, 0);
+        box.padding = st.has_padding ? etch_padding_all(std::fmax(0.f, st.padding))
+                                     : etch_padding_xy(8, 3);
+        box.align_x = st.has_align_x ? st.align_x : ETCH_ALIGN_X_CENTER;
+        box.align_y = st.has_align_y ? st.align_y : ETCH_ALIGN_Y_CENTER;
+        box.background = st.background.length ? color(st.background, theme, theme.surface_subtle)
+                                              : theme.surface_subtle;
+        box.border_width = st.has_border_width ? std::fmax(0.f, st.border_width)
+                                               : (st.border_color.length ? 1.f : 0.f);
+        if (st.border_color.length || box.border_width > 0)
+            box.border_color = color(st.border_color, theme, theme.border_subtle);
+        box.radius = etch_corners_all(parse_radius(st.radius, theme, theme.radius_pill_px));
+        if (st.has_opacity)
+            box.opacity = st.opacity;
+        etch_begin_box(&box);
+        auto text = etch_text_desc_default();
+        text.font_size_px = st.has_size && st.size > 0 ? st.size : 12.f;
+        text.color = st.color.length ? color(st.color, theme, theme.text_primary) : theme.text_primary;
+        text.wrap = false;
+        etch_text(frame_text(s, n.text), &text);
+        etch_end_box();
+    } else if (n.kind == INLAY_UI_DIVIDER) {
+        auto box = etch_box_desc_default();
+        box.id = id;
+        if (!st.column) {
+            box.width = st.width < 0   ? etch_sizing_grow(0, 0)
+                        : st.width > 0 ? etch_sizing_fixed(st.width)
+                                       : etch_sizing_grow(0, 0);
+            box.height = etch_sizing_fixed(st.height > 0 ? st.height : 1.f);
+        } else {
+            box.width = etch_sizing_fixed(st.width > 0 ? st.width : 1.f);
+            box.height = st.height < 0   ? etch_sizing_grow(0, 0)
+                         : st.height > 0 ? etch_sizing_fixed(st.height)
+                                         : etch_sizing_grow(0, 0);
+        }
+        box.background = st.color.length        ? color(st.color, theme, theme.border_line)
+                         : st.background.length ? color(st.background, theme, theme.border_line)
+                                                : theme.border_line;
+        if (st.has_opacity)
+            box.opacity = st.opacity;
+        etch_box(&box);
+    } else if (n.kind == INLAY_UI_IMAGE) {
+        if (st.has_sprite && st.sprite_id != ETCH_INVALID_SPRITE) {
+            auto img = etch_image_desc_default();
+            img.id = id;
+            img.sprite_id = st.sprite_id;
+            img.width = st.width > 0 ? etch_sizing_fixed(st.width) : etch_sizing_fit(0, 0);
+            img.height = st.height > 0 ? etch_sizing_fixed(st.height) : etch_sizing_fit(0, 0);
+            if (st.radius.length)
+                img.radius = etch_corners_all(parse_radius(st.radius, theme, 0));
+            if (st.color.length)
+                img.tint = color(st.color, theme, etch_color_white(255));
+            etch_image(&img);
+        } else if (st.has_icon && st.icon_id != ETCH_INVALID_ICON) {
+            auto ic = etch_icon_desc_default();
+            ic.id = id;
+            ic.icon_id = st.icon_id;
+            ic.size_px = st.width > 0 ? st.width : (st.has_size && st.size > 0 ? st.size : 24.f);
+            ic.color = st.color.length ? color(st.color, theme, theme.text_primary) : theme.text_primary;
+            etch_icon(&ic);
+        } else {
+            auto box = etch_box_desc_default();
+            box.id = id;
+            box.width = st.width < 0 ? etch_sizing_grow(0, 0) : etch_sizing_fixed(st.width > 0 ? st.width : 64.f);
+            box.height = st.height < 0 ? etch_sizing_grow(0, 0) : etch_sizing_fixed(st.height > 0 ? st.height : 64.f);
+            box.align_x = ETCH_ALIGN_X_CENTER;
+            box.align_y = ETCH_ALIGN_Y_CENTER;
+            box.background = st.background.length ? color(st.background, theme, theme.surface_subtle)
+                                                  : theme.surface_subtle;
+            box.border_width = st.has_border_width ? std::fmax(0.f, st.border_width) : 1.f;
+            box.border_color = st.border_color.length ? color(st.border_color, theme, theme.border_subtle)
+                                                      : theme.border_subtle;
+            box.radius = etch_corners_all(parse_radius(st.radius, theme, theme.radius_small_px));
+            etch_begin_box(&box);
+            const EtchStr label = n.text.length ? n.text : st.src;
+            if (label.length) {
+                auto text = etch_text_desc_default();
+                text.font_size_px = st.has_size && st.size > 0 ? st.size : 12.f;
+                text.color = st.color.length ? color(st.color, theme, theme.text_muted) : theme.text_muted;
+                text.wrap = false;
+                etch_text(frame_text(s, label), &text);
+            }
+            etch_end_box();
+        }
     } else {
         auto text = etch_text_desc_default();
         text.id = id;
@@ -936,6 +1192,8 @@ void draw_node(InlaySurface *s, uint32_t index, uint32_t parent, const EtchTheme
         text.color = color(st.color, theme, theme.text_primary);
         etch_text(frame_text(s, n.text), &text);
     }
+    if (use_layer)
+        etch_pop_layer();
 }
 } // namespace
 extern "C" {

@@ -8,7 +8,8 @@ struct InlayRow {
 };
 enum InlayInlineStyle : uint32_t {
  InlayInlineCode=1u<<0, InlayInlineLink=1u<<1, InlayInlineMath=1u<<2,
- InlayInlineBold=1u<<3, InlayInlineEmphasis=1u<<4, InlayInlineStrike=1u<<5
+ InlayInlineBold=1u<<3, InlayInlineEmphasis=1u<<4, InlayInlineStrike=1u<<5,
+ InlayInlineHighlight=1u<<6, InlayInlineFootnote=1u<<7, InlayInlineImage=1u<<8
 };
 struct InlayInline {uint32_t offset,length,url_offset,url_length,flags;};
 inline bool inlay_table_rule(const char* text,uint32_t length) noexcept {
@@ -28,6 +29,7 @@ struct InlayMeasure {
  uint32_t id;
  float width,font;
  InlayDocViewDesc view;
+ InlayDocStyle style;
  double total_height;
  uint32_t revision;
  bool layout_settled;

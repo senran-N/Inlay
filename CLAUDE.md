@@ -24,5 +24,5 @@ submission before resize/destruction. Input focus/capture are local; host contro
 occlusion policy. The optional WebView2 UNDERLAY initializes STA COM in the backend.
 The host owns the window, message pump and IME.
 
-Release candidate 0.8.0 requires the public Etch 0.20 package. Keep the pre-1.0
+Release candidate 0.9.0 requires the public Etch 0.22 package. Keep the pre-1.0
 release boundary until real-hardware cross-platform and adoption sign-off.

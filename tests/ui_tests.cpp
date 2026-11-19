@@ -217,6 +217,83 @@ bool styled_surface_controls(EtchContext *ctx, const InlaySurfaceDesc &desc) {
     inlay_surface_destroy(surface);
     return ok;
 }
+bool expanded_surface_primitives(EtchContext *ctx, const InlaySurfaceDesc &desc) {
+    auto *surface = inlay_surface_create(ctx, &desc);
+    if (!surface)
+        return false;
+    bool ok = check(inlay_surface_set_script(surface, ETCH_STR_LIT(
+        "function render(s){return ui.scroll({id:'scr',width:280,height:160,padding:8,gap:6,scrollY:true},"
+        "ui.badge({id:'bdg',text:'v0.9',bg:'#224488',color:'#eef4ff'}),"
+        "ui.divider({id:'div',color:'#445566'}),"
+        "ui.progress({id:'prg',value:s.gain||50,min:0,max:100,width:240,height:14,color:'#33cc88',bg:'#1a2230'}),"
+        "ui.slider({id:'sld',label:'Gain',value:s.gain||50,min:0,max:100,step:10,width:240,action:'setGain'}),"
+        "ui.image({id:'img',alt:'cover',width:64,height:48,opacity:0.75}));}"
+        "function onEvent(n,v,s){if(n==='setGain')s.gain=v;}")),
+        "expanded ui primitives script");
+    uint32_t count = 0;
+    const auto *nodes = inlay_surface_nodes(surface, &count);
+    if (count != 6 || nodes[0].kind != INLAY_UI_SCROLL || nodes[1].kind != INLAY_UI_BADGE ||
+        nodes[2].kind != INLAY_UI_DIVIDER || nodes[3].kind != INLAY_UI_PROGRESS ||
+        nodes[4].kind != INLAY_UI_SLIDER || nodes[5].kind != INLAY_UI_IMAGE) {
+        inlay_surface_destroy(surface);
+        return check(false, "expanded ui node kinds");
+    }
+    const InlaySurfaceViewDesc view = {etch_id("expanded-ui"), 320, 220};
+    const uint32_t scr_id = etch_id_index(view.id, nodes[0].id);
+    const uint32_t bdg_id = etch_id_index(scr_id, nodes[1].id);
+    const uint32_t div_id = etch_id_index(scr_id, nodes[2].id);
+    const uint32_t prg_id = etch_id_index(scr_id, nodes[3].id);
+    const uint32_t sld_id = etch_id_index(scr_id, nodes[4].id);
+    const uint32_t img_id = etch_id_index(scr_id, nodes[5].id);
+    auto frame = etch_frame_desc_default();
+    frame.viewport_w = 320;
+    frame.viewport_h = 220;
+    etch_begin_frame(ctx, &frame);
+    inlay_surface_view(surface, &view);
+    etch_end_frame(ctx);
+    const auto scr_b = etch_element_bounds(scr_id);
+    const auto bdg_b = etch_element_bounds(bdg_id);
+    const auto div_b = etch_element_bounds(div_id);
+    const auto prg_b = etch_element_bounds(prg_id);
+    const auto sld_b = etch_element_bounds(sld_id);
+    const auto img_b = etch_element_bounds(img_id);
+    ok &= check(scr_b.w == 280 && scr_b.h == 160, "scroll dimensions");
+    ok &= check(bdg_b.w > 16 && bdg_b.h > 12, "badge dimensions");
+    ok &= check(div_b.h == 1 && div_b.w > 100, "divider dimensions");
+    ok &= check(prg_b.w == 240 && prg_b.h == 14, "progress dimensions");
+    ok &= check(sld_b.w == 240 && sld_b.h > 16, "slider dimensions");
+    ok &= check(img_b.w == 64 && img_b.h == 48, "image placeholder dimensions");
+    const uint64_t idle_before = inlay_surface_stats(surface).js_ticks;
+    etch_begin_frame(ctx, &frame);
+    inlay_surface_view(surface, &view);
+    etch_end_frame(ctx);
+    ok &= check(inlay_surface_stats(surface).js_ticks == idle_before, "expanded primitives idle zero ticks");
+    ok &= check(etch_perform_a11y_action(sld_id, ETCH_A11Y_ACT_INCREMENT, 0, {}, ctx, nullptr),
+                "increment slider via a11y");
+    etch_begin_frame(ctx, &frame);
+    inlay_surface_view(surface, &view);
+    etch_end_frame(ctx);
+    const auto json = inlay_surface_state_json(surface);
+    ok &= check(json.chars && std::strstr(json.chars, "\"gain\":60") != nullptr,
+                "slider increment updates state via action");
+    ok &= check(inlay_surface_set_script(surface, ETCH_STR_LIT(
+        "function render(){return ui.image({spriteId:4294967295,iconId:65534,width:32,height:32});}")),
+        "max valid spriteId and iconId");
+    ok &= check(!inlay_surface_set_script(surface, ETCH_STR_LIT(
+        "function render(){return ui.image({spriteId:4294967296});}")),
+        "out-of-range spriteId rejected");
+    ok &= check(!inlay_surface_set_script(surface, ETCH_STR_LIT(
+        "function render(){return ui.image({iconId:65535});}")),
+        "invalid iconId rejected");
+    ok &= check(!inlay_surface_set_script(surface, ETCH_STR_LIT(
+        "function render(){return ui.image({spriteId:1.5});}")),
+        "fractional spriteId rejected");
+    ok &= check(!inlay_surface_set_script(surface, ETCH_STR_LIT(
+        "function render(){return ui.slider({value:1e100});}")),
+        "overflow float slider value rejected");
+    inlay_surface_destroy(surface);
+    return ok;
+}
 } // namespace
 int main(int argc, char **argv) {
     auto config = etch_context_desc_default();
@@ -234,6 +311,7 @@ int main(int argc, char **argv) {
     }
     bool ok = reactive_controls(context, functional_desc);
     ok &= styled_surface_controls(context, functional_desc);
+    ok &= expanded_surface_primitives(context, functional_desc);
     const auto script = ETCH_STR_LIT(
         "function render(s){return "
         "h('box',{axis:'column',gap:8,padding:12,bg:'var(--etch-bg-elevated)',radius:'panel',"

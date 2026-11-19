@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.0] - 2026-11-19
+
+- Require Etch 0.22 and add `InlayDocStyle` (`background` with `has_background`, custom block/text/link/selection/highlight colors, custom `font_id`/`bold_font_id`/`mono_font_id`, `line_height_scale`, and `heading_scale[6]`) with reflow detection and `inlay_doc_measure_height` integration.
+- Add `![alt](src)` block and inline image parsing with `InlayImageResolverFn` callback and `[alt]` fallback pills, interactive task-list checkboxes with `InlayTaskToggleFn`, `==highlight==` inline spans, and `[^label]` / `[^label]: text` footnotes.
+- Expand `InlaySurface` QuickJS primitives with `ui.scroll`, `ui.progress`, `ui.slider`, `ui.badge`, `ui.divider`, and `ui.image` plus `opacity`, `value`, `min`, `max`, `scrollX`/`scroll_x`, and `scrollY`/`scroll_y` properties.
+- Add first-class zero-cast C++20 `etch::Context*` helper overloads and type aliases in `<inlay/inlay.h>`.
+
 ## [0.8.0] - 2026-11-19
 
 - Require Etch 0.20 and stabilize streaming document `row_id` without `content_length` so chunked appends preserve `StateMap` and code-block horizontal scroll.

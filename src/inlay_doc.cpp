@@ -42,7 +42,28 @@ InlayBlock classify(const char* text,uint32_t start,uint32_t length) noexcept {
  else if(starts(s,n,"<details")) {b.kind=INLAY_DETAILS;}
  else if(starts(s,n,"- [ ] ") || starts(s,n,"- [x] ") || starts(s,n,"- [X] ")) {b.kind=INLAY_TASK_LIST;}
  else if(starts(s,n,"- ") || starts(s,n,"* ") || starts(s,n,"+ "))b.kind=INLAY_LIST;
- else {
+ else if(n>=5 && s[0]=='!' && s[1]=='[') {
+  uint32_t trimmed=n;while(trimmed && (s[trimmed-1]==' ' || s[trimmed-1]=='\t'))--trimmed;
+  uint32_t close=2;while(close<trimmed && s[close]!=']')++close;
+  if(close+2<trimmed && s[close+1]=='(') {
+   uint32_t paren=close+2;while(paren<trimmed && s[paren]!=')')++paren;
+   if(paren==trimmed-1) {
+    b.kind=INLAY_IMAGE;
+    b.content_offset=start+indent+2;b.content_length=close-2;
+    b.language_offset=start+indent+close+2;b.language_length=paren-(close+2);
+    return b;
+   }
+  }
+ } else if(n>=4 && s[0]=='[' && s[1]=='^') {
+  uint32_t k=2;while(k<n && s[k]!=']' && s[k]!=' ' && s[k]!='\t' && s[k]!='[')++k;
+  if(k>2 && k+1<n && s[k]==']' && s[k+1]==':') {
+   uint32_t body=k+2;while(body<n && (s[body]==' ' || s[body]=='\t'))++body;
+   b.kind=INLAY_FOOTNOTE;
+   b.language_offset=start+indent+2;b.language_length=k-2;
+   b.content_offset=start+indent+body;b.content_length=start+length-b.content_offset;
+   return b;
+  }
+ } else {
   uint32_t digits=0;while(digits<n && s[digits]>='0' && s[digits]<='9')++digits;
   if(digits && digits+1<n && (s[digits]=='.' || s[digits]==')') && s[digits+1]==' ')b.kind=INLAY_LIST;
  }
@@ -91,7 +112,7 @@ void parse_tail(InlayDoc* d) noexcept {
   } else if(!blank) {
    InlayBlock b=classify(line,pos,length);
    if(current && current->kind==INLAY_PARAGRAPH && inlay_table_rule(line,length))current->kind=INLAY_TABLE;
-   const bool continuing=current && (current->kind==b.kind || (current->kind==INLAY_ALERT && b.kind==INLAY_BLOCKQUOTE) || (current->kind==INLAY_TABLE && std::memchr(line,'|',length)));
+   const bool continuing=current && ((current->kind==b.kind && b.kind!=INLAY_FOOTNOTE && b.kind!=INLAY_IMAGE) || (current->kind==INLAY_FOOTNOTE && b.kind==INLAY_PARAGRAPH && length>=2 && (line[0]==' ' || line[0]=='\t')) || (current->kind==INLAY_ALERT && b.kind==INLAY_BLOCKQUOTE) || (current->kind==INLAY_TABLE && std::memchr(line,'|',length)));
    if(continuing) {
     current->length=after-current->offset;current->content_length=after-current->content_offset;
    } else {
@@ -107,7 +128,7 @@ void parse_tail(InlayDoc* d) noexcept {
       if(full){current->complete=true;d->frozen_count=d->block_count;d->tail_start=after;current=nullptr;}
      }
     }
-    if(full && (b.kind==INLAY_HEADING || b.kind==INLAY_THEMATIC_BREAK)) {
+    if(full && (b.kind==INLAY_HEADING || b.kind==INLAY_THEMATIC_BREAK || b.kind==INLAY_IMAGE)) {
      current->complete=true;d->frozen_count=d->block_count;d->tail_start=after;current=nullptr;
     }
    }
@@ -118,7 +139,12 @@ void parse_tail(InlayDoc* d) noexcept {
 }
 extern "C" {
 InlayDocConfig inlay_doc_config_default(void) {return {4096,64};}
-InlayDocViewDesc inlay_doc_view_desc_default(void) {return {0,640,480,15,12,8,12,8,8,false,nullptr,nullptr};}
+InlayDocStyle inlay_doc_style_default(void) {
+ InlayDocStyle s={};
+ s.font_id=ETCH_INVALID_FONT;s.bold_font_id=ETCH_INVALID_FONT;s.mono_font_id=ETCH_INVALID_FONT;
+ return s;
+}
+InlayDocViewDesc inlay_doc_view_desc_default(void) {return {0,640,480,15,12,8,12,8,8,false,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr};}
 InlayDoc* inlay_doc_create(EtchContext* context,const InlayDocConfig* config) {
  if(!context)return nullptr;
  const InlayDocConfig c=config ? *config : inlay_doc_config_default();
