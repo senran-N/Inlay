@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.10.1] - 2026-11-20
+
+- Require Etch 0.24 so downstream `find_package(Inlay 0.10)` consumers adopt Etch 0.24 native file/folder dialogs and configurable desktop drawers cleanly.
+
 ## [0.10.0] - 2026-11-20
 
 - Require Etch 0.23 and forward smart sticky-bottom streaming (`InlayDocViewDesc::stick_to_bottom`, `InlayDocResult::at_bottom`, `inlay_doc_view_is_at_bottom`, and `inlay_doc_view_scroll_to_bottom`).
