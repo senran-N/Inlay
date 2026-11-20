@@ -49,10 +49,11 @@ int main() {
  ok &= cpp_doc && cpp_surf && cpp_portal &&
        inlay_doc_set_utf8(cpp_doc,ETCH_STR_LIT("Zero-cast ==C++20== wrapper"));
  if(ok) {
+  inlay::doc_view_scroll_to_bottom(cpp_view.id,true);
   etch::begin_frame(cpp_ctx,{.viewport_w=320,.viewport_h=240});
   const inlay::DocResult r=inlay_doc_view(cpp_doc,&cpp_view);
   etch::end_frame(cpp_ctx);
-  ok &= r.measured_height_px>0 && r.visible_end==1;
+  ok &= r.measured_height_px>0 && r.visible_end==1 && r.at_bottom && inlay::doc_view_is_at_bottom(cpp_view.id);
  }
  inlay_portal_destroy(cpp_portal);
  inlay_surface_destroy(cpp_surf);

@@ -35,6 +35,9 @@ using InlineDecoratorFn=InlayInlineDecoratorFn;
 using ImageResult=InlayImageResult;
 using ImageResolverFn=InlayImageResolverFn;
 using TaskToggleFn=InlayTaskToggleFn;
+using CustomFenceEstimateFn=InlayCustomFenceEstimateFn;
+using CustomFenceRenderFn=InlayCustomFenceRenderFn;
+using CodeHeaderFn=InlayCodeHeaderFn;
 
 inline EtchContext* to_c_context(etch::Context* ctx) noexcept {
  return reinterpret_cast<EtchContext*>(ctx);
@@ -58,5 +61,11 @@ inline Surface* create_surface(etch::Context* ctx,const SurfaceDesc* desc=nullpt
 }
 inline Portal* create_portal(etch::Context* ctx,const PortalDesc* desc=nullptr) noexcept {
  return inlay_portal_create(to_c_context(ctx),desc);
+}
+inline bool doc_view_is_at_bottom(uint32_t view_id) noexcept {
+ return inlay_doc_view_is_at_bottom(view_id);
+}
+inline void doc_view_scroll_to_bottom(uint32_t view_id,bool stop_momentum=true) noexcept {
+ inlay_doc_view_scroll_to_bottom(view_id,stop_momentum);
 }
 }

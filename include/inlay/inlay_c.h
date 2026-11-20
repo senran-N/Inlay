@@ -5,7 +5,7 @@
 #include <stdint.h>
 #include <etch/etch_c.h>
 #define INLAY_VERSION_MAJOR 0
-#define INLAY_VERSION_MINOR 9
+#define INLAY_VERSION_MINOR 10
 #define INLAY_VERSION_PATCH 0
 #define INLAY_STRING_DETAIL(x) #x
 #define INLAY_STRING(x) INLAY_STRING_DETAIL(x)
@@ -52,6 +52,23 @@ typedef struct InlayImageResult {
 } InlayImageResult;
 typedef bool (*InlayImageResolverFn)(EtchStr alt,EtchStr src,InlayImageResult* out_image,void* user_data);
 typedef void (*InlayTaskToggleFn)(uint32_t block_index,uint32_t item_index,bool checked,void* user_data);
+/* Return > 0 to claim a fenced code block (other than built-in mermaid) as a
+   single unsplit custom row with that initial estimated height in logical px.
+   Return <= 0 to keep standard code-block rendering. Must not mutate the doc. */
+typedef float (*InlayCustomFenceEstimateFn)(EtchStr language,EtchStr body,
+                                            float available_width_px,float font_size_px,
+                                            void* user_data);
+/* Renders a custom fenced block previously claimed by custom_fence_estimate_fn.
+   Must not mutate the document. */
+typedef void (*InlayCustomFenceRenderFn)(uint32_t block_index,uint32_t row_id,
+                                         EtchStr language,EtchStr body,
+                                         float available_width_px,float font_size_px,
+                                         void* user_data);
+/* Optional extra controls rendered on the right side of a standard code block's
+   header strip (before the built-in Copy button when visible). */
+typedef void (*InlayCodeHeaderFn)(uint32_t block_index,uint32_t row_id,
+                                  EtchStr language,EtchStr full_code,
+                                  void* user_data);
 typedef struct InlayDocViewDesc {
  uint32_t id;
  float width_px,height_px,font_size_px; /* Zero height builds an auto-height view. */
@@ -65,11 +82,18 @@ typedef struct InlayDocViewDesc {
  void* image_resolver_user_data;
  InlayTaskToggleFn task_toggle_fn;
  void* task_toggle_user_data;
+ bool stick_to_bottom;
+ InlayCustomFenceEstimateFn custom_fence_estimate_fn;
+ InlayCustomFenceRenderFn custom_fence_render_fn;
+ void* custom_fence_user_data;
+ InlayCodeHeaderFn code_header_fn;
+ void* code_header_user_data;
 } InlayDocViewDesc;
 typedef struct InlayDocResult {
  EtchStr clicked_link;
  uint32_t visible_first,visible_end,total_rows;
  float measured_height_px;
+ bool at_bottom;
 } InlayDocResult;
 typedef struct InlayMathDesc {EtchVec2 pos;float font_size_px;EtchColor color;} InlayMathDesc;
 typedef struct InlayMathResult {float width,height,baseline;bool valid;} InlayMathResult;
@@ -99,6 +123,8 @@ InlayDocResult inlay_doc_view(InlayDoc*,const InlayDocViewDesc*);
 /* Total height in logical pixels. Uses matching view measurements or estimates
    with default flow spacing. May be called outside a frame. */
 float inlay_doc_measure_height(InlayDoc*,uint32_t view_id,float width_px,float font_size_px);
+bool inlay_doc_view_is_at_bottom(uint32_t view_id);
+void inlay_doc_view_scroll_to_bottom(uint32_t view_id,bool stop_momentum);
 
 typedef struct InlaySurface InlaySurface;
 typedef struct InlaySurfaceDesc {size_t memory_limit_bytes,max_stack_bytes;float max_tick_ms;uint32_t max_nodes,max_text_bytes;} InlaySurfaceDesc;

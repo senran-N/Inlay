@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.10.0] - 2026-11-20
+
+- Require Etch 0.23 and forward smart sticky-bottom streaming (`InlayDocViewDesc::stick_to_bottom`, `InlayDocResult::at_bottom`, `inlay_doc_view_is_at_bottom`, and `inlay_doc_view_scroll_to_bottom`).
+- Add host custom fenced-block rendering hooks (`InlayCustomFenceEstimateFn` / `InlayCustomFenceRenderFn`) keeping claimed custom fences as single unsplit virtualized rows, plus a `InlayCodeHeaderFn` action slot on a unified horizontal code-block header bar.
+- Expand multi-language syntax highlighting in fenced code blocks (`//`, `#`, `--`, `/* */` comments; single/double/backtick strings; hex/binary/float literals; C/C++/Rust/TS/JS/Python/Shell/Go keywords; and semantic `+`/`-`/`@@` coloring for `diff`/`patch` blocks).
+
 ## [0.9.0] - 2026-11-19
 
 - Require Etch 0.22 and add `InlayDocStyle` (`background` with `has_background`, custom block/text/link/selection/highlight colors, custom `font_id`/`bold_font_id`/`mono_font_id`, `line_height_scale`, and `heading_scale[6]`) with reflow detection and `inlay_doc_measure_height` integration.

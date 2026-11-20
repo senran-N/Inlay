@@ -689,6 +689,119 @@ bool doc_images_highlights_footnotes_tasks(EtchContext* ctx,InlayDoc* doc,InlayD
                      task_ctx.calls,task_ctx.block,task_ctx.item,task_ctx.checked);
  return ok;
 }
+bool doc_v010_sticky_custom_fence_and_syntax(EtchContext* ctx,InlayDoc* doc) {
+ bool ok=true;
+ // 1. Sticky-bottom virtual list stays pinned across appends, detaches on wheel-up, re-attaches via API.
+ inlay_doc_clear(doc);
+ for(int i=0;i<24;++i)ok &= inlay_doc_append_utf8(doc,ETCH_STR_LIT("Paragraph line for sticky bottom streaming test.\n\n"));
+ auto view=inlay_doc_view_desc_default();
+ view.id=etch_id("v010-sticky");
+ view.width_px=260;view.height_px=140;view.stick_to_bottom=true;
+ auto f=etch_frame_desc_default();f.viewport_w=320;f.viewport_h=200;
+ InlayDocResult res={};
+ for(int i=0;i<4;++i) {
+  etch_begin_frame(ctx,&f);res=inlay_doc_view(doc,&view);etch_end_frame(ctx);
+ }
+ const bool s1_init=res.at_bottom && inlay_doc_view_is_at_bottom(view.id);
+ ok &= s1_init;
+ const double bottom_before=etch_virtual_list_scroll_offset(view.id);
+ ok &= inlay_doc_append_utf8(doc,ETCH_STR_LIT("Streamed delta paragraph one.\n\nStreamed delta paragraph two.\n\n"));
+ for(int i=0;i<3;++i) {
+  etch_begin_frame(ctx,&f);res=inlay_doc_view(doc,&view);etch_end_frame(ctx);
+ }
+ const double bottom_after=etch_virtual_list_scroll_offset(view.id);
+ const bool s1_grow=res.at_bottom && inlay_doc_view_is_at_bottom(view.id) && bottom_after>bottom_before;
+ ok &= s1_grow;
+ // Scroll up to detach sticky-bottom.
+ const auto list_bounds=etch_element_bounds(view.id);
+ f.pointer_pos={list_bounds.x+list_bounds.w*0.5f,list_bounds.y+list_bounds.h*0.5f};
+ f.scroll_delta={0.0f,4.0f};
+ etch_begin_frame(ctx,&f);res=inlay_doc_view(doc,&view);etch_end_frame(ctx);
+ f.scroll_delta={0.0f,0.0f};
+ etch_begin_frame(ctx,&f);res=inlay_doc_view(doc,&view);etch_end_frame(ctx);
+ const bool s1_detach=!res.at_bottom && !inlay_doc_view_is_at_bottom(view.id);
+ ok &= s1_detach;
+ inlay_doc_view_scroll_to_bottom(view.id,true);
+ etch_begin_frame(ctx,&f);res=inlay_doc_view(doc,&view);etch_end_frame(ctx);
+ const bool s1_reattach=res.at_bottom && inlay_doc_view_is_at_bottom(view.id);
+ ok &= s1_reattach;
+ if(!(s1_init && s1_grow && s1_detach && s1_reattach)) {
+  std::fprintf(stderr,"v0.10 sticky failed: init=%d grow=%d detach=%d reattach=%d before=%.1f after=%.1f cur=%.1f bounds=%.1fx%.1f\n",
+               s1_init,s1_grow,s1_detach,s1_reattach,bottom_before,bottom_after,
+               etch_virtual_list_scroll_offset(view.id),list_bounds.w,list_bounds.h);
+ }
+
+ // 2. Custom fence rendering hook (single unsplit row >16 lines) + Code header slot + multi-language syntax.
+ struct Hooks {
+  uint32_t est_calls=0,render_calls=0,header_calls=0;
+  uint32_t last_custom_body_len=0;
+  bool diff_header_seen=false;
+ } hooks;
+ const auto custom_src=ETCH_STR_LIT(
+  "```omp-tool\nline1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\n"
+  "line11\nline12\nline13\nline14\nline15\nline16\nline17\nline18\nline19\nline20\n```\n\n"
+  "```rust\n// rust comment\npub fn check() -> usize { let x = 0x2A; return x; }\n```\n\n"
+  "```diff\n@@ -1,2 +1,2 @@\n-old_line\n+new_line\n```\n");
+ ok &= inlay_doc_set_utf8(doc,custom_src);
+ auto cview=inlay_doc_view_desc_default();
+ cview.id=etch_id("v010-custom");cview.width_px=360;cview.height_px=0;
+ cview.custom_fence_user_data=&hooks;
+ cview.custom_fence_estimate_fn=[](EtchStr lang,EtchStr,float,float,void* user) -> float {
+  auto& h=*static_cast<Hooks*>(user);
+  ++h.est_calls;
+  return str_equal(lang,ETCH_STR_LIT("omp-tool")) ? 56.f : 0.f;
+ };
+ cview.custom_fence_render_fn=[](uint32_t,uint32_t row_id,EtchStr lang,EtchStr body,float avail_w,float,void* user) {
+  auto& h=*static_cast<Hooks*>(user);
+  ++h.render_calls;
+  if(str_equal(lang,ETCH_STR_LIT("omp-tool")))h.last_custom_body_len=body.length;
+  auto card=etch_box_desc_default();
+  card.id=etch_id_index(row_id,77);
+  card.width=etch_sizing_fixed(avail_w);
+  card.height=etch_sizing_fixed(72.f);
+  etch_box(&card);
+ };
+ cview.code_header_user_data=&hooks;
+ cview.code_header_fn=[](uint32_t,uint32_t row_id,EtchStr lang,EtchStr,void* user) {
+  auto& h=*static_cast<Hooks*>(user);
+  ++h.header_calls;
+  if(str_equal(lang,ETCH_STR_LIT("diff")))h.diff_header_seen=true;
+  auto pill=etch_box_desc_default();
+  pill.id=etch_id_index(row_id,88);
+  pill.width=etch_sizing_fixed(28.f);pill.height=etch_sizing_fixed(18.f);
+  etch_box(&pill);
+ };
+ auto f2=etch_frame_desc_default();f2.viewport_w=420;f2.viewport_h=640;
+ InlayDocResult cres={};
+ for(int i=0;i<3;++i) {
+  etch_begin_frame(ctx,&f2);cres=inlay_doc_view(doc,&cview);etch_end_frame(ctx);
+ }
+ // 3 blocks => exactly 3 rows (custom fence with 20 lines was NOT split into 16-line chunks).
+ ok &= cres.total_rows==3 && hooks.est_calls>0 && hooks.render_calls>0 && hooks.last_custom_body_len>100;
+ ok &= hooks.header_calls>0 && hooks.diff_header_seen;
+ // Verify multi-language & diff syntax colors were emitted.
+ const EtchTheme thm=etch_get_theme(ctx);
+ const uint32_t col_kw=etch_color_pack_rgba8(thm.syntax_keyword);
+ const uint32_t col_cm=etch_color_pack_rgba8(thm.syntax_comment);
+ const uint32_t col_num=etch_color_pack_rgba8(thm.syntax_number);
+ const uint32_t col_ok=etch_color_pack_rgba8(thm.syntax_string);
+ const uint32_t col_err=etch_color_pack_rgba8(thm.danger);
+ bool seen_kw=false,seen_cm=false,seen_num=false,seen_ok=false,seen_err=false;
+ for(uint32_t j=0;j<etch_frame_prim_count(ctx);++j) {
+  EtchPrim prim={};
+  if(!etch_get_frame_prim(ctx,j,&prim))continue;
+  if(prim.style.y==col_kw)seen_kw=true;
+  if(prim.style.y==col_cm)seen_cm=true;
+  if(prim.style.y==col_num)seen_num=true;
+  if(prim.style.y==col_ok)seen_ok=true;
+  if(prim.style.y==col_err)seen_err=true;
+ }
+ ok &= seen_kw && seen_cm && seen_num && seen_ok && seen_err;
+ if(!ok)std::fprintf(stderr,"v0.10 features failed: rows=%u est=%u ren=%u hdr=%u colors=%d%d%d%d%d\n",
+                     cres.total_rows,hooks.est_calls,hooks.render_calls,hooks.header_calls,
+                     seen_kw,seen_cm,seen_num,seen_ok,seen_err);
+ return ok;
+}
 }
 int main(int argc,char** argv) {
  if(argc==4) {
@@ -915,6 +1028,7 @@ int main(int argc,char** argv) {
  ok &= mermaid_single_pass_arena(ctx,streamed);
  ok &= doc_style_customization(ctx,streamed);
  ok &= doc_images_highlights_footnotes_tasks(ctx,reference,streamed);
+ ok &= doc_v010_sticky_custom_fence_and_syntax(ctx,streamed);
  inlay_doc_destroy(reference);inlay_doc_destroy(streamed);etch_destroy_context(ctx);
  ok &= flow_document(nullptr);
  std::printf("32KB streaming equivalence: %s\n",ok ? "PASS" : "FAIL");return ok ? 0 : 1;

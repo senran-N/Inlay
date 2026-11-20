@@ -1,6 +1,6 @@
 # Inlay
 Native streamed documents on Etch, through its public C99 API. Build with CMake
-and Ninja in `build/`; a sibling `../Etch` is used when Etch 0.22 is not installed. Inlay 0.9.0 requires Etch 0.22.
+and Ninja in `build/`; a sibling `../Etch` is used when Etch 0.23 is not installed. Inlay 0.10.0 requires Etch 0.23.
 C99 includes `<inlay/inlay_c.h>`; C++20 may include `<inlay/inlay.h>`.
 
 Create a document with an Etch context, append UTF-8 chunks, and call
@@ -132,7 +132,7 @@ can implement the same public vtable; the built-in web accessor returns NULL whe
 disabled or unsupported. No unimplemented native feature is silently mocked.
 Set `INLAY_WEBVIEW2_LOADER` to enable the real-runtime async/destruction smoke test.
 
-Release candidate scope: Inlay 0.9.0 requires Etch 0.22 and remains pre-1.0.
+Release candidate scope: Inlay 0.10.0 requires Etch 0.23 and remains pre-1.0.
 Local release checks cover Windows Vulkan/D3D12, installed/subproject C99 and
 C++20 consumers, script/browser enabled and disabled configurations, bounded
 portal scratch memory and idle uploads. Metal and Linux browser/compositor
