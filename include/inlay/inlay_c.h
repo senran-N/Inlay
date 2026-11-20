@@ -45,6 +45,7 @@ typedef struct InlayDocStyle {
  uint16_t font_id,bold_font_id,mono_font_id;
  float line_height_scale;
  float heading_scale[6];
+ float code_font_scale; /* Optical scale for inline code and code blocks (0 = 1.0). */
 } InlayDocStyle;
 typedef struct InlayImageResult {
  struct SDL_GPUTexture* texture;
@@ -88,6 +89,7 @@ typedef struct InlayDocViewDesc {
  void* custom_fence_user_data;
  InlayCodeHeaderFn code_header_fn;
  void* code_header_user_data;
+ bool show_code_line_numbers;
 } InlayDocViewDesc;
 typedef struct InlayDocResult {
  EtchStr clicked_link;

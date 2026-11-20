@@ -1,4 +1,5 @@
 #include "inlay_internal.h"
+#include <cstdio>
 #include <cstring>
 #include <cmath>
 #include <cstdlib>
@@ -71,6 +72,9 @@ uint16_t effective_bold_font(const InlayDocStyle& style) noexcept {
 }
 uint16_t effective_mono_font(const InlayDocStyle& style) noexcept {
  return style.mono_font_id!=ETCH_INVALID_FONT ? style.mono_font_id : ETCH_FONT_MONO;
+}
+float effective_code_font_size(float font,const InlayDocStyle& style) noexcept {
+ return (style.code_font_scale>0.f) ? std::fmax(8.f,font*style.code_font_scale) : font;
 }
 struct ResolvedImage {
  struct SDL_GPUTexture* texture;
@@ -478,10 +482,11 @@ float rich_line(InlayMeasure* m,EtchStr line,uint32_t base_id,float font,InlayDo
   }
   if(t.flags&InlayInlineCode) {
    span.font_id=mono_font;
+   span.font_size_px=effective_code_font_size(font,style);
    span.background=style.code_bg.a!=0 ? style.code_bg : theme.surface_subtle;
    if(style.code_border.a!=0)span.border_color=style.code_border;
    span.color=theme.text_code;
-   span.padding_x=4;span.bg_radius=theme.radius_small_px;
+   span.padding_x=4;span.padding_y=1;span.bg_radius=theme.radius_small_px;
   }
   if(t.flags&InlayInlineFootnote) {
    const EtchColor fn_col=style.link_color.a!=0 ? style.link_color : theme.accent;
@@ -542,7 +547,7 @@ float rich_line(InlayMeasure* m,EtchStr line,uint32_t base_id,float font,InlayDo
  else if(style.text_color.a!=0)desc.color=style.text_color;
  if(style.selection_color.a!=0)desc.selection_color=style.selection_color;
  if(math || has_image) {
-  auto row=etch_box_desc_default();row.width=etch_sizing_fixed(width);row.wrap=true;row.align_y=ETCH_ALIGN_Y_CENTER;row.gap=4;etch_begin_box(&row);
+  auto row=etch_box_desc_default();row.width=etch_sizing_fixed(width);row.wrap=true;row.align_x=align;row.align_y=ETCH_ALIGN_Y_CENTER;row.gap=4;etch_begin_box(&row);
   for(uint32_t i=0;i<count;++i) {
    desc.id=etch_id_index(base_id,i+1);
    const auto& t=m->tokens[low+i];
@@ -603,38 +608,60 @@ bool is_code_ident_start(char c) noexcept {
 bool is_code_ident_char(char c) noexcept {
  return is_code_ident_start(c) || (c>='0' && c<='9');
 }
-bool is_code_keyword(const char* s,uint32_t len) noexcept {
+bool is_code_keyword(const char* s,uint32_t len,bool sql_mode) noexcept {
  static constexpr const char* kWords[]={
   "const","let","var","mut","fn","func","function","def","class","struct","enum","union",
   "trait","impl","interface","type","typedef","namespace","using","import","export","from","as",
-  "pub","public","private","protected","static","extern","inline","constexpr","virtual","override",
-  "final","noexcept","template","typename","auto","void","bool","char","int","long","short",
+  "pub","public","private","protected","static","extern","inline","constexpr","consteval","virtual","override",
+  "final","noexcept","template","typename","concept","requires","auto","void","bool","char","int","long","short",
   "float","double","unsigned","signed","size_t","uint8_t","uint16_t","uint32_t","uint64_t",
   "int32_t","int64_t","usize","isize","u8","u16","u32","u64","i32","i64","f32","f64","str",
-  "string","number","boolean","any","unknown","never","if","else","elif","for","while","loop",
-  "do","switch","match","case","default","break","continue","return","yield","async","await",
+  "string","number","boolean","any","unknown","never","readonly","declare","extends","implements","abstract",
+  "keyof","typeof","infer","satisfies","if","else","elif","for","while","loop","do","switch","match","case",
+  "default","break","continue","return","yield","async","await","co_await","co_return","co_yield",
   "try","catch","finally","throw","raise","with","in","of","is","not","and","or","true","false",
   "null","nullptr","nil","None","True","False","self","this","super","new","delete","sizeof",
-  "alignof","where","unsafe","move","ref","pass","lambda","package","module","local","then","fi","done"
+  "alignof","where","unsafe","move","ref","pass","lambda","package","module","local","then","fi","done",
+  "defer","chan","go","range","select","map","export","echo","set","unset","exit","cmake_minimum_required",
+  "project","add_executable","add_library","target_link_libraries","target_include_directories","find_package","option"
  };
  for(const char* word:kWords) {
   if(std::strlen(word)==len && !std::memcmp(word,s,len))return true;
+ }
+ if(sql_mode) {
+  static constexpr const char* kSql[]={
+   "SELECT","FROM","WHERE","JOIN","LEFT","RIGHT","INNER","OUTER","ON","GROUP","ORDER","BY",
+   "HAVING","LIMIT","OFFSET","INSERT","INTO","VALUES","UPDATE","SET","DELETE","CREATE","ALTER",
+   "DROP","TABLE","INDEX","VIEW","PRIMARY","KEY","FOREIGN","REFERENCES","NOT","NULL","UNIQUE",
+   "AS","AND","OR","IN","IS","LIKE","DISTINCT","UNION","ALL","CASE","WHEN","THEN","ELSE","END"
+  };
+  for(const char* word:kSql) {
+   if(std::strlen(word)==len) {
+    bool eq=true;
+    for(uint32_t k=0;k<len;++k) {
+     char ch=s[k];if(ch>='a' && ch<='z')ch=char(ch-('a'-'A'));
+     if(ch!=word[k]){eq=false;break;}
+    }
+    if(eq)return true;
+   }
+  }
  }
  return false;
 }
 void code_line(EtchStr line,EtchStr language,uint32_t id,float font,const EtchTheme& theme,const InlayDocStyle& style) {
  const uint16_t mono_font=effective_mono_font(style);
- const float line_height=font*effective_line_scale(style);
+ const float code_font=effective_code_font_size(font,style);
+ const float line_height=code_font*effective_line_scale(style);
  if(!line.length) {auto spacer=etch_box_desc_default();spacer.height=etch_sizing_fixed(line_height);etch_box(&spacer);return;}
  if(ascii_ieq(language,"diff") || ascii_ieq(language,"patch")) {
   auto span=etch_text_span_default();
-  span.font_id=mono_font;span.font_size_px=font;span.text=line;span.color=theme.text_code;
+  span.font_id=mono_font;span.font_size_px=code_font;span.text=line;span.color=theme.text_code;
   if(line.length>=2 && line.chars[0]=='@' && line.chars[1]=='@')span.color=theme.accent;
   else if(line.length>=3 && ((line.chars[0]=='+' && line.chars[1]=='+' && line.chars[2]=='+') ||
                              (line.chars[0]=='-' && line.chars[1]=='-' && line.chars[2]=='-')))span.color=theme.syntax_keyword;
   else if(line.chars[0]=='+')span.color=theme.syntax_string;
   else if(line.chars[0]=='-')span.color=theme.danger;
-  auto desc=etch_rich_text_desc_default();desc.id=id;desc.selectable=true;desc.font_id=mono_font;desc.font_size_px=font;desc.line_height_px=line_height;desc.wrap=false;
+  auto desc=etch_rich_text_desc_default();desc.id=id;desc.selectable=true;desc.font_id=mono_font;desc.font_size_px=code_font;desc.line_height_px=line_height;desc.wrap=false;
   if(style.selection_color.a!=0)desc.selection_color=style.selection_color;
   etch_text_spans(&span,1,&desc);
   return;
@@ -642,11 +669,17 @@ void code_line(EtchStr line,EtchStr language,uint32_t id,float font,const EtchTh
  const bool c_like=ascii_ieq(language,"c") || ascii_ieq(language,"cpp") || ascii_ieq(language,"c++") ||
                    ascii_ieq(language,"cxx") || ascii_ieq(language,"cc") || ascii_ieq(language,"h") ||
                    ascii_ieq(language,"hpp") || ascii_ieq(language,"hlsl") || ascii_ieq(language,"glsl");
+ const bool shell_like=ascii_ieq(language,"sh") || ascii_ieq(language,"bash") || ascii_ieq(language,"zsh") ||
+                       ascii_ieq(language,"shell") || ascii_ieq(language,"ps1") || ascii_ieq(language,"powershell");
+ const bool json_like=ascii_ieq(language,"json") || ascii_ieq(language,"jsonc");
+ const bool yaml_like=ascii_ieq(language,"yaml") || ascii_ieq(language,"yml") || ascii_ieq(language,"toml");
+ const bool sql_like=ascii_ieq(language,"sql");
+ const EtchColor type_col=theme.accent_secondary.a!=0 ? theme.accent_secondary : theme.accent;
  EtchTextSpan* spans=nullptr;uint32_t count=0,pos=0;
  for(uint32_t pass=0;pass<2;++pass) {
  count=0;pos=0;
  while(pos<line.length) {
-  uint32_t start=pos;auto span=etch_text_span_default();span.font_id=mono_font;span.font_size_px=font;span.color=theme.text_code;
+  uint32_t start=pos;auto span=etch_text_span_default();span.font_id=mono_font;span.font_size_px=code_font;span.color=theme.text_code;
   const char c=line.chars[pos];
   if(uint8_t(c)>=0x80) {++pos;while(pos<line.length && (uint8_t(line.chars[pos])&0xc0)==0x80)++pos;}
   else if((c=='/' && pos+1<line.length && line.chars[pos+1]=='/') ||
@@ -660,12 +693,27 @@ void code_line(EtchStr line,EtchStr language,uint32_t id,float font,const EtchTh
    if(c_like) {
     ++pos;while(pos<line.length && is_code_ident_char(line.chars[pos]))++pos;
     span.color=theme.syntax_keyword;
+   } else if(pos+1<line.length && line.chars[pos+1]=='[') {
+    ++pos;span.color=theme.accent;
    } else {
     pos=line.length;span.color=theme.syntax_comment;
    }
+  } else if(c=='@' && pos+1<line.length && is_code_ident_start(line.chars[pos+1])) {
+   ++pos;while(pos<line.length && is_code_ident_char(line.chars[pos]))++pos;
+   span.color=theme.accent;
+  } else if(shell_like && c=='$' && pos+1<line.length && (is_code_ident_start(line.chars[pos+1]) || line.chars[pos+1]=='{')) {
+   ++pos;
+   if(line.chars[pos]=='{') {++pos;while(pos<line.length && line.chars[pos]!='}')++pos;if(pos<line.length)++pos;}
+   else {while(pos<line.length && is_code_ident_char(line.chars[pos]))++pos;}
+   span.color=theme.syntax_number;
+  } else if(shell_like && c=='-' && pos+1<line.length && (line.chars[pos+1]=='-' || is_code_ident_start(line.chars[pos+1])) &&
+            (start==0 || line.chars[start-1]==' ')) {
+   ++pos;while(pos<line.length && (is_code_ident_char(line.chars[pos]) || line.chars[pos]=='-'))++pos;
+   span.color=type_col;
   } else if(c=='"' || c=='\'' || c=='`') {
    ++pos;while(pos<line.length) {const char next=line.chars[pos++];if(next=='\\' && pos<line.length)++pos;else if(next==c)break;}
-   span.color=theme.syntax_string;
+   uint32_t peek=pos;while(peek<line.length && line.chars[peek]==' ')++peek;
+   span.color=(json_like && c=='"' && peek<line.length && line.chars[peek]==':') ? type_col : theme.syntax_string;
   } else if(c>='0' && c<='9') {
    ++pos;
    if(c=='0' && pos<line.length && (line.chars[pos]=='x' || line.chars[pos]=='X' || line.chars[pos]=='b' || line.chars[pos]=='B')) {
@@ -678,8 +726,17 @@ void code_line(EtchStr line,EtchStr language,uint32_t id,float font,const EtchTh
    while(pos<line.length && (line.chars[pos]=='u' || line.chars[pos]=='U' || line.chars[pos]=='l' || line.chars[pos]=='L' || line.chars[pos]=='f' || line.chars[pos]=='F'))++pos;
    span.color=theme.syntax_number;
   } else if(is_code_ident_start(c)) {
-   ++pos;while(pos<line.length && is_code_ident_char(line.chars[pos]))++pos;
-   if(is_code_keyword(line.chars+start,pos-start))span.color=theme.syntax_keyword;
+   ++pos;while(pos<line.length && (is_code_ident_char(line.chars[pos]) || (yaml_like && line.chars[pos]=='-')))++pos;
+   const uint32_t tok_len=pos-start;
+   uint32_t peek=pos;while(peek<line.length && line.chars[peek]==' ')++peek;
+   if(yaml_like && peek<line.length && line.chars[peek]==':') {
+    span.color=type_col;
+   } else if(is_code_keyword(line.chars+start,tok_len,sql_like)) {
+    span.color=theme.syntax_keyword;
+   } else if(c>='A' && c<='Z' && tok_len>1) {
+    bool has_lower=false;for(uint32_t k=start+1;k<pos;++k)if(line.chars[k]>='a' && line.chars[k]<='z'){has_lower=true;break;}
+    if(has_lower)span.color=type_col;
+   }
   } else {
    ++pos;
   }
@@ -687,9 +744,73 @@ void code_line(EtchStr line,EtchStr language,uint32_t id,float font,const EtchTh
  }
  if(pass==0) {spans=static_cast<EtchTextSpan*>(etch_frame_arena_alloc(etch_current_context(),size_t(count)*sizeof(EtchTextSpan),alignof(EtchTextSpan)));if(!spans)return;}
  }
- auto desc=etch_rich_text_desc_default();desc.id=id;desc.selectable=true;desc.font_id=mono_font;desc.font_size_px=font;desc.line_height_px=line_height;desc.wrap=false;
+ auto desc=etch_rich_text_desc_default();desc.id=id;desc.selectable=true;desc.font_id=mono_font;desc.font_size_px=code_font;desc.line_height_px=line_height;desc.wrap=false;
  if(style.selection_color.a!=0)desc.selection_color=style.selection_color;
  etch_text_spans(spans,count,&desc);
+}
+void compute_table_col_widths(const InlayMeasure* measure,EtchStr source,const InlayRow& info,uint32_t columns,
+                              float width,float font,const InlayDocStyle& style,const InlayDocViewDesc& view,
+                              float* out_widths) noexcept {
+ if(!columns)return;
+ if(columns==1) {out_widths[0]=width;return;}
+ constexpr uint32_t kMaxAutoCols=32;
+ if(columns>kMaxAutoCols) {
+  const float eq=width/float(columns);
+  for(uint32_t c=0;c<columns;++c)out_widths[c]=eq;
+  return;
+ }
+ float natural[kMaxAutoCols]={};
+ const uint16_t sans_fid=effective_sans_font(style);
+ const uint16_t bold_fid=effective_bold_font(style);
+ const float min_col=std::fmin(52.f,width/float(columns));
+ const float max_col=std::fmax(min_col,width*0.62f);
+ for(uint32_t c=0;c<columns;++c)natural[c]=min_col;
+ uint32_t scanned=0;
+ for(uint32_t r=info.table_header;r<measure->count && measure->rows[r].block==info.block && scanned<32;++r) {
+  const auto& row=measure->rows[r];
+  if(row.separator)continue;
+  ++scanned;
+  EtchStr rstr=table_line(source,row);
+  uint32_t cstart=0;table_row_range(&rstr,&cstart);
+  const float cf=row.first ? std::fmax(11.f,font*0.88f) : font;
+  const uint16_t fid=row.first ? bold_fid : sans_fid;
+  for(uint32_t c=0;c<columns && cstart<rstr.length;++c) {
+   const uint32_t cstop=table_cell_end(rstr,cstart);
+   char buf[256];uint32_t blen=0;
+   bool in_code=false;
+   for(uint32_t k=cstart;k<cstop && blen<254;++k) {
+    const char ch=rstr.chars[k];
+    if(ch=='`' || ch=='*') {if(ch=='`')in_code=!in_code;continue;}
+    if(ch=='$')continue;
+    if(ch=='\\' && k+1<cstop && ((rstr.chars[k+1]>='a' && rstr.chars[k+1]<='z') || (rstr.chars[k+1]>='A' && rstr.chars[k+1]<='Z'))) {
+     // Approximate LaTeX control sequence width as ~2 chars instead of raw command length
+     ++k;while(k+1<cstop && ((rstr.chars[k+1]>='a' && rstr.chars[k+1]<='z') || (rstr.chars[k+1]>='A' && rstr.chars[k+1]<='Z')))++k;
+     buf[blen++]=' ';continue;
+    }
+    if(ch=='{' || ch=='}')continue;
+    buf[blen++]=ch;
+   }
+   while(blen>0 && buf[blen-1]==' ')--blen;
+   uint32_t b0=0;while(b0<blen && buf[b0]==' ')++b0;
+   const float tw=blen>b0 ? etch_measure_text({buf+b0,blen-b0,false},fid,cf,0.f).x : 0.f;
+   const float cw=std::fmin(max_col,std::fmax(min_col,tw+2.f*view.table_cell_padding_x+16.f));
+   natural[c]=std::fmax(natural[c],cw);
+   cstart=cstop+1;
+  }
+ }
+ float sum=0.f;
+ for(uint32_t c=0;c<columns;++c)sum+=natural[c];
+ if(sum<=0.f) {
+  const float eq=width/float(columns);
+  for(uint32_t c=0;c<columns;++c)out_widths[c]=eq;
+  return;
+ }
+ float used=0.f;
+ for(uint32_t c=0;c<columns;++c) {
+  const float w=(c+1==columns) ? std::fmax(1.f,width-used) : std::fmax(min_col,width*(natural[c]/sum));
+  out_widths[c]=w;
+  used+=w;
+ }
 }
 float block_lines(InlayMeasure* measure,const InlayBlock& b,EtchStr source,uint32_t id,float font,
                   InlayDocResult* result,const EtchTheme& theme,const InlayDocStyle& style,const InlayRow& info,bool estimate=false,
@@ -738,19 +859,25 @@ float block_lines(InlayMeasure* measure,const InlayBlock& b,EtchStr source,uint3
    const float top=info.first ? radius : 0.f,bottom=info.last_in_block ? radius : 0.f;
    row.radius={top,top,bottom,bottom};etch_begin_box(&row);
    uint32_t start=0;table_row_range(&line,&start);
-   const float cell_width=width/float(columns);
-   const float pad_x=std::fmin(view.table_cell_padding_x,cell_width*.5f);
+   float col_widths_stack[32]={};
+   float* col_widths=columns<=32 ? col_widths_stack : nullptr;
+   if(col_widths)compute_table_col_widths(measure,source,info,columns,width,font,style,view,col_widths);
+   const float eq_width=width/float(columns);
    float tallest=0;
    for(uint32_t column=0;column<columns;++column) {
+    const float cell_width=col_widths ? col_widths[column] : eq_width;
+    const float pad_x=std::fmin(view.table_cell_padding_x,cell_width*.5f);
     const auto align=table_alignment(rule,&rule_start);
     auto cell=etch_box_desc_default();cell.width=etch_sizing_fixed(cell_width);cell.axis=ETCH_AXIS_COL;
-    cell.align_x=align;cell.height=etch_sizing_fit(0,0);
+    cell.align_x=align;cell.height=etch_sizing_fit(0,0);cell.shrink_width=true;
     cell.padding=etch_padding_xy(pad_x,view.table_cell_padding_y);etch_begin_box(&cell);
     if(start<line.length) {
      const uint32_t stop=table_cell_end(line,start);
+     const float cell_font=info.first ? std::fmax(11.f,font*0.88f) : font;
+     const EtchColor cell_col=(info.first && style.muted_color.a!=0) ? style.muted_color : color_override;
      const float cell_height=rich_line(measure,{line.chars+start,stop-start,false},etch_id_index(line_id,column+1),
-                                      font,result,theme,style,0,stop-start,std::fmax(1.f,cell_width-2*pad_x),
-                                      estimate,row_box,true,info.first,align,color_override);
+                                      cell_font,result,theme,style,0,stop-start,std::fmax(1.f,cell_width-2*pad_x),
+                                      estimate,row_box,true,info.first,align,cell_col);
      tallest=std::fmax(tallest,cell_height);
      start=stop+1;
     }
@@ -767,7 +894,7 @@ float block_lines(InlayMeasure* measure,const InlayBlock& b,EtchStr source,uint3
    if((b.kind==INLAY_LIST || b.kind==INLAY_TASK_LIST) && !continuation) {
     begin_inline_row(row_box);
     uint32_t indent=0;while(indent<line.length && indent<3 && line.chars[indent]==' ')++indent;line.chars+=indent;line.length-=indent;
-    auto row=etch_box_desc_default();row.width=etch_sizing_fixed(width);row.gap=8;row.align_y=ETCH_ALIGN_Y_CENTER;etch_begin_box(&row);
+    auto row=etch_box_desc_default();row.width=etch_sizing_fixed(width);row.gap=8;row.align_y=ETCH_ALIGN_Y_TOP;row.shrink_width=true;etch_begin_box(&row);
     EtchStr marker=ETCH_STR_LIT("•");uint32_t trim=0;
     const bool task=line.length>=6 && line.chars[0]=='-' && line.chars[2]=='[';
     if(task)trim=6;
@@ -796,11 +923,17 @@ float block_lines(InlayMeasure* measure,const InlayBlock& b,EtchStr source,uint3
       }
      } else {
       auto md=etch_text_desc_default();md.font_size_px=font;md.font_id=effective_sans_font(style);md.wrap=false;
-      if(style.text_color.a!=0)md.color=style.text_color;
+      md.line_height_px=font*effective_line_scale(style);
+      md.color=style.muted_color.a!=0 ? style.muted_color : (style.text_color.a!=0 ? style.text_color : theme.text_muted);
       etch_text(marker,&md);
      }
     }
-    line.chars+=trim;line.length-=trim;render_rich(line);etch_end_box();
+    auto item_body=etch_box_desc_default();item_body.axis=ETCH_AXIS_COL;
+    item_body.width=etch_sizing_grow(0,0);item_body.height=etch_sizing_fit(0,0);item_body.shrink_width=true;
+    etch_begin_box(&item_body);
+    line.chars+=trim;line.length-=trim;render_rich(line);
+    etch_end_box();
+    etch_end_box();
    } else render_rich(line);
   }
   pos=next<end ? next+1 : end;
@@ -909,12 +1042,13 @@ bool valid_spacing(float value) {return std::isfinite(value) && value>=0;}
 bool valid_style(const InlayDocStyle* s) noexcept {
  if(!s)return true;
  if(!std::isfinite(s->line_height_scale) || s->line_height_scale<0.f || s->line_height_scale>10.f)return false;
+ if(!std::isfinite(s->code_font_scale) || s->code_font_scale<0.f || s->code_font_scale>4.f)return false;
  for(float hs:s->heading_scale)if(!std::isfinite(hs) || hs<0.f || hs>10.f)return false;
  return true;
 }
 bool style_reflow_changed(const InlayDocStyle& a,const InlayDocStyle& b) noexcept {
  if(a.font_id!=b.font_id || a.bold_font_id!=b.bold_font_id || a.mono_font_id!=b.mono_font_id ||
-    a.line_height_scale!=b.line_height_scale)return true;
+    a.line_height_scale!=b.line_height_scale || a.code_font_scale!=b.code_font_scale)return true;
  for(int i=0;i<6;++i)if(a.heading_scale[i]!=b.heading_scale[i])return true;
  return false;
 }
@@ -1081,7 +1215,7 @@ extern "C" InlayDocResult inlay_doc_view(InlayDoc* doc,const InlayDocViewDesc* i
    custom_fence_estimate(view,doc,doc->blocks[info.block],std::fmax(1.f,row_width-2*view.block_padding_px))>0.f;
   const float padding=is_custom_fence ? view.block_padding_px : block_padding(view,b.kind);
   auto box=etch_box_desc_default();box.id=row_id;box.axis=ETCH_AXIS_COL;box.width=etch_sizing_fixed(row_width);box.height=etch_sizing_fit(0,0);
-  box.padding=etch_padding_all(padding);box.gap=4;box.clip_children=true;
+  box.padding=etch_padding_all(padding);box.gap=4;box.clip_children=true;box.shrink_width=true;
   if(b.kind==INLAY_TABLE) {
    box.padding={padding,padding,info.first ? padding : 0.f,info.last_in_block ? padding : 0.f};
    box.gap=0;
@@ -1166,15 +1300,19 @@ extern "C" InlayDocResult inlay_doc_view(InlayDoc* doc,const InlayDocViewDesc* i
    const EtchStr body=slice(source,full.content_offset,full.content_length);
    view.custom_fence_render_fn(info.block,row_id,lang,body,std::fmax(1.f,row_width-2*padding),view.font_size_px,view.custom_fence_user_data);
   } else if(b.kind==INLAY_CODE_BLOCK) {
+   const auto& full=doc->blocks[info.block];
+   const float code_inner_w=std::fmax(1.f,row_width-2*padding);
    if(info.first && (!view.hide_code_copy_button || b.language_length || view.code_header_fn)) {
-    const auto& full=doc->blocks[info.block];
     const EtchStr lang=slice(source,full.language_offset,full.language_length);
     const EtchStr full_code=slice(source,full.content_offset,full.content_length);
     auto hdr=etch_box_desc_default();
-    hdr.width=etch_sizing_fixed(std::fmax(1.f,row_width-2*padding));
+    hdr.width=etch_sizing_fixed(code_inner_w);
     hdr.height=etch_sizing_fit(0,0);
+    hdr.padding={0,0,0,6};
     hdr.align_y=ETCH_ALIGN_Y_CENTER;
     hdr.gap=8;
+    hdr.border_color=style.code_border.a!=0 ? style.code_border : theme.border_subtle;
+    hdr.border_sides={0,0,0,1};
     etch_begin_box(&hdr);
     if(lang.length) {
      auto ld=etch_text_desc_default();ld.font_id=effective_mono_font(style);ld.font_size_px=std::fmax(11.f,view.font_size_px*0.82f);
@@ -1195,8 +1333,58 @@ extern "C" InlayDocResult inlay_doc_view(InlayDoc* doc,const InlayDocViewDesc* i
     }
     etch_end_box();
    }
+   const bool show_ln=view.show_code_line_numbers;
+   float scroll_w=code_inner_w;
+   if(show_ln) {
+    uint32_t start_line=1,chunk_lines=0,total_lines=1;
+    for(uint32_t k=full.content_offset;k<b.content_offset;++k)if(source.chars[k]=='\n')++start_line;
+    for(uint32_t k=full.content_offset;k<full.content_offset+full.content_length;++k)if(source.chars[k]=='\n')++total_lines;
+    {
+     uint32_t lp=b.content_offset,le=b.content_offset+b.content_length;
+     while(lp<le) {
+      uint32_t ln=lp;while(ln<le && source.chars[ln]!='\n')++ln;
+      ++chunk_lines;
+      lp=ln<le ? ln+1 : le;
+     }
+    }
+    const float gutter_w=total_lines>=1000 ? 40.f : (total_lines>=100 ? 32.f : 24.f);
+    const float code_font=effective_code_font_size(view.font_size_px,style);
+    const float line_h=code_font*effective_line_scale(style);
+    scroll_w=std::fmax(1.f,code_inner_w-gutter_w-10.f);
+    auto row_wrap=etch_box_desc_default();
+    row_wrap.axis=ETCH_AXIS_ROW;
+    row_wrap.width=etch_sizing_fixed(code_inner_w);
+    row_wrap.height=etch_sizing_fit(0,0);
+    row_wrap.gap=10;
+    etch_begin_box(&row_wrap);
+    auto gutter=etch_box_desc_default();
+    gutter.axis=ETCH_AXIS_COL;
+    gutter.width=etch_sizing_fixed(gutter_w);
+    gutter.height=etch_sizing_fit(0,0);
+    gutter.padding={0,8,0,0};
+    gutter.gap=4;
+    gutter.align_x=ETCH_ALIGN_X_RIGHT;
+    gutter.border_color=style.code_border.a!=0 ? style.code_border : theme.border_subtle;
+    gutter.border_sides={0,1,0,0};
+    etch_begin_box(&gutter);
+    auto lnd=etch_text_desc_default();
+    lnd.font_id=effective_mono_font(style);
+    lnd.font_size_px=std::fmax(10.f,code_font*0.92f);
+    lnd.line_height_px=line_h;
+    lnd.color=style.muted_color.a!=0 ? style.muted_color : theme.text_muted;
+    lnd.wrap=false;
+    for(uint32_t li=0;li<chunk_lines;++li) {
+     char nb[16];
+     const int n=std::snprintf(nb,sizeof(nb),"%u",start_line+li);
+     if(n>0) {
+      char* arena_s=static_cast<char*>(etch_frame_arena_alloc(doc->context,size_t(n),1));
+      if(arena_s) {std::memcpy(arena_s,nb,size_t(n));etch_text({arena_s,uint32_t(n),false},&lnd);}
+     }
+    }
+    etch_end_box();
+   }
    auto scroll=etch_box_desc_default();scroll.id=etch_id_index(row_id,2);
-   scroll.width=etch_sizing_fixed(std::fmax(1.f,row_width-2*padding));scroll.height=etch_sizing_fit(0,0);
+   scroll.width=etch_sizing_fixed(scroll_w);scroll.height=etch_sizing_fit(0,0);
    scroll.scroll_x=true;scroll.clip_children=true;
    etch_begin_box(&scroll);
    auto content=etch_box_desc_default();content.axis=ETCH_AXIS_COL;
@@ -1204,6 +1392,7 @@ extern "C" InlayDocResult inlay_doc_view(InlayDoc* doc,const InlayDocViewDesc* i
    etch_begin_box(&content);
    block_lines(measure,b,source,scroll.id,view.font_size_px,&result,theme,style,info);
    etch_end_box();etch_end_box();
+   if(show_ln)etch_end_box();
   } else {
    const bool estimate=view.inline_decorator_fn && (measure->heights[i]==collapsed_height ||
                        (measure->heights[i]==0 && (refresh || etch_element_bounds(row_id).h<=0)));

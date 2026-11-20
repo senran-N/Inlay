@@ -144,7 +144,7 @@ InlayDocStyle inlay_doc_style_default(void) {
  s.font_id=ETCH_INVALID_FONT;s.bold_font_id=ETCH_INVALID_FONT;s.mono_font_id=ETCH_INVALID_FONT;
  return s;
 }
-InlayDocViewDesc inlay_doc_view_desc_default(void) {return {0,640,480,15,12,8,12,8,8,false,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,false,nullptr,nullptr,nullptr,nullptr,nullptr};}
+InlayDocViewDesc inlay_doc_view_desc_default(void) {return {0,640,480,15,12,8,12,8,8,false,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,false,nullptr,nullptr,nullptr,nullptr,nullptr,false};}
 InlayDoc* inlay_doc_create(EtchContext* context,const InlayDocConfig* config) {
  if(!context)return nullptr;
  const InlayDocConfig c=config ? *config : inlay_doc_config_default();
