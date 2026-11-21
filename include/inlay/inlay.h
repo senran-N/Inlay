@@ -25,11 +25,14 @@ using MathDesc=InlayMathDesc;
 using MathResult=InlayMathResult;
 using Doc=InlayDoc;
 using BlockKind=InlayBlockKind;
+using AlertKind=InlayAlertKind;
+using BlockFlags=InlayBlockFlags;
 using Block=InlayBlock;
 using DocConfig=InlayDocConfig;
 using DocStyle=InlayDocStyle;
 using DocViewDesc=InlayDocViewDesc;
 using DocResult=InlayDocResult;
+using DocSelection=InlayDocSelection;
 using InlineKind=InlayInlineKind;
 using InlineDecoratorFn=InlayInlineDecoratorFn;
 using ImageResult=InlayImageResult;
@@ -39,6 +42,7 @@ using CustomFenceEstimateFn=InlayCustomFenceEstimateFn;
 using CustomFenceRenderFn=InlayCustomFenceRenderFn;
 using CodeHeaderFn=InlayCodeHeaderFn;
 
+inline uint32_t abi_version() noexcept { return inlay_abi_version(); }
 inline EtchContext* to_c_context(etch::Context* ctx) noexcept {
  return reinterpret_cast<EtchContext*>(ctx);
 }
@@ -51,6 +55,8 @@ inline DocViewDesc doc_view_desc_default() noexcept { return inlay_doc_view_desc
 inline SurfaceDesc surface_desc_default() noexcept { return inlay_surface_desc_default(); }
 inline SurfaceViewDesc surface_view_desc_default() noexcept { return inlay_surface_view_desc_default(); }
 inline PortalDesc portal_desc_default() noexcept { return inlay_portal_desc_default(); }
+inline PortalViewDesc portal_view_desc_default() noexcept { return inlay_portal_view_desc_default(); }
+inline PortalWebView2Options portal_webview2_options_default() noexcept { return inlay_portal_webview2_options_default(); }
 inline MathDesc math_desc_default() noexcept { return inlay_math_desc_default(); }
 inline DiagramDesc diagram_desc_default() noexcept { return inlay_diagram_desc_default(); }
 inline Doc* create_doc(etch::Context* ctx,const DocConfig* cfg=nullptr) noexcept {
@@ -67,6 +73,24 @@ inline bool doc_view_is_at_bottom(uint32_t view_id) noexcept {
 }
 inline void doc_view_scroll_to_bottom(uint32_t view_id,bool stop_momentum=true) noexcept {
  inlay_doc_view_scroll_to_bottom(view_id,stop_momentum);
+}
+inline DocSelection doc_view_selection(const Doc* doc,uint32_t view_id) noexcept {
+ return inlay_doc_view_selection(doc,view_id);
+}
+inline void doc_view_set_selection(Doc* doc,uint32_t view_id,uint32_t anchor,uint32_t focus) noexcept {
+ inlay_doc_view_set_selection(doc,view_id,anchor,focus);
+}
+inline void doc_view_select_all(Doc* doc,uint32_t view_id) noexcept {
+ inlay_doc_view_select_all(doc,view_id);
+}
+inline void doc_view_clear_selection(Doc* doc,uint32_t view_id) noexcept {
+ inlay_doc_view_clear_selection(doc,view_id);
+}
+inline uint32_t doc_view_copy_plain_text(const Doc* doc,uint32_t view_id,char* out_buf,uint32_t cap) noexcept {
+ return inlay_doc_view_copy_plain_text(doc,view_id,out_buf,cap);
+}
+inline uint32_t doc_view_copy_markdown(const Doc* doc,uint32_t view_id,char* out_buf,uint32_t cap) noexcept {
+ return inlay_doc_view_copy_markdown(doc,view_id,out_buf,cap);
 }
 inline int32_t surface_next_timer_ms(const Surface* s) noexcept {
  return inlay_surface_next_timer_ms(s);

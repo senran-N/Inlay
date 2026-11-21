@@ -1,4 +1,4 @@
-#include <inlay/inlay_c.h>
+#include "inlay_internal.h"
 #include <SDL3/SDL_timer.h>
 #include <SDL3/SDL_filesystem.h>
 #include <SDL3/SDL_iostream.h>
@@ -1376,12 +1376,10 @@ void draw_node(InlaySurface *s, uint32_t index, uint32_t parent, const EtchTheme
 }
 } // namespace
 extern "C" {
-InlaySurfaceDesc inlay_surface_desc_default(void) {
-    return {8u * 1024u * 1024u, 512u * 1024u, 4, 4096, 65536};
-}
-InlaySurfaceViewDesc inlay_surface_view_desc_default(void) { return {0, 640, 480}; }
-InlaySurface *inlay_surface_create(EtchContext *context, const InlaySurfaceDesc *desc) {
-    const auto d = desc ? *desc : inlay_surface_desc_default();
+INLAY_API InlaySurface *inlay_surface_create(EtchContext *context, const InlaySurfaceDesc *desc) {
+    InlaySurfaceDesc d = inlay_surface_desc_default();
+    if (desc && !inlay_read_abi_struct(desc, &d))
+        return nullptr;
     if (!context || d.memory_limit_bytes < 512u * 1024u ||
         d.memory_limit_bytes > 256u * 1024u * 1024u || d.max_stack_bytes < 16384 ||
         d.max_stack_bytes > 512u * 1024u || !std::isfinite(d.max_tick_ms) || d.max_tick_ms <= 0 ||
@@ -1418,7 +1416,7 @@ InlaySurface *inlay_surface_create(EtchContext *context, const InlaySurfaceDesc 
     JS_SetContextOpaque(s->js, s);
     return s;
 }
-void inlay_surface_destroy(InlaySurface *s) {
+INLAY_API void inlay_surface_destroy(InlaySurface *s) {
     if (s) {
         clear_context(s);
         if (s->runtime)
@@ -1433,12 +1431,12 @@ void inlay_surface_destroy(InlaySurface *s) {
         std::free(s);
     }
 }
-bool inlay_surface_set_script(InlaySurface *s, EtchStr script) {
+INLAY_API bool inlay_surface_set_script(InlaySurface *s, EtchStr script) {
     if (!s || s->running || (!script.chars && script.length) || script.length > 1024u * 1024u)
         return false;
     return load(s, script);
 }
-bool inlay_surface_set_state_json(InlaySurface *s, EtchStr json) {
+INLAY_API bool inlay_surface_set_state_json(InlaySurface *s, EtchStr json) {
     if (!s || !json.chars || !json.length || json.length > 65536)
         return false;
     // Parse JSON as data; installing it into script globals belongs to a bounded tick.
@@ -1459,14 +1457,14 @@ bool inlay_surface_set_state_json(InlaySurface *s, EtchStr json) {
     etch_request_redraw(s->etch);
     return s->running || !s->loaded ? true : run_update(s, {}, {});
 }
-EtchStr inlay_surface_state_json(const InlaySurface *s) {
+INLAY_API EtchStr inlay_surface_state_json(const InlaySurface *s) {
     if (!s)
         return {};
     if (s->state_dirty)
         sync_state_json(const_cast<InlaySurface *>(s));
     return EtchStr{s->state, s->state_size, false};
 }
-bool inlay_surface_bind_action(InlaySurface *s, EtchStr name, InlayActionFn fn, void *user) {
+INLAY_API bool inlay_surface_bind_action(InlaySurface *s, EtchStr name, InlayActionFn fn, void *user) {
     if (!s || !name.chars || !name.length || name.length >= 64 || !fn ||
         std::memchr(name.chars, 0, name.length))
         return false;
@@ -1485,20 +1483,20 @@ bool inlay_surface_bind_action(InlaySurface *s, EtchStr name, InlayActionFn fn, 
     a.user = user;
     return true;
 }
-bool inlay_surface_dispatch(InlaySurface *s, EtchStr name, EtchStr payload) {
+INLAY_API bool inlay_surface_dispatch(InlaySurface *s, EtchStr name, EtchStr payload) {
     if (!s || !s->js || !s->loaded || s->running || !name.chars || !name.length ||
         name.length >= 64 || !payload.chars || !payload.length || payload.length > 65536)
         return false;
     return run_update(s, name, payload);
 }
-bool inlay_surface_enable_hmr(InlaySurface *s, const char *path) {
+INLAY_API bool inlay_surface_enable_hmr(InlaySurface *s, const char *path) {
     if (!s || !path || std::strlen(path) >= sizeof(s->path))
         return false;
     std::memcpy(s->path, path, std::strlen(path) + 1);
     s->modified = -1;
     return inlay_surface_poll_hmr(s);
 }
-bool inlay_surface_poll_hmr(InlaySurface *s) {
+INLAY_API bool inlay_surface_poll_hmr(InlaySurface *s) {
     if (!s || !s->path[0] || s->running)
         return false;
     SDL_PathInfo info = {};
@@ -1535,9 +1533,10 @@ bool inlay_surface_poll_hmr(InlaySurface *s) {
         double(SDL_GetPerformanceCounter() - start) * 1000 / s->frequency;
     return ok;
 }
-void inlay_surface_view(InlaySurface *s, const InlaySurfaceViewDesc *input) {
-    if (!s || !input || !input->id || !std::isfinite(input->width_px) ||
-        !std::isfinite(input->height_px) || input->width_px <= 0 || input->height_px <= 0 ||
+INLAY_API void inlay_surface_view(InlaySurface *s, const InlaySurfaceViewDesc *input_in) {
+    InlaySurfaceViewDesc input = {};
+    if (!s || !inlay_read_abi_struct(input_in, &input) || !input.id || !std::isfinite(input.width_px) ||
+        !std::isfinite(input.height_px) || input.width_px <= 0 || input.height_px <= 0 ||
         etch_current_context() != s->etch || !etch_frame_in_progress(s->etch) || s->running)
         return;
     if (s->path[0])
@@ -1570,10 +1569,10 @@ void inlay_surface_view(InlaySurface *s, const InlaySurfaceViewDesc *input) {
         etch_request_redraw(s->etch);
     const auto theme = etch_get_theme(s->etch);
     auto box = etch_box_desc_default();
-    box.id = input->id;
+    box.id = input.id;
     box.axis = ETCH_AXIS_COL;
-    box.width = etch_sizing_fixed(input->width_px);
-    box.height = etch_sizing_fixed(input->height_px);
+    box.width = etch_sizing_fixed(input.width_px);
+    box.height = etch_sizing_fixed(input.height_px);
     box.clip_children = true;
     etch_begin_box(&box);
     WidgetEvents events = {};
@@ -1590,12 +1589,12 @@ void inlay_surface_view(InlaySurface *s, const InlaySurfaceViewDesc *input) {
         etch_text(frame_text(s, {s->error, uint32_t(std::strlen(s->error)), false}), &text);
         etch_end_box();
     } else if (s->node_count)
-        draw_node(s, 0, input->id, theme, &events);
+        draw_node(s, 0, input.id, theme, &events);
     etch_end_box();
     if (events.first && s->js && s->loaded && !s->running)
         run_batch(s, events.first);
 }
-int32_t inlay_surface_next_timer_ms(const InlaySurface *s) {
+INLAY_API int32_t inlay_surface_next_timer_ms(const InlaySurface *s) {
     if (!s || !s->loaded || s->stats.has_error)
         return -1;
     bool has = false;
@@ -1616,13 +1615,13 @@ int32_t inlay_surface_next_timer_ms(const InlaySurface *s) {
     const double ceiled = std::ceil(rem);
     return ceiled >= double(INT32_MAX) ? INT32_MAX : int32_t(ceiled);
 }
-InlaySurfaceStats inlay_surface_stats(const InlaySurface *s) {
+INLAY_API InlaySurfaceStats inlay_surface_stats(const InlaySurface *s) {
     return s ? s->stats : InlaySurfaceStats{};
 }
-EtchStr inlay_surface_error(const InlaySurface *s) {
+INLAY_API EtchStr inlay_surface_error(const InlaySurface *s) {
     return s ? EtchStr{s->error, uint32_t(std::strlen(s->error)), false} : EtchStr{};
 }
-const InlayUiNode *inlay_surface_nodes(const InlaySurface *s, uint32_t *count) {
+INLAY_API const InlayUiNode *inlay_surface_nodes(const InlaySurface *s, uint32_t *count) {
     if (count)
         *count = s ? s->node_count : 0;
     return s ? s->nodes : nullptr;
@@ -1630,24 +1629,20 @@ const InlayUiNode *inlay_surface_nodes(const InlaySurface *s, uint32_t *count) {
 }
 #else
 extern "C" {
-InlaySurfaceDesc inlay_surface_desc_default(void) {
-    return {8u * 1024u * 1024u, 512u * 1024u, 4, 4096, 65536};
-}
-InlaySurfaceViewDesc inlay_surface_view_desc_default(void) { return {0, 640, 480}; }
-InlaySurface *inlay_surface_create(EtchContext *, const InlaySurfaceDesc *) { return nullptr; }
-void inlay_surface_destroy(InlaySurface *) {}
-bool inlay_surface_set_script(InlaySurface *, EtchStr) { return false; }
-bool inlay_surface_set_state_json(InlaySurface *, EtchStr) { return false; }
-EtchStr inlay_surface_state_json(const InlaySurface *) { return {}; }
-bool inlay_surface_bind_action(InlaySurface *, EtchStr, InlayActionFn, void *) { return false; }
-bool inlay_surface_dispatch(InlaySurface *, EtchStr, EtchStr) { return false; }
-bool inlay_surface_enable_hmr(InlaySurface *, const char *) { return false; }
-bool inlay_surface_poll_hmr(InlaySurface *) { return false; }
-void inlay_surface_view(InlaySurface *, const InlaySurfaceViewDesc *) {}
-int32_t inlay_surface_next_timer_ms(const InlaySurface *) { return -1; }
-InlaySurfaceStats inlay_surface_stats(const InlaySurface *) { return {}; }
-EtchStr inlay_surface_error(const InlaySurface *) { return {}; }
-const InlayUiNode *inlay_surface_nodes(const InlaySurface *, uint32_t *count) {
+INLAY_API InlaySurface *inlay_surface_create(EtchContext *, const InlaySurfaceDesc *) { return nullptr; }
+INLAY_API void inlay_surface_destroy(InlaySurface *) {}
+INLAY_API bool inlay_surface_set_script(InlaySurface *, EtchStr) { return false; }
+INLAY_API bool inlay_surface_set_state_json(InlaySurface *, EtchStr) { return false; }
+INLAY_API EtchStr inlay_surface_state_json(const InlaySurface *) { return {}; }
+INLAY_API bool inlay_surface_bind_action(InlaySurface *, EtchStr, InlayActionFn, void *) { return false; }
+INLAY_API bool inlay_surface_dispatch(InlaySurface *, EtchStr, EtchStr) { return false; }
+INLAY_API bool inlay_surface_enable_hmr(InlaySurface *, const char *) { return false; }
+INLAY_API bool inlay_surface_poll_hmr(InlaySurface *) { return false; }
+INLAY_API void inlay_surface_view(InlaySurface *, const InlaySurfaceViewDesc *) {}
+INLAY_API int32_t inlay_surface_next_timer_ms(const InlaySurface *) { return -1; }
+INLAY_API InlaySurfaceStats inlay_surface_stats(const InlaySurface *) { return {}; }
+INLAY_API EtchStr inlay_surface_error(const InlaySurface *) { return {}; }
+INLAY_API const InlayUiNode *inlay_surface_nodes(const InlaySurface *, uint32_t *count) {
     if (count)
         *count = 0;
     return nullptr;

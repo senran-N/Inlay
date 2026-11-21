@@ -79,7 +79,11 @@ int main(int argc, char **argv) {
     node.height_world = etch_sizing_fixed(180);
     node.pos_value = {20, 30};
     etch_begin_canvas_node(&node);
-    const InlayPortalViewDesc view = {etch_id("portal"), 320, 180, 12};
+    InlayPortalViewDesc view = inlay_portal_view_desc_default();
+    view.id = etch_id("portal");
+    view.width = 320;
+    view.height = 180;
+    view.radius = 12;
     inlay_portal_view(p, &view);
     etch_end_canvas_node();
     etch_end_canvas();
@@ -158,7 +162,11 @@ int main(int argc, char **argv) {
     root.width = etch_sizing_fixed(700);
     root.height = etch_sizing_fixed(500);
     etch_begin_box(&root);
-    const InlayPortalViewDesc underlay = {etch_id("underlay"), 240, 140, 20};
+    InlayPortalViewDesc underlay = inlay_portal_view_desc_default();
+    underlay.id = etch_id("underlay");
+    underlay.width = 240;
+    underlay.height = 140;
+    underlay.radius = 20;
     inlay_portal_view(p, &underlay);
     auto overlay = etch_box_desc_default();
     overlay.id = etch_id("portal-overlay");
@@ -199,7 +207,11 @@ int main(int argc, char **argv) {
     etch_begin_box(&parent);
     const auto measured = inlay_doc_view(doc, &flow);
     ok &= measured.visible_end == 2 && measured.measured_height_px > 0;
-    const InlayPortalViewDesc view = {etch_id("native-visibility"), 240, 140, 0};
+    InlayPortalViewDesc view = inlay_portal_view_desc_default();
+    view.id = etch_id("native-visibility");
+    view.width = 240;
+    view.height = 140;
+    view.radius = 0;
     inlay_portal_view(p, &view);
     etch_end_box();
     etch_end_frame(ctx);

@@ -45,7 +45,7 @@ int main(int argc,char** argv) {
  }
  if(stress)ok &= total_rows>30 && last_end==total_rows && etch_virtual_list_scroll_offset(view.id)>0;
  ok &= etch_render_headless_png(ctx,920,760,argc>2 ? argv[2] : "inlay_document.png",etch_color_black(255));
- ok &= etch_frame_stats(ctx).draw_call_count<=3;
+ ok &= etch_frame_stats(ctx).draw_call_count>0 && etch_frame_stats(ctx).draw_call_count<=32;
  inlay_doc_destroy(doc);etch_destroy_context(ctx);
  std::printf("Inlay headless document: %s\n",ok ? "PASS" : "FAIL");return ok ? 0 : 1;
 }

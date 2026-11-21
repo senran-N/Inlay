@@ -1,4 +1,5 @@
 #include <inlay/inlay.h>
+#include <cstring>
 
 namespace {
 bool decorate(inlay::InlineKind kind,EtchStr,EtchStr url,EtchTextSpan* span,void* user) {
@@ -9,9 +10,11 @@ bool decorate(inlay::InlineKind kind,EtchStr,EtchStr url,EtchTextSpan* span,void
 }
 
 int main() {
+ if(inlay::abi_version()!=INLAY_ABI_VERSION)return 1;
  const inlay::PortalDesc portal=inlay_portal_desc_default();
  const inlay::SurfaceDesc surface=inlay_surface_desc_default();
- if(!portal.width || !inlay_portal_mock_backend() || !inlay_portal_destroy(nullptr) ||
+ if(portal.struct_size!=sizeof(inlay::PortalDesc) || surface.struct_size!=sizeof(inlay::SurfaceDesc) ||
+    !portal.width || !inlay_portal_mock_backend() || !inlay_portal_destroy(nullptr) ||
     !surface.max_nodes || !inlay_doc_config_default().initial_blocks ||
     inlay_math_desc_default().font_size_px<=0 || inlay_diagram_desc_default().rank_gap_px<=0)return 1;
  auto config=etch_context_desc_default();config.headless=true;
@@ -37,7 +40,8 @@ int main() {
  // Zero-cast C++20 wrapper verification with etch::Context* directly
  etch::Context* cpp_ctx=etch::create_context({.headless=true});
  if(!cpp_ctx)return 1;
- inlay::Doc* cpp_doc=inlay::create_doc(cpp_ctx);
+ inlay::DocConfig zero_cfg={};
+ inlay::Doc* cpp_doc=inlay::create_doc(cpp_ctx,&zero_cfg);
  inlay::Surface* cpp_surf=inlay::create_surface(cpp_ctx);
  inlay::Portal* cpp_portal=inlay::create_portal(cpp_ctx);
  inlay::DocStyle style=inlay::doc_style_default();
@@ -53,7 +57,11 @@ int main() {
   etch::begin_frame(cpp_ctx,{.viewport_w=320,.viewport_h=240});
   const inlay::DocResult r=inlay_doc_view(cpp_doc,&cpp_view);
   etch::end_frame(cpp_ctx);
-  ok &= r.measured_height_px>0 && r.visible_end==1 && r.at_bottom && inlay::doc_view_is_at_bottom(cpp_view.id);
+  inlay::doc_view_select_all(cpp_doc,cpp_view.id);
+  char buf[128]={};
+  const uint32_t n=inlay::doc_view_copy_plain_text(cpp_doc,cpp_view.id,buf,sizeof(buf));
+  ok &= r.measured_height_px>0 && r.visible_end==1 && r.at_bottom && inlay::doc_view_is_at_bottom(cpp_view.id) &&
+        n>0 && std::strstr(buf,"Zero-cast C++20 wrapper")!=nullptr;
  }
  inlay_portal_destroy(cpp_portal);
  inlay_surface_destroy(cpp_surf);

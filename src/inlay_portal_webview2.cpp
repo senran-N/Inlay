@@ -1,60 +1,278 @@
-#include <inlay/inlay_c.h>
+#include "inlay_internal.h"
 #if defined(_WIN32) && INLAY_ENABLE_PORTAL_WEBVIEW2
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
-#define CINTERFACE
 // clang-format off
 #include <windows.h>
 #include <objbase.h>
+#include <dcomp.h>
 #include <WebView2.h>
 // clang-format on
 #include <cmath>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <new>
+
 namespace {
 struct WebPortal;
-struct EnvironmentHandler {
-  ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler iface;
+
+ULONG retain(WebPortal *p) noexcept;
+ULONG release(WebPortal *p) noexcept;
+HRESULT on_environment_ready(WebPortal *p, HRESULT result, ICoreWebView2Environment *env) noexcept;
+HRESULT on_controller_ready(WebPortal *p, HRESULT result, ICoreWebView2Controller *ctrl) noexcept;
+HRESULT on_composition_ready(WebPortal *p, HRESULT result, ICoreWebView2CompositionController *comp) noexcept;
+
+struct EnvironmentHandler final : ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler {
   WebPortal *owner;
+  explicit EnvironmentHandler(WebPortal *o) noexcept : owner(o) {}
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id, void **out) override {
+    if (!out)
+      return E_POINTER;
+    *out = nullptr;
+    if (!IsEqualIID(id, IID_IUnknown) &&
+        !IsEqualIID(id, IID_ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler))
+      return E_NOINTERFACE;
+    *out = static_cast<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler *>(this);
+    AddRef();
+    return S_OK;
+  }
+  ULONG STDMETHODCALLTYPE AddRef() override { return retain(owner); }
+  ULONG STDMETHODCALLTYPE Release() override { return release(owner); }
+  HRESULT STDMETHODCALLTYPE Invoke(HRESULT result, ICoreWebView2Environment *env) override {
+    return on_environment_ready(owner, result, env);
+  }
 };
-struct ControllerHandler {
-  ICoreWebView2CreateCoreWebView2ControllerCompletedHandler iface;
+
+struct ControllerHandler final : ICoreWebView2CreateCoreWebView2ControllerCompletedHandler {
   WebPortal *owner;
+  explicit ControllerHandler(WebPortal *o) noexcept : owner(o) {}
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id, void **out) override {
+    if (!out)
+      return E_POINTER;
+    *out = nullptr;
+    if (!IsEqualIID(id, IID_IUnknown) &&
+        !IsEqualIID(id, IID_ICoreWebView2CreateCoreWebView2ControllerCompletedHandler))
+      return E_NOINTERFACE;
+    *out = static_cast<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler *>(this);
+    AddRef();
+    return S_OK;
+  }
+  ULONG STDMETHODCALLTYPE AddRef() override { return retain(owner); }
+  ULONG STDMETHODCALLTYPE Release() override { return release(owner); }
+  HRESULT STDMETHODCALLTYPE Invoke(HRESULT result, ICoreWebView2Controller *ctrl) override {
+    return on_controller_ready(owner, result, ctrl);
+  }
 };
+
+struct CompositionHandler final : ICoreWebView2CreateCoreWebView2CompositionControllerCompletedHandler {
+  WebPortal *owner;
+  explicit CompositionHandler(WebPortal *o) noexcept : owner(o) {}
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id, void **out) override {
+    if (!out)
+      return E_POINTER;
+    *out = nullptr;
+    if (!IsEqualIID(id, IID_IUnknown) &&
+        !IsEqualIID(id, IID_ICoreWebView2CreateCoreWebView2CompositionControllerCompletedHandler))
+      return E_NOINTERFACE;
+    *out = static_cast<ICoreWebView2CreateCoreWebView2CompositionControllerCompletedHandler *>(this);
+    AddRef();
+    return S_OK;
+  }
+  ULONG STDMETHODCALLTYPE AddRef() override { return retain(owner); }
+  ULONG STDMETHODCALLTYPE Release() override { return release(owner); }
+  HRESULT STDMETHODCALLTYPE Invoke(HRESULT result, ICoreWebView2CompositionController *comp) override {
+    return on_composition_ready(owner, result, comp);
+  }
+};
+
 struct WebPortal {
   EnvironmentHandler environment_handler;
   ControllerHandler controller_handler;
+  CompositionHandler composition_handler;
   volatile LONG references;
   DWORD com_thread;
   HWND parent;
   HWND child_hwnd;
   HMODULE loader;
+  HMODULE dcomp_dll;
+  IDCompositionDevice *dcomp_device;
+  IDCompositionTarget *dcomp_target;
+  IDCompositionVisual *dcomp_root;
+  IDCompositionVisual *dcomp_webview;
+  IDCompositionRectangleClip *dcomp_clip;
+  ICoreWebView2Environment *environment;
+  ICoreWebView2CompositionController *comp_controller;
   ICoreWebView2Controller *controller;
   ICoreWebView2 *web;
   wchar_t *navigation;
-  bool html, closed, com_initialized;
+  bool html, closed, com_initialized, disable_dcomp, using_dcomp;
   void (*completed)(void *, int32_t);
   void *user;
+  uint32_t portal_width, portal_height;
+  EtchRect bounds_logical, visible_logical;
+  float radius_logical;
   RECT bounds;
   RECT clip_rect;
   bool visible, clipped, has_rgn;
+  bool left_down, has_mouse_pt;
+  POINT last_mouse_pt;
+
+  WebPortal() noexcept
+      : environment_handler(this),
+        controller_handler(this),
+        composition_handler(this),
+        references(1),
+        com_thread(0),
+        parent(nullptr),
+        child_hwnd(nullptr),
+        loader(nullptr),
+        dcomp_dll(nullptr),
+        dcomp_device(nullptr),
+        dcomp_target(nullptr),
+        dcomp_root(nullptr),
+        dcomp_webview(nullptr),
+        dcomp_clip(nullptr),
+        environment(nullptr),
+        comp_controller(nullptr),
+        controller(nullptr),
+        web(nullptr),
+        navigation(nullptr),
+        html(false),
+        closed(false),
+        com_initialized(false),
+        disable_dcomp(false),
+        using_dcomp(false),
+        completed(nullptr),
+        user(nullptr),
+        portal_width(0),
+        portal_height(0),
+        bounds_logical{},
+        visible_logical{},
+        radius_logical(0.f),
+        bounds{},
+        clip_rect{},
+        visible(false),
+        clipped(false),
+        has_rgn(false),
+        left_down(false),
+        has_mouse_pt(false),
+        last_mouse_pt{0, 0} {}
 };
-ULONG retain(WebPortal *p) {
+
+void release_dcomp(WebPortal *p) noexcept {
+  if (p->dcomp_webview) {
+    p->dcomp_webview->SetClip(static_cast<IDCompositionClip *>(nullptr));
+    p->dcomp_webview->Release();
+    p->dcomp_webview = nullptr;
+  }
+  if (p->dcomp_clip) {
+    p->dcomp_clip->Release();
+    p->dcomp_clip = nullptr;
+  }
+  if (p->dcomp_root) {
+    p->dcomp_root->Release();
+    p->dcomp_root = nullptr;
+  }
+  if (p->dcomp_target) {
+    p->dcomp_target->SetRoot(nullptr);
+    p->dcomp_target->Release();
+    p->dcomp_target = nullptr;
+  }
+  if (p->dcomp_device) {
+    p->dcomp_device->Commit();
+    p->dcomp_device->Release();
+    p->dcomp_device = nullptr;
+  }
+  if (p->dcomp_dll) {
+    FreeLibrary(p->dcomp_dll);
+    p->dcomp_dll = nullptr;
+  }
+  p->using_dcomp = false;
+}
+
+bool init_dcomp_device(WebPortal *p) noexcept {
+  if (p->disable_dcomp || !p->parent)
+    return false;
+  if (p->dcomp_device)
+    return true;
+  HMODULE dll = LoadLibraryExW(L"dcomp.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+  if (!dll)
+    return false;
+  using CreateDeviceFn = HRESULT(STDAPICALLTYPE *)(IDXGIDevice *, REFIID, void **);
+  const auto proc = GetProcAddress(dll, "DCompositionCreateDevice");
+  CreateDeviceFn create_device = nullptr;
+  static_assert(sizeof(create_device) == sizeof(proc));
+  std::memcpy(&create_device, &proc, sizeof(create_device));
+  if (!create_device) {
+    FreeLibrary(dll);
+    return false;
+  }
+  p->dcomp_dll = dll;
+  const HRESULT hr = create_device(nullptr, __uuidof(IDCompositionDevice),
+                                   reinterpret_cast<void **>(&p->dcomp_device));
+  if (FAILED(hr) || !p->dcomp_device) {
+    release_dcomp(p);
+    return false;
+  }
+  return true;
+}
+
+bool init_dcomp_target(WebPortal *p) noexcept {
+  if (!p->dcomp_device || !p->parent)
+    return false;
+  HRESULT hr = p->dcomp_device->CreateTargetForHwnd(p->parent, TRUE, &p->dcomp_target);
+  if (FAILED(hr) || !p->dcomp_target) {
+    release_dcomp(p);
+    return false;
+  }
+  hr = p->dcomp_device->CreateVisual(&p->dcomp_root);
+  if (FAILED(hr) || !p->dcomp_root) {
+    release_dcomp(p);
+    return false;
+  }
+  hr = p->dcomp_device->CreateVisual(&p->dcomp_webview);
+  if (FAILED(hr) || !p->dcomp_webview) {
+    release_dcomp(p);
+    return false;
+  }
+  hr = p->dcomp_device->CreateRectangleClip(&p->dcomp_clip);
+  if (FAILED(hr) || !p->dcomp_clip) {
+    release_dcomp(p);
+    return false;
+  }
+  if (FAILED(p->dcomp_root->AddVisual(p->dcomp_webview, FALSE, nullptr)) ||
+      FAILED(p->dcomp_target->SetRoot(p->dcomp_root)) ||
+      FAILED(p->dcomp_device->Commit())) {
+    release_dcomp(p);
+    return false;
+  }
+  return true;
+}
+
+ULONG retain(WebPortal *p) noexcept {
   return static_cast<ULONG>(InterlockedIncrement(&p->references));
 }
-ULONG release(WebPortal *p) {
+
+ULONG release(WebPortal *p) noexcept {
   const ULONG n = static_cast<ULONG>(InterlockedDecrement(&p->references));
   if (!n) {
+    release_dcomp(p);
+    if (p->environment) {
+      p->environment->Release();
+      p->environment = nullptr;
+    }
     std::free(p->navigation);
-    FreeLibrary(p->loader);
+    if (p->loader)
+      FreeLibrary(p->loader);
     if (p->com_initialized && GetCurrentThreadId() == p->com_thread)
       CoUninitialize();
     std::free(p);
   }
   return n;
 }
-HWND find_webview_child(WebPortal *p) {
+
+HWND find_webview_child(WebPortal *p) noexcept {
   if (p->child_hwnd && IsWindow(p->child_hwnd) && GetParent(p->child_hwnd) == p->parent)
     return p->child_hwnd;
   HWND first = nullptr;
@@ -78,19 +296,66 @@ HWND find_webview_child(WebPortal *p) {
     p->child_hwnd = first;
   return p->child_hwnd;
 }
-void apply_bounds(WebPortal *p) {
+
+void apply_bounds(WebPortal *p) noexcept {
   if (!p->controller)
     return;
-  p->controller->lpVtbl->put_Bounds(p->controller, p->bounds);
-  p->controller->lpVtbl->put_IsVisible(p->controller, p->visible);
+  const float scale = static_cast<float>(GetDpiForWindow(p->parent)) / 96.f;
+  const InlayDCompClipGeom geom =
+      inlay_dcomp_compute_clip(p->bounds_logical, p->visible_logical, p->radius_logical, scale);
+  p->bounds = {static_cast<LONG>(geom.offset_x), static_cast<LONG>(geom.offset_y),
+               static_cast<LONG>(geom.offset_x + geom.width),
+               static_cast<LONG>(geom.offset_y + geom.height)};
+  p->clip_rect = {static_cast<LONG>(geom.offset_x + geom.left),
+                  static_cast<LONG>(geom.offset_y + geom.top),
+                  static_cast<LONG>(geom.offset_x + geom.right),
+                  static_cast<LONG>(geom.offset_y + geom.bottom)};
+  p->visible = geom.visible;
+  p->clipped = geom.clipped;
+
+  if (p->using_dcomp && p->dcomp_device && p->dcomp_webview) {
+    const RECT local_bounds = {0, 0, static_cast<LONG>(geom.width),
+                               static_cast<LONG>(geom.height)};
+    p->controller->put_Bounds(local_bounds);
+    p->controller->put_IsVisible(geom.visible ? TRUE : FALSE);
+    p->dcomp_webview->SetOffsetX(geom.offset_x);
+    p->dcomp_webview->SetOffsetY(geom.offset_y);
+    if (geom.need_clip && p->dcomp_clip) {
+      p->dcomp_clip->SetLeft(geom.left);
+      p->dcomp_clip->SetTop(geom.top);
+      p->dcomp_clip->SetRight(geom.right);
+      p->dcomp_clip->SetBottom(geom.bottom);
+      p->dcomp_clip->SetTopLeftRadiusX(geom.tl_r);
+      p->dcomp_clip->SetTopLeftRadiusY(geom.tl_r);
+      p->dcomp_clip->SetTopRightRadiusX(geom.tr_r);
+      p->dcomp_clip->SetTopRightRadiusY(geom.tr_r);
+      p->dcomp_clip->SetBottomRightRadiusX(geom.br_r);
+      p->dcomp_clip->SetBottomRightRadiusY(geom.br_r);
+      p->dcomp_clip->SetBottomLeftRadiusX(geom.bl_r);
+      p->dcomp_clip->SetBottomLeftRadiusY(geom.bl_r);
+      p->dcomp_webview->SetClip(p->dcomp_clip);
+    } else {
+      p->dcomp_webview->SetClip(static_cast<IDCompositionClip *>(nullptr));
+    }
+    p->dcomp_device->Commit();
+    return;
+  }
+
+  p->controller->put_Bounds(p->bounds);
+  p->controller->put_IsVisible(p->visible ? TRUE : FALSE);
   HWND child = find_webview_child(p);
   if (!child)
     return;
-  if (p->visible && p->clipped) {
-    HRGN rgn = CreateRectRgn(p->clip_rect.left - p->bounds.left,
-                             p->clip_rect.top - p->bounds.top,
-                             p->clip_rect.right - p->bounds.left,
-                             p->clip_rect.bottom - p->bounds.top);
+  if (geom.visible && geom.need_clip) {
+    HRGN rgn = nullptr;
+    if (!geom.clipped && geom.tl_r > 0.5f) {
+      const int diam = static_cast<int>(std::lround(geom.tl_r * 2.f));
+      rgn = CreateRoundRectRgn(0, 0, static_cast<int>(geom.width) + 1,
+                               static_cast<int>(geom.height) + 1, diam, diam);
+    } else {
+      rgn = CreateRectRgn(static_cast<int>(geom.left), static_cast<int>(geom.top),
+                          static_cast<int>(geom.right), static_cast<int>(geom.bottom));
+    }
     if (rgn) {
       if (SetWindowRgn(child, rgn, TRUE))
         p->has_rgn = true;
@@ -102,7 +367,8 @@ void apply_bounds(WebPortal *p) {
     p->has_rgn = false;
   }
 }
-wchar_t *wide(const char *bytes, uint32_t length) {
+
+wchar_t *wide(const char *bytes, uint32_t length) noexcept {
   const int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, bytes,
                                     static_cast<int>(length), nullptr, 0);
   if (n <= 0)
@@ -116,61 +382,28 @@ wchar_t *wide(const char *bytes, uint32_t length) {
   out[n] = 0;
   return out;
 }
-HRESULT navigate(WebPortal *p) {
-  if (!p->navigation)
+
+HRESULT navigate(WebPortal *p) noexcept {
+  if (!p->navigation || !p->web)
     return S_OK;
-  return p->html ? p->web->lpVtbl->NavigateToString(p->web, p->navigation)
-                 : p->web->lpVtbl->Navigate(p->web, p->navigation);
+  return p->html ? p->web->NavigateToString(p->navigation)
+                 : p->web->Navigate(p->navigation);
 }
-ULONG STDMETHODCALLTYPE
-env_add(ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler *h) {
-  return retain(reinterpret_cast<EnvironmentHandler *>(h)->owner);
-}
-ULONG STDMETHODCALLTYPE
-env_release(ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler *h) {
-  return release(reinterpret_cast<EnvironmentHandler *>(h)->owner);
-}
-HRESULT STDMETHODCALLTYPE
-env_query(ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler *h,
-          REFIID id, void **out) {
-  if (!out)
-    return E_POINTER;
-  *out = nullptr;
-  if (id != IID_IUnknown &&
-      id != IID_ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler)
-    return E_NOINTERFACE;
-  *out = h;
-  env_add(h);
+
+HRESULT start_classic_controller(WebPortal *p, ICoreWebView2Environment *env) noexcept {
+  release_dcomp(p);
+  const HRESULT started =
+      env->CreateCoreWebView2Controller(p->parent, &p->controller_handler);
+  if (FAILED(started) && p->completed)
+    p->completed(p->user, static_cast<int32_t>(started));
   return S_OK;
 }
-ULONG STDMETHODCALLTYPE
-controller_add(ICoreWebView2CreateCoreWebView2ControllerCompletedHandler *h) {
-  return retain(reinterpret_cast<ControllerHandler *>(h)->owner);
-}
-ULONG STDMETHODCALLTYPE controller_release(
-    ICoreWebView2CreateCoreWebView2ControllerCompletedHandler *h) {
-  return release(reinterpret_cast<ControllerHandler *>(h)->owner);
-}
-HRESULT STDMETHODCALLTYPE
-controller_query(ICoreWebView2CreateCoreWebView2ControllerCompletedHandler *h,
-                 REFIID id, void **out) {
-  if (!out)
-    return E_POINTER;
-  *out = nullptr;
-  if (id != IID_IUnknown &&
-      id != IID_ICoreWebView2CreateCoreWebView2ControllerCompletedHandler)
-    return E_NOINTERFACE;
-  *out = h;
-  controller_add(h);
-  return S_OK;
-}
-HRESULT STDMETHODCALLTYPE
-controller_ready(ICoreWebView2CreateCoreWebView2ControllerCompletedHandler *h,
-                 HRESULT result, ICoreWebView2Controller *controller) {
-  auto *p = reinterpret_cast<ControllerHandler *>(h)->owner;
+
+HRESULT on_controller_ready(WebPortal *p, HRESULT result,
+                            ICoreWebView2Controller *controller) noexcept {
   if (p->closed) {
     if (controller)
-      controller->lpVtbl->Close(controller);
+      controller->Close();
     return S_OK;
   }
   if (FAILED(result) || !controller) {
@@ -180,8 +413,9 @@ controller_ready(ICoreWebView2CreateCoreWebView2ControllerCompletedHandler *h,
     return S_OK;
   }
   p->controller = controller;
-  controller->lpVtbl->AddRef(controller);
-  controller->lpVtbl->get_CoreWebView2(controller, &p->web);
+  controller->AddRef();
+  controller->get_CoreWebView2(&p->web);
+  p->using_dcomp = false;
   apply_bounds(p);
   if (p->web)
     navigate(p);
@@ -189,10 +423,64 @@ controller_ready(ICoreWebView2CreateCoreWebView2ControllerCompletedHandler *h,
     p->completed(p->user, static_cast<int32_t>(p->web ? S_OK : E_FAIL));
   return S_OK;
 }
-HRESULT STDMETHODCALLTYPE
-environment_ready(ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler *h,
-                  HRESULT result, ICoreWebView2Environment *environment) {
-  auto *p = reinterpret_cast<EnvironmentHandler *>(h)->owner;
+
+HRESULT on_composition_ready(WebPortal *p, HRESULT result,
+                             ICoreWebView2CompositionController *comp) noexcept {
+  ICoreWebView2Environment *fallback_env = p->environment;
+  p->environment = nullptr;
+  if (p->closed) {
+    if (fallback_env)
+      fallback_env->Release();
+    if (comp) {
+      ICoreWebView2Controller *ctrl = nullptr;
+      if (SUCCEEDED(comp->QueryInterface(IID_ICoreWebView2Controller,
+                                         reinterpret_cast<void **>(&ctrl))) &&
+          ctrl) {
+        ctrl->Close();
+        ctrl->Release();
+      }
+    }
+    return S_OK;
+  }
+  ICoreWebView2Controller *ctrl = nullptr;
+  const bool ok_comp = SUCCEEDED(result) && comp &&
+                       SUCCEEDED(comp->QueryInterface(
+                           IID_ICoreWebView2Controller,
+                           reinterpret_cast<void **>(&ctrl))) &&
+                       ctrl && init_dcomp_target(p) && p->dcomp_webview &&
+                       SUCCEEDED(comp->put_RootVisualTarget(p->dcomp_webview));
+  if (!ok_comp) {
+    if (ctrl) {
+      ctrl->Close();
+      ctrl->Release();
+    }
+    if (fallback_env) {
+      const HRESULT hr = start_classic_controller(p, fallback_env);
+      fallback_env->Release();
+      return hr;
+    }
+    if (p->completed)
+      p->completed(p->user,
+                   static_cast<int32_t>(FAILED(result) ? result : E_FAIL));
+    return S_OK;
+  }
+  if (fallback_env)
+    fallback_env->Release();
+  p->comp_controller = comp;
+  comp->AddRef();
+  p->controller = ctrl;
+  p->using_dcomp = true;
+  p->controller->get_CoreWebView2(&p->web);
+  apply_bounds(p);
+  if (p->web)
+    navigate(p);
+  if (p->completed)
+    p->completed(p->user, static_cast<int32_t>(p->web ? S_OK : E_FAIL));
+  return S_OK;
+}
+
+HRESULT on_environment_ready(WebPortal *p, HRESULT result,
+                             ICoreWebView2Environment *environment) noexcept {
   if (p->closed)
     return S_OK;
   if (FAILED(result) || !environment) {
@@ -201,30 +489,43 @@ environment_ready(ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler *h,
                    static_cast<int32_t>(FAILED(result) ? result : E_FAIL));
     return S_OK;
   }
-  const HRESULT started = environment->lpVtbl->CreateCoreWebView2Controller(
-      environment, p->parent, &p->controller_handler.iface);
-  if (FAILED(started) && p->completed)
-    p->completed(p->user, static_cast<int32_t>(started));
-  return S_OK;
+  ICoreWebView2Environment3 *env3 = nullptr;
+  if (!p->disable_dcomp && init_dcomp_device(p) &&
+      SUCCEEDED(environment->QueryInterface(IID_ICoreWebView2Environment3,
+                                            reinterpret_cast<void **>(&env3))) &&
+      env3) {
+    p->environment = environment;
+    environment->AddRef();
+    const HRESULT started = env3->CreateCoreWebView2CompositionController(
+        p->parent, &p->composition_handler);
+    env3->Release();
+    if (SUCCEEDED(started))
+      return S_OK;
+    p->environment->Release();
+    p->environment = nullptr;
+  }
+  return start_classic_controller(p, environment);
 }
-ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandlerVtbl
-    environment_vtable = {env_query, env_add, env_release, environment_ready};
-ICoreWebView2CreateCoreWebView2ControllerCompletedHandlerVtbl
-    controller_vtable = {controller_query, controller_add, controller_release,
-                         controller_ready};
+
 void *create(void *user, uint32_t w, uint32_t h) {
-  const auto *options = static_cast<const InlayPortalWebView2Options *>(user);
-  if (!options || !IsWindow(static_cast<HWND>(options->underlay_hwnd)) ||
-      !options->user_data_path)
+  InlayPortalWebView2Options options = {};
+  if (!inlay_read_abi_struct(static_cast<const InlayPortalWebView2Options *>(user),
+                             &options))
     return nullptr;
-  const size_t loader_len = options->loader_path ? std::strlen(options->loader_path) : 0,
-               data_len = std::strlen(options->user_data_path);
+  if (!IsWindow(static_cast<HWND>(options.underlay_hwnd)) ||
+      !options.user_data_path)
+    return nullptr;
+  const size_t loader_len =
+                   options.loader_path ? std::strlen(options.loader_path) : 0,
+               data_len = std::strlen(options.user_data_path);
   if (loader_len > 32767 || data_len > 32767)
     return nullptr;
-  auto *loader_path = loader_len
-      ? wide(options->loader_path, static_cast<uint32_t>(loader_len)) : nullptr;
+  auto *loader_path =
+      loader_len
+          ? wide(options.loader_path, static_cast<uint32_t>(loader_len))
+          : nullptr;
   auto *data_path =
-      wide(options->user_data_path, static_cast<uint32_t>(data_len));
+      wide(options.user_data_path, static_cast<uint32_t>(data_len));
   if ((loader_len && !loader_path) || !data_path) {
     std::free(loader_path);
     std::free(data_path);
@@ -232,8 +533,9 @@ void *create(void *user, uint32_t w, uint32_t h) {
   }
   const DWORD search = loader_path ? LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR
                                    : LOAD_LIBRARY_SEARCH_APPLICATION_DIR;
-  HMODULE module = LoadLibraryExW(loader_path ? loader_path : L"WebView2Loader.dll",
-                                 nullptr, search | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+  HMODULE module = LoadLibraryExW(
+      loader_path ? loader_path : L"WebView2Loader.dll", nullptr,
+      search | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
   std::free(loader_path);
   if (!module) {
     std::free(data_path);
@@ -252,15 +554,16 @@ void *create(void *user, uint32_t w, uint32_t h) {
     std::free(data_path);
     return nullptr;
   }
-  auto *p = static_cast<WebPortal *>(std::calloc(1, sizeof(WebPortal)));
-  if (!p) {
+  void *raw = std::malloc(sizeof(WebPortal));
+  if (!raw) {
     FreeLibrary(module);
     std::free(data_path);
     return nullptr;
   }
-  p->references = 1;
-  p->completed = options->completed;
-  p->user = options->user_data;
+  auto *p = new (raw) WebPortal();
+  p->completed = options.completed;
+  p->user = options.user_data;
+  p->disable_dcomp = options.disable_dcomp;
   p->loader = module;
   const HRESULT initialized = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
   if (FAILED(initialized)) {
@@ -270,12 +573,13 @@ void *create(void *user, uint32_t w, uint32_t h) {
   }
   p->com_initialized = true;
   p->com_thread = GetCurrentThreadId();
-  p->parent = static_cast<HWND>(options->underlay_hwnd);
+  p->parent = static_cast<HWND>(options.underlay_hwnd);
+  p->portal_width = w;
+  p->portal_height = h;
+  p->bounds_logical = {0.f, 0.f, static_cast<float>(w), static_cast<float>(h)};
+  p->visible_logical = p->bounds_logical;
   p->bounds = {0, 0, static_cast<LONG>(w), static_cast<LONG>(h)};
-  p->environment_handler = {{&environment_vtable}, p};
-  p->controller_handler = {{&controller_vtable}, p};
-  const HRESULT result =
-      start(nullptr, data_path, nullptr, &p->environment_handler.iface);
+  const HRESULT result = start(nullptr, data_path, nullptr, &p->environment_handler);
   std::free(data_path);
   if (FAILED(result)) {
     p->closed = true;
@@ -284,20 +588,32 @@ void *create(void *user, uint32_t w, uint32_t h) {
   }
   return p;
 }
+
 void destroy(void *backend) {
   auto *p = static_cast<WebPortal *>(backend);
   p->closed = true;
+  if (p->comp_controller) {
+    p->comp_controller->put_RootVisualTarget(nullptr);
+    p->comp_controller->Release();
+    p->comp_controller = nullptr;
+  }
   if (p->controller) {
-    p->controller->lpVtbl->Close(p->controller);
-    p->controller->lpVtbl->Release(p->controller);
+    p->controller->Close();
+    p->controller->Release();
     p->controller = nullptr;
   }
   if (p->web) {
-    p->web->lpVtbl->Release(p->web);
+    p->web->Release();
     p->web = nullptr;
   }
+  if (p->environment) {
+    p->environment->Release();
+    p->environment = nullptr;
+  }
+  release_dcomp(p);
   release(p);
 }
+
 bool load(WebPortal *p, EtchStr text, bool html) {
   if (text.length > 16 * 1024 * 1024 || std::memchr(text.chars, 0, text.length))
     return false;
@@ -309,45 +625,111 @@ bool load(WebPortal *p, EtchStr text, bool html) {
   p->html = html;
   return !p->web || SUCCEEDED(navigate(p));
 }
+
 bool load_url(void *b, EtchStr s) {
   return load(static_cast<WebPortal *>(b), s, false);
 }
+
 bool load_html(void *b, EtchStr s) {
   return load(static_cast<WebPortal *>(b), s, true);
 }
-bool resize(void *, uint32_t, uint32_t) { return true; }
+
+bool resize(void *b, uint32_t w, uint32_t h) {
+  auto *p = static_cast<WebPortal *>(b);
+  p->portal_width = w;
+  p->portal_height = h;
+  return true;
+}
+
 uint32_t poll(void *, InlayPortalDirtyRect *, uint32_t) { return 0; }
 void ack(void *, bool) {}
+
+void inject_pointer(void *b, EtchVec2 local_pos, bool down) {
+  auto *p = static_cast<WebPortal *>(b);
+  if (!p->using_dcomp || !p->comp_controller)
+    return;
+  if (local_pos.x < 0.f || local_pos.y < 0.f) {
+    if (p->left_down) {
+      p->comp_controller->SendMouseInput(
+          COREWEBVIEW2_MOUSE_EVENT_KIND_LEFT_BUTTON_UP,
+          COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS_NONE, 0u, p->last_mouse_pt);
+      p->left_down = false;
+    }
+    p->comp_controller->SendMouseInput(
+        COREWEBVIEW2_MOUSE_EVENT_KIND_LEAVE,
+        COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS_NONE, 0u, p->last_mouse_pt);
+    return;
+  }
+  const float bw = static_cast<float>(p->bounds.right - p->bounds.left);
+  const float bh = static_cast<float>(p->bounds.bottom - p->bounds.top);
+  const float sx = p->portal_width ? (bw / static_cast<float>(p->portal_width)) : 1.f;
+  const float sy = p->portal_height ? (bh / static_cast<float>(p->portal_height)) : 1.f;
+  const POINT pt = {static_cast<LONG>(std::lround(local_pos.x * sx)),
+                    static_cast<LONG>(std::lround(local_pos.y * sy))};
+  const auto move_keys = p->left_down ? COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS_LEFT_BUTTON
+                                      : COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS_NONE;
+  if (!p->has_mouse_pt || pt.x != p->last_mouse_pt.x || pt.y != p->last_mouse_pt.y) {
+    p->comp_controller->SendMouseInput(COREWEBVIEW2_MOUSE_EVENT_KIND_MOVE,
+                                       move_keys, 0u, pt);
+    p->last_mouse_pt = pt;
+    p->has_mouse_pt = true;
+  }
+  if (down && !p->left_down) {
+    p->comp_controller->SendMouseInput(
+        COREWEBVIEW2_MOUSE_EVENT_KIND_LEFT_BUTTON_DOWN,
+        COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS_LEFT_BUTTON, 0u, pt);
+    p->left_down = true;
+  } else if (!down && p->left_down) {
+    p->comp_controller->SendMouseInput(
+        COREWEBVIEW2_MOUSE_EVENT_KIND_LEFT_BUTTON_UP,
+        COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS_NONE, 0u, pt);
+    p->left_down = false;
+  }
+}
+
+void inject_wheel(void *b, EtchVec2 delta) {
+  auto *p = static_cast<WebPortal *>(b);
+  if (!p->using_dcomp || !p->comp_controller)
+    return;
+  const auto keys = p->left_down ? COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS_LEFT_BUTTON
+                                 : COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS_NONE;
+  if (delta.y != 0.f) {
+    const int32_t d = static_cast<int32_t>(std::lround(delta.y * static_cast<float>(WHEEL_DELTA)));
+    p->comp_controller->SendMouseInput(COREWEBVIEW2_MOUSE_EVENT_KIND_WHEEL,
+                                       keys, static_cast<UINT32>(d), p->last_mouse_pt);
+  }
+  if (delta.x != 0.f) {
+    const int32_t d = static_cast<int32_t>(std::lround(delta.x * static_cast<float>(WHEEL_DELTA)));
+    p->comp_controller->SendMouseInput(COREWEBVIEW2_MOUSE_EVENT_KIND_HORIZONTAL_WHEEL,
+                                       keys, static_cast<UINT32>(d), p->last_mouse_pt);
+  }
+}
+
+void set_radius(void *b, float radius_px) {
+  auto *p = static_cast<WebPortal *>(b);
+  p->radius_logical = (std::isfinite(radius_px) && radius_px > 0.f) ? radius_px : 0.f;
+}
+
 void bounds(void *b, EtchRect rect, EtchRect clip) {
   auto *p = static_cast<WebPortal *>(b);
-  const float scale = static_cast<float>(GetDpiForWindow(p->parent)) / 96.f;
-  const LONG bl = static_cast<LONG>(std::lround(rect.x * scale));
-  const LONG bt = static_cast<LONG>(std::lround(rect.y * scale));
-  const LONG br = static_cast<LONG>(std::lround((rect.x + rect.w) * scale));
-  const LONG bb = static_cast<LONG>(std::lround((rect.y + rect.h) * scale));
-  const float ix0 = rect.x > clip.x ? rect.x : clip.x;
-  const float iy0 = rect.y > clip.y ? rect.y : clip.y;
-  const float ix1 = (rect.x + rect.w) < (clip.x + clip.w) ? (rect.x + rect.w) : (clip.x + clip.w);
-  const float iy1 = (rect.y + rect.h) < (clip.y + clip.h) ? (rect.y + rect.h) : (clip.y + clip.h);
-  const LONG vl = static_cast<LONG>(std::lround(ix0 * scale));
-  const LONG vt = static_cast<LONG>(std::lround(iy0 * scale));
-  const LONG vr = static_cast<LONG>(std::lround(ix1 * scale));
-  const LONG vb = static_cast<LONG>(std::lround(iy1 * scale));
-  p->bounds = {bl, bt, br, bb};
-  p->clip_rect = {vl, vt, vr, vb};
-  p->visible = clip.w > 0 && clip.h > 0 && vr > vl && vb > vt;
-  p->clipped = p->visible && (vl > bl || vt > bt || vr < br || vb < bb);
+  p->bounds_logical = rect;
+  p->visible_logical = clip;
   apply_bounds(p);
 }
+
 const InlayPortalBackendVTable api = {
-    create,  destroy, load_url, load_html, resize, poll, nullptr,
-    nullptr, nullptr, nullptr,  nullptr,   bounds, ack};
+    create,  destroy,        load_url,     load_html, resize,
+    poll,    inject_pointer, inject_wheel, nullptr,   nullptr,
+    nullptr, bounds,         ack,          set_radius};
 } // namespace
-extern "C" const InlayPortalBackendVTable *inlay_portal_webview2_backend(void) {
+
+extern "C" INLAY_API const InlayPortalBackendVTable *
+inlay_portal_webview2_backend(void) {
   return &api;
 }
 #else
-extern "C" const InlayPortalBackendVTable *inlay_portal_webview2_backend(void) {
+extern "C" INLAY_API const InlayPortalBackendVTable *
+inlay_portal_webview2_backend(void) {
   return nullptr;
 }
 #endif

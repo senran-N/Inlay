@@ -59,7 +59,10 @@ bool reactive_controls(EtchContext *ctx, const InlaySurfaceDesc &desc) {
         inlay_surface_destroy(surface);
         return check(false, "input and toggle cached nodes");
     }
-    const InlaySurfaceViewDesc view = {etch_id("reactive-controls"), 300, 200};
+    InlaySurfaceViewDesc view = inlay_surface_view_desc_default();
+    view.id = etch_id("reactive-controls");
+    view.width_px = 300;
+    view.height_px = 200;
     const uint32_t root = etch_id_index(view.id,nodes[0].id);
     const uint32_t input = etch_id_index(root,nodes[1].id);
     const uint32_t toggle = etch_id_index(root,nodes[3].id);
@@ -163,7 +166,10 @@ bool styled_surface_controls(EtchContext *ctx, const InlaySurfaceDesc &desc) {
         "radius:8,width:200,height:42,fontSize:14,padding:6}));}"
         "function onEvent(n,v,s){if(n==='save')s.saved=(s.saved||0)+1;}")),
         "styled surface script");
-    const InlaySurfaceViewDesc view = {etch_id("styled-surface"), 400, 300};
+    InlaySurfaceViewDesc view = inlay_surface_view_desc_default();
+    view.id = etch_id("styled-surface");
+    view.width_px = 400;
+    view.height_px = 300;
     uint32_t count = 0;
     const auto *nodes = inlay_surface_nodes(surface, &count);
     if (count != 4) {
@@ -238,7 +244,10 @@ bool expanded_surface_primitives(EtchContext *ctx, const InlaySurfaceDesc &desc)
         inlay_surface_destroy(surface);
         return check(false, "expanded ui node kinds");
     }
-    const InlaySurfaceViewDesc view = {etch_id("expanded-ui"), 320, 220};
+    InlaySurfaceViewDesc view = inlay_surface_view_desc_default();
+    view.id = etch_id("expanded-ui");
+    view.width_px = 320;
+    view.height_px = 220;
     const uint32_t scr_id = etch_id_index(view.id, nodes[0].id);
     const uint32_t bdg_id = etch_id_index(scr_id, nodes[1].id);
     const uint32_t div_id = etch_id_index(scr_id, nodes[2].id);
@@ -303,7 +312,10 @@ bool i2_reactive_reconciler_upgrades(EtchContext *ctx, const InlaySurfaceDesc &d
     auto frame = etch_frame_desc_default();
     frame.viewport_w = 400;
     frame.viewport_h = 300;
-    const InlaySurfaceViewDesc view = {etch_id("i2-reconciler"), 360, 260};
+    InlaySurfaceViewDesc view = inlay_surface_view_desc_default();
+    view.id = etch_id("i2-reconciler");
+    view.width_px = 360;
+    view.height_px = 260;
     const auto step = [&] {
         etch_begin_frame(ctx, &frame);
         inlay_surface_view(s, &view);

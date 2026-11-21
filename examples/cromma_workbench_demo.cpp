@@ -102,7 +102,11 @@ void build(Context *ctx, Workbench *app) {
        .radius = Corners::all(12),
        .border_beam = {.color = Color::oklch(.7f, .13f, 160), .glow_px = 3}});
   label("Browser tool / synthetic interactive view", 18);
-  const InlayPortalViewDesc portal_view = {id("browser-portal"), 456, 240, 8};
+  InlayPortalViewDesc portal_view = inlay_portal_view_desc_default();
+  portal_view.id = id("browser-portal");
+  portal_view.width = 456;
+  portal_view.height = 240;
+  portal_view.radius = 8;
   inlay_portal_view(app->portal, &portal_view);
   end_box();
   end_canvas_node();
@@ -138,8 +142,10 @@ void build(Context *ctx, Workbench *app) {
                .radius = Corners::all(16)});
     label("Sandbox inspector", 16);
     if (app->inspector) {
-      const InlaySurfaceViewDesc surface_view = {id("sandbox-inspector"), 200,
-                                                 400};
+      InlaySurfaceViewDesc surface_view = inlay_surface_view_desc_default();
+      surface_view.id = id("sandbox-inspector");
+      surface_view.width_px = 200;
+      surface_view.height_px = 400;
       inlay_surface_view(app->inspector, &surface_view);
     } else
       label("Scripting disabled");

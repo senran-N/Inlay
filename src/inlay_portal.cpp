@@ -1,7 +1,7 @@
+#include "inlay_internal.h"
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
-#include <inlay/inlay_c.h>
 
 struct InlayPortal {
   EtchContext *context;
@@ -157,7 +157,7 @@ void mock_ack(void *b, bool accepted) {
 const InlayPortalBackendVTable mock_api = {
     mock_create, mock_destroy, mock_load,  mock_load, mock_resize,
     mock_poll,   mock_pointer, mock_wheel, mock_key,  mock_text,
-    mock_ime,    mock_bounds,  mock_ack};
+    mock_ime,    mock_bounds,  mock_ack,   nullptr};
 bool valid_size(uint32_t w, uint32_t h) noexcept {
   return w >= 1 && h >= 1 && w <= 8192 && h <= 8192;
 }
@@ -185,15 +185,14 @@ EtchLoadedTexture blank_texture(EtchContext *ctx, uint32_t w,
 }
 } // namespace
 extern "C" {
-const InlayPortalBackendVTable *inlay_portal_mock_backend(void) {
+INLAY_API const InlayPortalBackendVTable *inlay_portal_mock_backend(void) {
   return &mock_api;
 }
-InlayPortalDesc inlay_portal_desc_default(void) {
-  return {640, 360, INLAY_PORTAL_MODE_TEXTURE, nullptr, nullptr};
-}
-InlayPortal *inlay_portal_create(EtchContext *ctx,
-                                 const InlayPortalDesc *config) {
-  const auto d = config ? *config : inlay_portal_desc_default();
+INLAY_API InlayPortal *inlay_portal_create(EtchContext *ctx,
+                                           const InlayPortalDesc *config) {
+  InlayPortalDesc d = inlay_portal_desc_default();
+  if (config && !inlay_read_abi_struct(config, &d))
+    return nullptr;
   const auto *api = d.backend ? d.backend : &mock_api;
   if (!ctx || !valid_size(d.width, d.height) ||
       (d.mode != INLAY_PORTAL_MODE_TEXTURE &&
@@ -227,7 +226,7 @@ InlayPortal *inlay_portal_create(EtchContext *ctx,
   }
   return p;
 }
-bool inlay_portal_destroy(InlayPortal *p) {
+INLAY_API bool inlay_portal_destroy(InlayPortal *p) {
   if (!p)
     return true;
   if (p->pending_draw)
@@ -237,17 +236,17 @@ bool inlay_portal_destroy(InlayPortal *p) {
   std::free(p);
   return true;
 }
-void inlay_portal_frame_submitted(InlayPortal *p) {
+INLAY_API void inlay_portal_frame_submitted(InlayPortal *p) {
   if (p)
     p->pending_draw = false;
 }
-bool inlay_portal_load_url(InlayPortal *p, EtchStr s) {
+INLAY_API bool inlay_portal_load_url(InlayPortal *p, EtchStr s) {
   return p && s.chars && p->api.load_url && p->api.load_url(p->backend, s);
 }
-bool inlay_portal_load_html(InlayPortal *p, EtchStr s) {
+INLAY_API bool inlay_portal_load_html(InlayPortal *p, EtchStr s) {
   return p && s.chars && p->api.load_html && p->api.load_html(p->backend, s);
 }
-bool inlay_portal_resize(InlayPortal *p, uint32_t w, uint32_t h) {
+INLAY_API bool inlay_portal_resize(InlayPortal *p, uint32_t w, uint32_t h) {
   if (!p || p->pending_draw || !valid_size(w, h))
     return false;
   if (w == p->width && h == p->height)
@@ -271,7 +270,7 @@ bool inlay_portal_resize(InlayPortal *p, uint32_t w, uint32_t h) {
   cancel_portal_input(p);
   return true;
 }
-bool inlay_portal_poll(InlayPortal *p) {
+INLAY_API bool inlay_portal_poll(InlayPortal *p) {
   if (!p)
     return false;
   InlayPortalDirtyRect rects[32] = {};
@@ -304,41 +303,42 @@ bool inlay_portal_poll(InlayPortal *p) {
     etch_request_redraw(p->context);
   return true;
 }
-void inlay_portal_view(InlayPortal *p, const InlayPortalViewDesc *view) {
-  if (!p || etch_current_context() != p->context || !view || !view->id ||
-      !std::isfinite(view->width) || !std::isfinite(view->height) ||
-      view->width <= 0 || view->height <= 0 || !std::isfinite(view->radius) ||
-      view->radius < 0)
+INLAY_API void inlay_portal_view(InlayPortal *p, const InlayPortalViewDesc *view_in) {
+  InlayPortalViewDesc view = {};
+  if (!p || etch_current_context() != p->context || !inlay_read_abi_struct(view_in, &view) || !view.id ||
+      !std::isfinite(view.width) || !std::isfinite(view.height) ||
+      view.width <= 0 || view.height <= 0 || !std::isfinite(view.radius) ||
+      view.radius < 0)
     return;
   p->pending_draw = true;
-  p->id = view->id;
-  p->view_width = view->width;
-  p->view_height = view->height;
+  p->id = view.id;
+  p->view_width = view.width;
+  p->view_height = view.height;
   p->radius =
-      std::fmin(view->radius, .5f * std::fmin(view->width, view->height));
+      std::fmin(view.radius, .5f * std::fmin(view.width, view.height));
   auto box = etch_box_desc_default();
-  box.id = view->id;
-  box.width = etch_sizing_fixed(view->width);
-  box.height = etch_sizing_fixed(view->height);
+  box.id = view.id;
+  box.width = etch_sizing_fixed(view.width);
+  box.height = etch_sizing_fixed(view.height);
   box.background = etch_rgba8(0, 0, 0, 0);
-  box.radius = etch_corners_all(view->radius);
+  box.radius = etch_corners_all(view.radius);
   box.clip_children = true;
   etch_begin_box(&box);
   if (p->mode == INLAY_PORTAL_MODE_TEXTURE) {
     auto image = etch_image_draw_desc_default();
     image.texture = p->texture.texture;
-    image.rect = {0, 0, view->width, view->height};
-    image.radius = view->radius;
+    image.rect = {0, 0, view.width, view.height};
+    image.radius = view.radius;
     etch_draw_image(&image);
   } else {
     auto hole = etch_punch_hole_desc_default();
-    hole.rect = {0, 0, view->width, view->height};
-    hole.radius = etch_corners_all(view->radius);
+    hole.rect = {0, 0, view.width, view.height};
+    hole.radius = etch_corners_all(view.radius);
     etch_punch_hole(&hole);
   }
   etch_end_box();
 }
-bool inlay_portal_sync_geometry(InlayPortal *p) {
+INLAY_API bool inlay_portal_sync_geometry(InlayPortal *p) {
   if (!p || etch_current_context() != p->context)
     return false;
   p->has_geometry = etch_element_geometry(p->id, &p->geometry);
@@ -346,13 +346,18 @@ bool inlay_portal_sync_geometry(InlayPortal *p) {
                     p->geometry.visible_bounds.h > 0 && p->geometry.opacity > 0;
   if (!p->geom_visible)
     cancel_portal_input(p);
+  if (p->api.set_underlay_radius) {
+    const float sx = p->has_geometry && p->geometry.local_scale.x > 0.f ? p->geometry.local_scale.x : 1.f;
+    const float sy = p->has_geometry && p->geometry.local_scale.y > 0.f ? p->geometry.local_scale.y : 1.f;
+    p->api.set_underlay_radius(p->backend, p->radius * std::fmin(sx, sy));
+  }
   if (p->api.set_underlay_bounds)
     p->api.set_underlay_bounds(
         p->backend, p->has_geometry ? p->geometry.bounds : EtchRect{},
         p->geom_visible ? p->geometry.visible_bounds : EtchRect{});
   return p->has_geometry;
 }
-bool inlay_portal_inject_pointer(InlayPortal *p, EtchVec2 screen, bool down) {
+INLAY_API bool inlay_portal_inject_pointer(InlayPortal *p, EtchVec2 screen, bool down) {
   if (!p || !p->api.inject_pointer || !std::isfinite(screen.x) ||
       !std::isfinite(screen.y))
     return false;
@@ -392,21 +397,21 @@ bool inlay_portal_inject_pointer(InlayPortal *p, EtchVec2 screen, bool down) {
       down);
   return true;
 }
-void inlay_portal_inject_wheel(InlayPortal *p, EtchVec2 delta) {
+INLAY_API void inlay_portal_inject_wheel(InlayPortal *p, EtchVec2 delta) {
   if (portal_accepts_input(p) && p->focused && p->api.inject_wheel &&
       std::isfinite(delta.x) && std::isfinite(delta.y))
     p->api.inject_wheel(p->backend, delta);
 }
-void inlay_portal_inject_key(InlayPortal *p, uint32_t key, bool down,
-                             uint16_t mods) {
+INLAY_API void inlay_portal_inject_key(InlayPortal *p, uint32_t key, bool down,
+                                       uint16_t mods) {
   if (portal_accepts_input(p) && p->focused && p->api.inject_key)
     p->api.inject_key(p->backend, key, down, mods);
 }
-void inlay_portal_inject_text(InlayPortal *p, EtchStr text) {
+INLAY_API void inlay_portal_inject_text(InlayPortal *p, EtchStr text) {
   if (portal_accepts_input(p) && p->focused && text.chars && p->api.inject_text)
     p->api.inject_text(p->backend, text);
 }
-bool inlay_portal_query_ime_rect(InlayPortal *p, EtchRect *out) {
+INLAY_API bool inlay_portal_query_ime_rect(InlayPortal *p, EtchRect *out) {
   if (!out || !portal_accepts_input(p) || !p->focused || !p->api.query_ime_rect)
     return false;
   EtchRect r;
@@ -418,24 +423,24 @@ bool inlay_portal_query_ime_rect(InlayPortal *p, EtchRect *out) {
   *out = {g.bounds.x + r.x * sx, g.bounds.y + r.y * sy, r.w * sx, r.h * sy};
   return true;
 }
-InlayPortalStats inlay_portal_stats(const InlayPortal *p) {
+INLAY_API InlayPortalStats inlay_portal_stats(const InlayPortal *p) {
   if (!p)
     return {};
   auto s = p->stats;
   s.has_texture = p->texture.texture != nullptr;
   return s;
 }
-bool inlay_portal_has_focus(const InlayPortal *p) {
+INLAY_API bool inlay_portal_has_focus(const InlayPortal *p) {
   return portal_accepts_input(p) && p->focused;
 }
-void inlay_portal_set_input_enabled(InlayPortal *p, bool enabled) {
+INLAY_API void inlay_portal_set_input_enabled(InlayPortal *p, bool enabled) {
   if (!p)
     return;
   if (!enabled)
     cancel_portal_input(p);
   p->host_input_enabled = enabled;
 }
-bool inlay_portal_mock_advance(InlayPortal *p, uint32_t phase) {
+INLAY_API bool inlay_portal_mock_advance(InlayPortal *p, uint32_t phase) {
   if (!p || p->api.create != mock_create)
     return false;
   auto *m = static_cast<MockPortal *>(p->backend);

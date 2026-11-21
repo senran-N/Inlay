@@ -848,15 +848,18 @@ void inlay_diagram_draw(const InlayDiagramResult& result, const InlayDiagramDesc
 }
 
 extern "C" {
-InlayDiagramDesc inlay_diagram_desc_default(void) { return { {0, 0}, 16, 24, 48, 0, 640, 400 }; }
-InlayDiagramResult inlay_diagram_layout(EtchStr source, const InlayDiagramDesc* desc) {
-    return inlay_diagram_layout_ex(source, desc, nullptr);
+INLAY_API InlayDiagramResult inlay_diagram_layout(EtchStr source, const InlayDiagramDesc* desc_in) {
+    InlayDiagramDesc desc = {};
+    if (!inlay_read_abi_struct(desc_in, &desc)) return {};
+    return inlay_diagram_layout_ex(source, &desc, nullptr);
 }
-InlayDiagramResult inlay_diagram_view(EtchStr source, const InlayDiagramDesc* input) {
+INLAY_API InlayDiagramResult inlay_diagram_view(EtchStr source, const InlayDiagramDesc* input_in) {
+    InlayDiagramDesc input = {};
+    if (!inlay_read_abi_struct(input_in, &input)) return {};
     InlayDiagramMeta meta = {};
-    auto result = inlay_diagram_layout_ex(source, input, &meta);
+    auto result = inlay_diagram_layout_ex(source, &input, &meta);
     if (!result.valid) return result;
-    inlay_diagram_draw_ex(result, *input, &meta);
+    inlay_diagram_draw_ex(result, input, &meta);
     return result;
 }
 }

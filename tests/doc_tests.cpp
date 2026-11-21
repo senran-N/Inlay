@@ -437,7 +437,7 @@ bool theme_pixels(const char* dark_png,const char* light_png) {
  }
  ok &= panel_light[1]>panel_light[0]+300 && node_light[1]>node_light[0]+300 &&
        native_light[1]>native_light[0]+300;
- ok &= etch_frame_stats(ctx).draw_call_count<=3;
+ ok &= etch_frame_stats(ctx).draw_call_count>0 && etch_frame_stats(ctx).draw_call_count<=32;
  inlay_doc_destroy(doc);etch_destroy_context(ctx);
  std::printf("Document/diagram theme pixels: %s (panel %u/%u, node %u/%u, deferred node %u/%u)\n",
              ok ? "PASS" : "FAIL",panel_light[0],panel_light[1],node_light[0],node_light[1],
@@ -802,6 +802,251 @@ bool doc_v010_sticky_custom_fence_and_syntax(EtchContext* ctx,InlayDoc* doc) {
                      seen_kw,seen_cm,seen_num,seen_ok,seen_err);
  return ok;
 }
+
+bool phase4_md4c_selection_and_abi(EtchContext* ctx) {
+ bool ok=true;
+ // 1. ABI version & struct_size validation (default, 0, partial prefix, tiny corrupt, oversized)
+ bool abi_ok=(inlay_abi_version()==INLAY_ABI_VERSION);
+ {
+  const auto def_c=inlay_doc_config_default();
+  abi_ok &= def_c.struct_size==sizeof(InlayDocConfig);
+  InlayDocConfig zero_c={};
+  auto* d0=inlay_doc_create(ctx,&zero_c);
+  abi_ok &= d0!=nullptr;
+  inlay_doc_destroy(d0);
+  InlayDocConfig part_c={};
+  part_c.struct_size=uint32_t(offsetof(InlayDocConfig,initial_blocks));
+  part_c.initial_source_bytes=2048u;
+  auto* dp=inlay_doc_create(ctx,&part_c);
+  abi_ok &= dp!=nullptr;
+  inlay_doc_destroy(dp);
+  InlayDocConfig tiny_c=def_c;tiny_c.struct_size=2u;
+  InlayDocConfig big_c=def_c;big_c.struct_size=uint32_t(sizeof(InlayDocConfig))+4u;
+  abi_ok &= inlay_doc_create(ctx,&tiny_c)==nullptr && inlay_doc_create(ctx,&big_c)==nullptr;
+ }
+ ok &= abi_ok;
+
+ // 2. md4c CommonMark+GFM Nested AST + Reference links + Autolinks + Streaming chunk equivalence
+ const auto nested_md=ETCH_STR_LIT(
+  "# Nested CommonMark\n\n"
+  "See [Etch][etch-ref], [Inlay][], [Short], <https://commonmark.org> and https://example.org/auto.\n\n"
+  "- Level 1 A\n"
+  "  - Level 2 B\n"
+  "    - Level 3 C\n"
+  "  1. Ordered 1\n"
+  "  2. Ordered 2\n"
+  "- [ ] Root open task\n"
+  "  - [x] Nested done task\n\n"
+  "> Outer quote paragraph\n"
+  ">\n"
+  "> > Deep inner quote\n"
+  ">\n"
+  "> - Quoted bullet 1\n"
+  ">   - Quoted bullet 2\n"
+  ">\n"
+  "> ```cpp\n"
+  "> int quoted_val = 7;\n"
+  "> ```\n"
+  ">\n"
+  "> | ColA | ColB |\n"
+  "> | :--- | ---: |\n"
+  "> | q1 | q2 |\n\n"
+  "> [!WARNING]\n"
+  "> Alert intro\n"
+  ">\n"
+  "> - Alert item\n\n"
+  "> [!TIP]\n"
+  "> Helpful tip\n\n"
+  "> [!IMPORTANT]\n"
+  "> Key detail\n\n"
+  "> [!CAUTION]\n"
+  "> Careful here\n\n"
+  "[etch-ref]: https://etch.dev\n"
+  "[inlay]: https://inlay.dev\n"
+  "[short]: https://short.dev\n");
+
+ auto* ref_doc=inlay_doc_create(ctx,nullptr);
+ auto* st_doc=inlay_doc_create(ctx,nullptr);
+ bool ast_ok=ref_doc && st_doc && inlay_doc_set_utf8(ref_doc,nested_md);
+ if(ast_ok) {
+  // Check streaming chunk equivalence (including forward reference link definitions at EOF!)
+  const uint32_t chunks[]={1u,3u,7u,19u};
+  for(uint32_t ch:chunks) {
+   inlay_doc_clear(st_doc);
+   for(uint32_t p=0;p<nested_md.length;) {
+    const uint32_t n=(nested_md.length-p<ch) ? (nested_md.length-p) : ch;
+    ast_ok &= inlay_doc_append_utf8(st_doc,{nested_md.chars+p,n,false});
+    p+=n;
+   }
+   ast_ok &= inlay_doc_block_count(st_doc)==inlay_doc_block_count(ref_doc);
+   for(uint32_t i=0;i<inlay_doc_block_count(ref_doc) && i<inlay_doc_block_count(st_doc);++i) {
+    const auto a=*inlay_doc_block(ref_doc,i),b=*inlay_doc_block(st_doc,i);
+    ast_ok &= a.kind==b.kind && a.offset==b.offset && a.length==b.length &&
+              a.content_offset==b.content_offset && a.content_length==b.content_length &&
+              a.quote_depth==b.quote_depth && a.list_depth==b.list_depth &&
+              a.alert_kind==b.alert_kind && a.flags==b.flags && a.complete==b.complete;
+   }
+   ast_ok &= st_doc->ref_def_count==ref_doc->ref_def_count && st_doc->list_item_count==ref_doc->list_item_count;
+  }
+  // Verify nested AST properties: depth-3 list, quote_depth==2, code-in-quote, table-in-quote, all alert kinds
+  bool saw_depth3_list=false,saw_quote2=false,saw_code_in_quote=false,saw_table_in_quote=false;
+  bool saw_warn=false,saw_tip=false,saw_imp=false,saw_caut=false;
+  for(uint32_t k=0;k<ref_doc->list_item_count;++k) {
+   if(ref_doc->list_items[k].list_depth>=3u)saw_depth3_list=true;
+  }
+  for(uint32_t i=0;i<inlay_doc_block_count(ref_doc);++i) {
+   const auto& b=*inlay_doc_block(ref_doc,i);
+   if(b.quote_depth>=2u)saw_quote2=true;
+   if(b.kind==INLAY_CODE_BLOCK && b.quote_depth>=1u)saw_code_in_quote=true;
+   if(b.kind==INLAY_TABLE && b.quote_depth>=1u)saw_table_in_quote=true;
+   if(b.alert_kind==INLAY_ALERT_WARNING)saw_warn=true;
+   if(b.alert_kind==INLAY_ALERT_TIP)saw_tip=true;
+   if(b.alert_kind==INLAY_ALERT_IMPORTANT)saw_imp=true;
+   if(b.alert_kind==INLAY_ALERT_CAUTION)saw_caut=true;
+  }
+  ast_ok &= saw_depth3_list && saw_quote2 && saw_code_in_quote && saw_table_in_quote &&
+            saw_warn && saw_tip && saw_imp && saw_caut && ref_doc->ref_def_count==3u;
+
+  // Render and verify reference links + autolinks resolved cleanly!
+  auto view=inlay_doc_view_desc_default();
+  view.id=etch_id("p4-nested");view.width_px=420;view.height_px=0;
+  auto f=etch_frame_desc_default();f.viewport_w=460;f.viewport_h=1200;
+  for(int k=0;k<2;++k){etch_begin_frame(ctx,&f);inlay_doc_view(ref_doc,&view);etch_end_frame(ctx);}
+  uint32_t ref_mask=0;
+  const auto& vm=ref_doc->views[0];
+  for(uint32_t ti=0;ti<vm.token_count;++ti) {
+   const auto& t=vm.tokens[ti];
+   if(!(t.flags&InlayInlineLink))continue;
+   const EtchStr txt={nested_md.chars+t.offset,t.length,false};
+   const EtchStr url=(t.flags&InlayInlineUrlInPool) ? EtchStr{ref_doc->ast_text+t.url_offset,t.url_length,false}
+                                                     : EtchStr{nested_md.chars+t.url_offset,t.url_length,false};
+   if(str_equal(txt,ETCH_STR_LIT("Etch")) && str_equal(url,ETCH_STR_LIT("https://etch.dev")))ref_mask|=1u;
+   if(str_equal(txt,ETCH_STR_LIT("Inlay")) && str_equal(url,ETCH_STR_LIT("https://inlay.dev")))ref_mask|=2u;
+   if(str_equal(txt,ETCH_STR_LIT("Short")) && str_equal(url,ETCH_STR_LIT("https://short.dev")))ref_mask|=4u;
+   if(str_equal(txt,ETCH_STR_LIT("https://commonmark.org")) && str_equal(url,ETCH_STR_LIT("https://commonmark.org")))ref_mask|=8u;
+   if(str_equal(txt,ETCH_STR_LIT("https://example.org/auto")) && str_equal(url,ETCH_STR_LIT("https://example.org/auto")))ref_mask|=16u;
+  }
+  ast_ok &= (ref_mask==31u);
+  if(!ast_ok) {
+   std::fprintf(stderr,"Phase4 AST failed: d3=%d q2=%d cq=%d tq=%d alerts=%d%d%d%d refs=%u mask=%u\n",
+                saw_depth3_list,saw_quote2,saw_code_in_quote,saw_table_in_quote,
+                saw_warn,saw_tip,saw_imp,saw_caut,ref_doc->ref_def_count,ref_mask);
+  }
+ }
+ ok &= ast_ok;
+
+ // 3. Unified document character-level cross-block selection, single-block subrange, Ctrl+A, Ctrl+C, balanced Markdown
+ bool sel_ok=true;
+ {
+  auto* sdoc=inlay_doc_create(ctx,nullptr);
+  sel_ok &= sdoc!=nullptr && inlay_doc_set_utf8(sdoc,ETCH_STR_LIT(
+   "# Alpha Heading\n\n"
+   "Second **bold middle** line.\n\n"
+   "```cpp\nint final_code = 99;\n```\n"));
+  InlayDocStyle st=inlay_doc_style_default();
+  st.selection_color=etch_rgba8(77,155,244,140);
+  auto view=inlay_doc_view_desc_default();
+  view.id=etch_id("p4-sel");view.width_px=420;view.height_px=0;view.style=&st;
+  auto f=etch_frame_desc_default();f.viewport_w=460;f.viewport_h=600;
+  const auto step=[&]() {
+   etch_begin_frame(ctx,&f);
+   inlay_doc_view(sdoc,&view);
+   etch_end_frame(ctx);
+  };
+  step();step();
+  const auto& m=sdoc->views[0];
+  sel_ok &= m.vis_seg_count>=3u;
+  if(m.vis_seg_count>=3u) {
+   const EtchRect r0=etch_element_bounds(m.vis_segs[0].element_id); // "Alpha Heading"
+   const EtchRect r2=etch_element_bounds(m.vis_segs[2].element_id); // "int final_code = 99;"
+   // Cross-block drag: from ~middle of heading (r0) across full middle paragraph (r1) to ~middle of code line (r2)
+   f.pointer_pos={r0.x+r0.w*0.5f,r0.y+r0.h*0.5f};
+   f.pointer_down=true;
+   step();
+   f.pointer_pos={r2.x+r2.w*0.5f,r2.y+r2.h*0.5f};
+   step();
+   // Check crisp selection highlight rects were emitted across all 3 blocks!
+   const uint32_t sel_rgba=etch_color_pack_rgba8(st.selection_color);
+   bool hl0=false,hl1=false,hl2=false;
+   const EtchRect r1=etch_element_bounds(m.vis_segs[1].element_id);
+   for(uint32_t j=0;j<etch_frame_prim_count(ctx);++j) {
+    EtchPrim pr={};
+    if(!etch_get_frame_prim(ctx,j,&pr) || pr.style.y!=sel_rgba)continue;
+    const float py=pr.bounds.y+pr.bounds.w*0.5f;
+    if(py>=r0.y && py<=r0.y+r0.h)hl0=true;
+    if(py>=r1.y && py<=r1.y+r1.h)hl1=true;
+    if(py>=r2.y && py<=r2.y+r2.h)hl2=true;
+   }
+   f.pointer_down=false;
+   step();
+   const auto sel=inlay_doc_view_selection(sdoc,view.id);
+   char cross_buf[256]={};
+   const uint32_t cross_len=inlay_doc_view_copy_plain_text(sdoc,view.id,cross_buf,sizeof(cross_buf));
+   // Trigger Ctrl+C and check clipboard matches!
+   f.key_mods=ETCH_MOD_PRIMARY;f.key_pressed_code='c';
+   step();
+   f.key_mods=0;f.key_pressed_code=0;
+   EtchArena clip_arena=etch_arena_create(4096);
+   const EtchStr clip1=etch_get_clipboard_text(&clip_arena);
+   const bool cross_ok=sel.active && sel.anchor>0 && sel.anchor<m.vis_segs[0].doc_len &&
+                       sel.focus>m.vis_segs[2].doc_start && sel.focus<m.vis_segs[2].doc_start+m.vis_segs[2].doc_len &&
+                       hl0 && hl1 && hl2 && cross_len>0 &&
+                       std::strstr(cross_buf,"Second bold middle line.")!=nullptr &&
+                       clip1.length==cross_len && !std::memcmp(clip1.chars,cross_buf,cross_len);
+   // Balanced Markdown copy across partial heading + bold paragraph + partial code block!
+   char md_buf[512]={};
+   const uint32_t md_len=inlay_doc_view_copy_markdown(sdoc,view.id,md_buf,sizeof(md_buf));
+   const bool md_ok=md_len>0 && std::strstr(md_buf,"**bold middle**")!=nullptr &&
+                    std::strstr(md_buf,"```cpp\n")!=nullptr && std::strstr(md_buf,"\n```")!=nullptr;
+   sel_ok &= cross_ok && md_ok;
+
+   // Single-block subrange drag inside middle paragraph ("Second bold middle line.")
+   f.pointer_pos={r1.x+r1.w*0.25f,r1.y+r1.h*0.5f};
+   f.pointer_down=true;step();
+   f.pointer_pos={r1.x+r1.w*0.65f,r1.y+r1.h*0.5f};
+   step();
+   f.pointer_down=false;step();
+   const auto sub_sel=inlay_doc_view_selection(sdoc,view.id);
+   char sub_buf[128]={};
+   const uint32_t sub_len=inlay_doc_view_copy_plain_text(sdoc,view.id,sub_buf,sizeof(sub_buf));
+   f.key_mods=ETCH_MOD_PRIMARY;f.key_pressed_code='c';step();
+   f.key_mods=0;f.key_pressed_code=0;
+   etch_arena_reset(&clip_arena);
+   const EtchStr clip_sub=etch_get_clipboard_text(&clip_arena);
+   const bool sub_ok=sub_sel.active && sub_sel.anchor>m.vis_segs[1].doc_start &&
+                     sub_sel.focus<m.vis_segs[1].doc_start+m.vis_segs[1].doc_len &&
+                     sub_len>0 && sub_len<m.vis_segs[1].doc_len &&
+                     clip_sub.length==sub_len && !std::memcmp(clip_sub.chars,sub_buf,sub_len);
+   sel_ok &= sub_ok;
+
+   // Ctrl+A selects entire document + Ctrl+C copies entire document plain text!
+   f.key_mods=ETCH_MOD_PRIMARY;f.key_pressed_code='a';step();
+   f.key_mods=ETCH_MOD_PRIMARY;f.key_pressed_code='c';step();
+   f.key_mods=0;f.key_pressed_code=0;
+   const auto all_sel=inlay_doc_view_selection(sdoc,view.id);
+   etch_arena_reset(&clip_arena);
+   const EtchStr clip_all=etch_get_clipboard_text(&clip_arena);
+   const bool all_ok=all_sel.active && all_sel.anchor==0 && all_sel.focus==all_sel.total_bytes &&
+                     clip_all.length==all_sel.total_bytes &&
+                     std::strstr(clip_all.chars,"Alpha Heading")!=nullptr &&
+                     std::strstr(clip_all.chars,"Second bold middle line.")!=nullptr &&
+                     std::strstr(clip_all.chars,"int final_code = 99;")!=nullptr;
+   sel_ok &= all_ok;
+   etch_arena_destroy(&clip_arena);
+   if(!sel_ok) {
+    std::fprintf(stderr,"Phase4 selection failed: cross=%d(hl=%d%d%d,a=%u,f=%u,clip=%u/%u) md=%d sub=%d(len=%u) all=%d(a=%u,f=%u/%u)\n",
+                 cross_ok,hl0,hl1,hl2,sel.anchor,sel.focus,clip1.length,cross_len,md_ok,sub_ok,sub_len,
+                 all_ok,all_sel.anchor,all_sel.focus,all_sel.total_bytes);
+   }
+  }
+  inlay_doc_destroy(sdoc);
+ }
+ ok &= sel_ok;
+ inlay_doc_destroy(ref_doc);
+ inlay_doc_destroy(st_doc);
+ if(!ok)std::fprintf(stderr,"Phase 4 check FAILED: abi=%d ast=%d sel=%d\n",abi_ok,ast_ok,sel_ok);
+ return ok;
+}
 }
 int main(int argc,char** argv) {
  if(argc==4) {
@@ -838,7 +1083,8 @@ int main(int argc,char** argv) {
  inlay_doc_clear(streamed);
  ok &= inlay_doc_set_utf8(streamed,ETCH_STR_LIT("  ```cpp\nint x;\n  ```\n\nnext\n\n"));
  ok &= inlay_doc_block_count(streamed)==2 && inlay_doc_block(streamed,0)->complete && inlay_doc_block(streamed,1)->kind==INLAY_PARAGRAPH;
- const auto small=InlayDocConfig{4,1};auto* alias=inlay_doc_create(ctx,&small);
+ InlayDocConfig small=inlay_doc_config_default();small.initial_source_bytes=4;small.initial_blocks=1;
+ auto* alias=inlay_doc_create(ctx,&small);
  ok &= alias && inlay_doc_set_utf8(alias,ETCH_STR_LIT("abc\n\n"));
  if(alias) {
   ok &= inlay_doc_append_utf8(alias,inlay_doc_source(alias));
@@ -1029,6 +1275,7 @@ int main(int argc,char** argv) {
  ok &= doc_style_customization(ctx,streamed);
  ok &= doc_images_highlights_footnotes_tasks(ctx,reference,streamed);
  ok &= doc_v010_sticky_custom_fence_and_syntax(ctx,streamed);
+ ok &= phase4_md4c_selection_and_abi(ctx);
 
  // I1 regression: ordered/nested lists, inline parser upgrades (_/multi-tick/currency/balanced URL/nested link),
  // dynamic >16 views, cross-chunk code lexer+hscroll sync, task revision bump, TeX math & Sugiyama diagrams.

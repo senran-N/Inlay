@@ -973,16 +973,16 @@ void inlay_math_draw_prepared(const InlayMathPrepared& prep, EtchVec2 pos, EtchC
 }
 
 extern "C" {
-InlayMathDesc inlay_math_desc_default(void) { return { {0, 0}, 20, etch_get_theme(etch_current_context()).text_primary }; }
-InlayMathResult inlay_measure_math(EtchStr tex, float size) {
+INLAY_API InlayMathResult inlay_measure_math(EtchStr tex, float size) {
     InlayMathPrepared prep = {};
     return inlay_math_prepare(tex, size, true, &prep) ? prep.metrics : InlayMathResult{};
 }
-InlayMathResult inlay_draw_math(EtchStr tex, const InlayMathDesc* desc) {
-    if (!desc || !std::isfinite(desc->pos.x) || !std::isfinite(desc->pos.y)) return {};
+INLAY_API InlayMathResult inlay_draw_math(EtchStr tex, const InlayMathDesc* desc_in) {
+    InlayMathDesc desc = {};
+    if (!inlay_read_abi_struct(desc_in, &desc) || !std::isfinite(desc.pos.x) || !std::isfinite(desc.pos.y)) return {};
     InlayMathPrepared prep = {};
-    if (!inlay_math_prepare(tex, desc->font_size_px, true, &prep)) return {};
-    inlay_math_draw_prepared(prep, desc->pos, desc->color);
+    if (!inlay_math_prepare(tex, desc.font_size_px, true, &prep)) return {};
+    inlay_math_draw_prepared(prep, desc.pos, desc.color);
     return prep.metrics;
 }
 }
