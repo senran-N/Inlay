@@ -25,10 +25,18 @@ bool reserve_blocks(InlayDoc* d,uint32_t needed) noexcept {
 bool starts(const char* text,uint32_t length,const char* prefix) noexcept {
  const size_t n=std::strlen(prefix);return n<=length && std::memcmp(text,prefix,n)==0;
 }
-InlayBlock classify(const char* text,uint32_t start,uint32_t length) noexcept {
+InlayBlock classify(const char* text,uint32_t start,uint32_t length,bool in_list=false) noexcept {
  InlayBlock b={};b.kind=INLAY_PARAGRAPH;b.offset=start;b.length=length;b.content_offset=start;b.content_length=length;
- uint32_t indent=0;while(indent<length && indent<3 && text[indent]==' ')++indent;
+ const uint32_t max_indent=in_list ? 16u : 3u;
+ uint32_t indent=0;while(indent<length && indent<max_indent && (text[indent]==' ' || (in_list && text[indent]=='\t')))++indent;
  const char* s=text+indent;const uint32_t n=length-indent;
+ if(in_list && indent>=4) {
+  if(starts(s,n,"- [ ] ") || starts(s,n,"- [x] ") || starts(s,n,"- [X] ")) {b.kind=INLAY_TASK_LIST;b.content_length=start+length-b.content_offset;return b;}
+  if(starts(s,n,"- ") || starts(s,n,"* ") || starts(s,n,"+ ")) {b.kind=INLAY_LIST;b.content_length=start+length-b.content_offset;return b;}
+  uint32_t digits=0;while(digits<n && s[digits]>='0' && s[digits]<='9')++digits;
+  if(digits && digits+1<n && (s[digits]=='.' || s[digits]==')') && s[digits+1]==' ') {b.kind=INLAY_LIST;b.content_length=start+length-b.content_offset;return b;}
+  return b;
+ }
  uint32_t h=0;while(h<n && s[h]=='#')++h;
  if(h>0 && h<=6 && h<n && s[h]==' ') {b.kind=INLAY_HEADING;b.level=h;b.content_offset=start+indent+h+1;}
  else if(starts(s,n,"```") || starts(s,n,"~~~")) {
@@ -110,7 +118,8 @@ void parse_tail(InlayDoc* d) noexcept {
    if(current)current->complete=true;
    d->frozen_count=d->block_count;d->tail_start=after;current=nullptr;
   } else if(!blank) {
-   InlayBlock b=classify(line,pos,length);
+   const bool in_list=current && (current->kind==INLAY_LIST || current->kind==INLAY_TASK_LIST);
+   InlayBlock b=classify(line,pos,length,in_list);
    if(current && current->kind==INLAY_PARAGRAPH && inlay_table_rule(line,length))current->kind=INLAY_TABLE;
    const bool continuing=current && ((current->kind==b.kind && b.kind!=INLAY_FOOTNOTE && b.kind!=INLAY_IMAGE) || (current->kind==INLAY_FOOTNOTE && b.kind==INLAY_PARAGRAPH && length>=2 && (line[0]==' ' || line[0]=='\t')) || (current->kind==INLAY_ALERT && b.kind==INLAY_BLOCKQUOTE) || (current->kind==INLAY_TABLE && std::memchr(line,'|',length)));
    if(continuing) {
@@ -154,8 +163,8 @@ InlayDoc* inlay_doc_create(EtchContext* context,const InlayDocConfig* config) {
  d->source=static_cast<char*>(std::malloc(d->source_capacity));d->blocks=static_cast<InlayBlock*>(std::malloc(size_t(d->block_capacity)*sizeof(InlayBlock)));
  if(!d->source || !d->blocks) {inlay_doc_destroy(d);return nullptr;}return d;
 }
-void inlay_doc_destroy(InlayDoc* d) {if(d) {for(auto& view:d->views) {std::free(view.rows);std::free(view.heights);std::free(view.open);std::free(view.code_wrap);std::free(view.details);std::free(view.tokens);}std::free(d->source);std::free(d->blocks);std::free(d);}}
-void inlay_doc_clear(InlayDoc* d) {if(d) {d->source_size=0;d->block_count=0;d->frozen_count=0;d->tail_start=0;d->utf8_carry_len=0;for(auto& view:d->views){view.width=0;view.doc_sel_active=false;view.doc_sel_dragging=false;}++d->revision;etch_request_redraw(d->context);}}
+void inlay_doc_destroy(InlayDoc* d) {if(d) {for(uint32_t i=0;i<d->view_count;++i) {auto& view=d->views[i];std::free(view.rows);std::free(view.heights);std::free(view.open);std::free(view.code_wrap);std::free(view.code_scroll_x);std::free(view.details);std::free(view.table_cols);std::free(view.tokens);}std::free(d->views);std::free(d->source);std::free(d->blocks);std::free(d);}}
+void inlay_doc_clear(InlayDoc* d) {if(d) {d->source_size=0;d->block_count=0;d->frozen_count=0;d->tail_start=0;d->utf8_carry_len=0;for(uint32_t i=0;i<d->view_count;++i){auto& view=d->views[i];view.width=0;view.table_cols_count=0;view.doc_sel_active=false;view.doc_sel_dragging=false;}++d->revision;etch_request_redraw(d->context);}}
 bool inlay_doc_append_utf8(InlayDoc* d,EtchStr chunk) {
  if(!d || (!chunk.chars && chunk.length) || chunk.length>max_bytes-d->source_size-d->utf8_carry_len)return false;
  const uintptr_t ptr=reinterpret_cast<uintptr_t>(chunk.chars),base=reinterpret_cast<uintptr_t>(d->source);

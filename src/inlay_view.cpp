@@ -25,30 +25,64 @@ float custom_fence_estimate(const InlayDocViewDesc& view,const InlayDoc* doc,con
  const float h=view.custom_fence_estimate_fn(lang,body,available_width,view.font_size_px,view.custom_fence_user_data);
  return (std::isfinite(h) && h>0.f) ? std::fmin(h,4096.f) : 0.f;
 }
-struct NativeDraw {EtchStr source;InlayDiagramResult diagram_result;float font;bool diagram;EtchTheme theme;EtchColor text_color;};
+struct NativeDraw {
+ EtchStr source;
+ InlayDiagramResult diagram_result;
+ InlayDiagramMeta diagram_meta;
+ InlayMathPrepared math_prep;
+ float font;
+ bool diagram;
+ EtchTheme theme;
+ EtchColor text_color;
+};
 void draw_native(EtchRect,void* user) {
  const auto& draw=*static_cast<NativeDraw*>(user);
  etch_push_theme(&draw.theme);
- if(draw.diagram){auto desc=inlay_diagram_desc_default();desc.font_size_px=draw.font;inlay_diagram_draw(draw.diagram_result,desc);}
- else {auto desc=inlay_math_desc_default();desc.font_size_px=draw.font;if(draw.text_color.a!=0)desc.color=draw.text_color;inlay_draw_math(draw.source,&desc);}
+ if(draw.diagram) {
+  auto desc=inlay_diagram_desc_default();desc.font_size_px=draw.font;
+  inlay_diagram_draw_ex(draw.diagram_result,desc,&draw.diagram_meta);
+ } else {
+  const EtchColor col=draw.text_color.a!=0 ? draw.text_color : etch_get_theme(etch_current_context()).text_primary;
+  inlay_math_draw_prepared(draw.math_prep,{0,0},col);
+ }
  etch_pop_theme();
 }
-void native_box(EtchStr source,float font,bool diagram,uint32_t id,float max_width,EtchColor text_color={}) {
+void native_box(EtchStr source,float font,bool diagram,uint32_t id,float max_width,EtchColor text_color={},
+                bool display_math=true,const InlayMathPrepared* pre_math=nullptr,float top_pad=0.f) {
  auto* ctx=etch_current_context();
- auto* copy=source.length ? static_cast<char*>(etch_frame_arena_alloc(ctx,source.length,1)) : nullptr;
- if(source.length && !copy){etch_text(source,nullptr);return;}
- if(copy)std::memcpy(copy,source.chars,source.length);
- const EtchStr copied={copy,source.length,false};
+ EtchStr copied=source;
+ if(!pre_math) {
+  auto* copy=source.length ? static_cast<char*>(etch_frame_arena_alloc(ctx,source.length,1)) : nullptr;
+  if(source.length && !copy){etch_text(source,nullptr);return;}
+  if(copy)std::memcpy(copy,source.chars,source.length);
+  copied={copy,source.length,false};
+ }
  float width=0,height=0;
  InlayDiagramResult diagram_result={};
- if(diagram){auto desc=inlay_diagram_desc_default();desc.font_size_px=font;diagram_result=inlay_diagram_layout(copied,&desc);if(!diagram_result.valid){etch_text(copied,nullptr);return;}width=diagram_result.width;height=diagram_result.height;}
- else {const auto metrics=inlay_measure_math(copied,font);if(!metrics.valid){etch_text(copied,nullptr);return;}width=metrics.width;height=metrics.height;}
- auto box=etch_box_desc_default();box.id=id;box.width=etch_sizing_fixed(std::fmin(width,max_width));box.height=etch_sizing_fixed(std::fmin(height+8,4096.f));box.scroll_y=height+8>4096;box.scroll_x=width>max_width;box.clip_children=true;
+ InlayDiagramMeta diagram_meta={};
+ InlayMathPrepared math_prep={};
+ if(diagram) {
+  auto desc=inlay_diagram_desc_default();desc.font_size_px=font;
+  diagram_result=inlay_diagram_layout_ex(copied,&desc,&diagram_meta);
+  if(!diagram_result.valid){etch_text(copied,nullptr);return;}
+  width=diagram_result.width;height=diagram_result.height;
+ } else {
+  if(pre_math) math_prep=*pre_math;
+  else if(!inlay_math_prepare(copied,font,display_math,&math_prep)){etch_text(copied,nullptr);return;}
+  width=math_prep.metrics.width;height=math_prep.metrics.height;
+ }
+ const float extra_h=(diagram || display_math) ? 8.f : 0.f;
+ const float box_h=height+extra_h+top_pad;
+ auto box=etch_box_desc_default();box.id=id;
+ box.width=etch_sizing_fixed(std::fmin(width,max_width));
+ box.height=etch_sizing_fixed(std::fmin(box_h,4096.f));
+ box.scroll_y=box_h>4096.f;box.scroll_x=width>max_width;box.clip_children=true;
+ if(top_pad>0.f)box.padding={0,0,top_pad,0};
  etch_begin_box(&box);
- auto content=etch_box_desc_default();content.width=etch_sizing_fixed(width);content.height=etch_sizing_fixed(height+8);etch_begin_box(&content);
+ auto content=etch_box_desc_default();content.width=etch_sizing_fixed(width);content.height=etch_sizing_fixed(height+extra_h);etch_begin_box(&content);
  auto* draw=static_cast<NativeDraw*>(etch_frame_arena_alloc(ctx,sizeof(NativeDraw),alignof(NativeDraw)));
- if(draw){
-  *draw={copied,diagram_result,font,diagram,etch_get_theme(ctx),text_color};
+ if(draw) {
+  *draw={copied,diagram_result,diagram_meta,math_prep,font,diagram,etch_get_theme(ctx),text_color};
   etch_draw_after_layout(draw_native,draw,false);
  }
  etch_end_box();etch_end_box();
@@ -145,30 +179,87 @@ bool append_inline(InlayMeasure* m,InlayInline token) {
  m->tokens[m->token_count++]=token;return true;
 }
 bool inline_space(char c) {return c==' ' || c=='\t' || c=='\r';}
-bool inline_line(InlayMeasure* m,const char* text,uint32_t pos,uint32_t end) {
+bool inline_alnum(char c) {return (c>='a' && c<='z') || (c>='A' && c<='Z') || (c>='0' && c<='9');}
+bool scan_balanced_paren_url(const char* text,uint32_t url_start,uint32_t end,uint32_t* out_close) noexcept {
+ uint32_t p=url_start;int depth=0;
+ while(p<end) {
+  const char ch=text[p];
+  if(ch=='\\' && p+1<end){p+=2;continue;}
+  if(ch=='('){++depth;++p;continue;}
+  if(ch==')'){if(depth==0){*out_close=p;return true;}--depth;++p;continue;}
+  ++p;
+ }
+ return false;
+}
+bool scan_link_bracket(const char* text,uint32_t inner_start,uint32_t end,uint32_t* out_close) noexcept {
+ uint32_t p=inner_start;int depth=0;
+ while(p<end) {
+  const char ch=text[p];
+  if(ch=='\\' && p+1<end){p+=2;continue;}
+  if(ch=='['){++depth;++p;continue;}
+  if(ch==']'){if(depth==0){*out_close=p;return true;}--depth;++p;continue;}
+  ++p;
+ }
+ return false;
+}
+bool inline_line(InlayMeasure* m,const char* text,uint32_t pos,uint32_t end,uint32_t base_flags=0,uint32_t link_url_off=0,uint32_t link_url_len=0) {
  const uint32_t first=m->token_count,line_start=pos;
- uint32_t opens[4],depth=0,bracket=pos,paren=pos;
- bool no_code=false,no_dollar=false,no_paren_math=false;
+ uint32_t opens[6],depth=0;
+ bool no_paren_math=false;
+ const bool in_link=(base_flags&InlayInlineLink)!=0;
  while(pos<end) {
-  const uint32_t start=pos;InlayInline token={pos,1,0,0,0};
+  const uint32_t start=pos;InlayInline token={pos,1,link_url_off,link_url_len,base_flags};
   const char c=text[pos];
-  if(c=='$' && !no_dollar) {
-   uint32_t close=pos+1;while(close<end && text[close]!='$')++close;
-   if(close<end){token={pos+1,close-pos-1,pos,close+1-pos,InlayInlineMath};pos=close+1;}else no_dollar=true;
+  if(c=='$' && pos+1<end && text[pos+1]!='$' && !inline_space(text[pos+1])) {
+   uint32_t close=pos+1;
+   while(close<end) {
+    if(text[close]=='\\' && close+1<end){close+=2;continue;}
+    if(text[close]=='$')break;
+    ++close;
+   }
+   // Pandoc currency boundary rule: closing $ cannot follow whitespace or precede an ASCII digit.
+   const bool valid_close=close<end && close>pos+1 && !inline_space(text[close-1]) &&
+                          (close+1>=end || text[close+1]<'0' || text[close+1]>'9');
+   if(valid_close) {
+    token={pos+1,close-pos-1,pos,close+1-pos,InlayInlineMath|base_flags};
+    pos=close+1;
+   }
   } else if(!no_paren_math && c=='\\' && pos+1<end && text[pos+1]=='(') {
    uint32_t close=pos+2;while(close+1<end && !(text[close]=='\\' && text[close+1]==')'))++close;
-   if(close+1<end){token={pos+2,close-pos-2,pos,close+2-pos,InlayInlineMath};pos=close+2;}else no_paren_math=true;
-  } else if(c=='`' && !no_code) {
-   uint32_t close=pos+1;while(close<end && text[close]!='`')++close;
-   if(close<end){token={pos+1,close-pos-1,0,0,InlayInlineCode};pos=close+1;}else no_code=true;
-  } else if(c=='!' && pos+1<end && text[pos+1]=='[') {
-   if(bracket<=pos+1){bracket=pos+2;while(bracket<end && text[bracket]!=']')++bracket;}
-   if(bracket+1<end && text[bracket+1]=='(') {
-    const uint32_t url=bracket+2;
-    if(paren<url){paren=url;while(paren<end && text[paren]!=')')++paren;}
-    if(paren<end){token={pos+2,bracket-(pos+2),url,paren-url,InlayInlineImage};pos=paren+1;}
+   if(close+1<end){token={pos+2,close-pos-2,pos,close+2-pos,InlayInlineMath|base_flags};pos=close+2;}else no_paren_math=true;
+  } else if(c=='`') {
+   uint32_t ticks=1;while(pos+ticks<end && text[pos+ticks]=='`' && ticks<8)++ticks;
+   uint32_t scan=pos+ticks,match_pos=end;
+   while(scan<end) {
+    if(text[scan]=='`') {
+     uint32_t run=1;while(scan+run<end && text[scan+run]=='`')++run;
+     if(run==ticks){match_pos=scan;break;}
+     scan+=run;
+    } else ++scan;
    }
-  } else if(c=='[') {
+   if(match_pos<end) {
+    uint32_t cs=pos+ticks,ce=match_pos;
+    if(ticks>=2 && ce-cs>=3 && text[cs]==' ' && text[ce-1]==' ') {
+     bool all_sp=true;for(uint32_t k=cs;k<ce;++k)if(text[k]!=' '){all_sp=false;break;}
+     if(!all_sp){++cs;--ce;}
+    }
+    const uint32_t span_off=in_link ? link_url_off : pos;
+    const uint32_t span_len=in_link ? link_url_len : (match_pos+ticks-pos);
+    token={cs,ce-cs,span_off,span_len,InlayInlineCode|base_flags};
+    pos=match_pos+ticks;
+   } else {
+    token={pos,ticks,link_url_off,link_url_len,base_flags};
+    pos+=ticks;
+   }
+  } else if(!in_link && c=='!' && pos+1<end && text[pos+1]=='[') {
+   uint32_t bracket=0,paren=0;
+   if(scan_link_bracket(text,pos+2,end,&bracket) && bracket+1<end && text[bracket+1]=='(' &&
+      scan_balanced_paren_url(text,bracket+2,end,&paren))
+   {
+    token={pos+2,bracket-(pos+2),bracket+2,paren-(bracket+2),InlayInlineImage};
+    pos=paren+1;
+   }
+  } else if(!in_link && c=='[') {
    if(pos+1<end && text[pos+1]=='^') {
     uint32_t fn_end=pos+2;
     while(fn_end<end && text[fn_end]!=']' && !inline_space(text[fn_end]) && text[fn_end]!='[')++fn_end;
@@ -177,19 +268,31 @@ bool inline_line(InlayMeasure* m,const char* text,uint32_t pos,uint32_t end) {
     }
    }
    if(pos==start) {
-    if(bracket<=pos){bracket=pos+1;while(bracket<end && text[bracket]!=']')++bracket;}
-    if(bracket+1<end && text[bracket+1]=='(') {
-     const uint32_t url=bracket+2;
-     if(paren<url){paren=url;while(paren<end && text[paren]!=')')++paren;}
-     if(paren<end){token={pos+1,bracket-pos-1,url,paren-url,InlayInlineLink};pos=paren+1;}
+    uint32_t bracket=0,paren=0;
+    if(scan_link_bracket(text,pos+1,end,&bracket) && bracket+1<end && text[bracket+1]=='(' &&
+       scan_balanced_paren_url(text,bracket+2,end,&paren))
+    {
+     const uint32_t url=bracket+2,url_len=paren-url;
+     bool has_nested=false;
+     for(uint32_t k=pos+1;k<bracket;++k) {
+      if(std::strchr("`*_~=",text[k])){has_nested=true;break;}
+     }
+     if(has_nested && bracket>pos+1) {
+      const uint32_t before_nested=m->token_count;
+      if(!inline_line(m,text,pos+1,bracket,InlayInlineLink,url,url_len))return false;
+      if(m->token_count>before_nested){pos=paren+1;continue;}
+     }
+     token={pos+1,bracket-pos-1,url,url_len,InlayInlineLink};
+     pos=paren+1;
     }
    }
-  } else if(c=='*' || c=='~' || c=='=') {
+  } else if(c=='*' || c=='_' || c=='~' || c=='=') {
    uint32_t stop=pos+1;while(stop<end && text[stop]==c)++stop;
    const uint32_t run=stop-pos;
-   const bool can_close=pos>line_start && !inline_space(text[pos-1]);
-   if(can_close || (c=='*' && run<=3) || ((c=='~' || c=='=') && run==2)) {
-    const bool can_open=stop<end && !inline_space(text[stop]);
+   const bool under=c=='_';
+   const bool can_close=pos>line_start && !inline_space(text[pos-1]) && (!under || stop==end || !inline_alnum(text[stop]));
+   const bool can_open=stop<end && !inline_space(text[stop]) && (!under || pos==line_start || !inline_alnum(text[pos-1]));
+   if(can_close || (can_open && (((c=='*' || under) && run<=3) || ((c=='~' || c=='=') && run==2)))) {
     while(pos<stop) {
      const uint32_t left=stop-pos;
      uint32_t flag=c=='~' ? InlayInlineStrike : c=='=' ? InlayInlineHighlight : left>=2 ? InlayInlineBold : InlayInlineEmphasis;
@@ -202,7 +305,7 @@ bool inline_line(InlayMeasure* m,const char* text,uint32_t pos,uint32_t end) {
       }
      }
      if(match==depth && (left>3 || ((c=='~' || c=='=') && left!=2))) {
-      if(!append_inline(m,{pos,left,0,0,0}))return false;
+      if(!append_inline(m,{pos,left,link_url_off,link_url_len,base_flags}))return false;
       break;
      }
      const uint32_t width=flag==InlayInlineEmphasis ? 1u : 2u;
@@ -210,26 +313,29 @@ bool inline_line(InlayMeasure* m,const char* text,uint32_t pos,uint32_t end) {
      if(match<depth) {
       // Both styles in a triple opener start at the same visible position.
       // The first closer determines which style is nested.
-      if(c=='*' && match+1<depth) {
+      if((c=='*' || under) && match+1<depth) {
        auto& open=m->tokens[opens[match]];
        auto& next=m->tokens[opens[match+1]];
        if(open.offset+open.length==next.offset && open.length+next.length==3 &&
-          text[next.offset]=='*') {
+          text[next.offset]==c) {
         const uint32_t outer_width=next.length;
         next.offset=open.offset+outer_width;next.length=open.length;
         open.length=outer_width;open.flags=next.flags;next.flags=flag;
         ++match;
        }
       }
-      while(depth>match+1)m->tokens[opens[--depth]].flags=0;
+      while(depth>match+1)m->tokens[opens[--depth]].flags=base_flags;
       m->tokens[opens[--depth]].flags=flag|inline_open;
       flags=flag|inline_close;
-     } else if(can_open && depth<4) {
+     } else if(can_open && depth<6) {
       bool already_open=false;
       for(uint32_t i=0;i<depth;++i)already_open |= m->tokens[opens[i]].flags==flag;
       if(!already_open){opens[depth++]=m->token_count;flags=flag;}
+      else flags=base_flags;
+     } else {
+      flags=base_flags;
      }
-     if(!append_inline(m,{pos,width,0,0,flags}))return false;
+     if(!append_inline(m,{pos,width,link_url_off,link_url_len,flags}))return false;
      pos+=width;
     }
     pos=stop;
@@ -239,21 +345,21 @@ bool inline_line(InlayMeasure* m,const char* text,uint32_t pos,uint32_t end) {
    token.length=run;
   }
   if(pos==start) {
-   if(c=='\\' && pos+1<end && std::strchr("\\|`*~[$=!",text[pos+1]))++pos;
+   if(c=='\\' && pos+1<end && std::strchr("\\|`*_~[$=!",text[pos+1]))++pos;
    ++pos;
-   while(pos<end && !std::strchr("`[*~$\\=!",text[pos]))++pos;
+   while(pos<end && !std::strchr("`[*_~$\\=!",text[pos]))++pos;
    token.length=pos-start;
   }
   if(!append_inline(m,token))return false;
  }
- while(depth)m->tokens[opens[--depth]].flags=0;
+ while(depth)m->tokens[opens[--depth]].flags=base_flags;
  uint32_t active=0,out=first;
  for(uint32_t i=first;i<m->token_count;++i) {
   auto t=m->tokens[i];
   if(t.flags&inline_open){active|=t.flags&~inline_open;continue;}
   if(t.flags&inline_close){active&=~(t.flags&~inline_close);continue;}
   if(!t.length && !(t.flags&(InlayInlineMath|InlayInlineImage)))continue;
-  t.flags|=active;
+  t.flags|=active|base_flags;
   if(out>first && !(t.flags&(InlayInlineCode|InlayInlineLink|InlayInlineMath|InlayInlineFootnote|InlayInlineImage))) {
    auto& previous=m->tokens[out-1];
    if(previous.flags==t.flags && previous.offset+previous.length==t.offset) {
@@ -404,8 +510,8 @@ uint32_t finish_inline_row(const InlayMeasure* m,uint32_t pos,uint32_t stop,uint
   const uint32_t text_end=t.offset+t.length;
   const bool link=(t.flags&InlayInlineLink)!=0,image=(t.flags&InlayInlineImage)!=0;
   if(link || image || (t.flags&InlayInlineCode)) {
-   const uint32_t token_end=(link || image) ? t.url_offset+t.url_length+1 : text_end+1;
-   const uint32_t token_start=image ? t.offset-2 : t.offset-1;
+   const uint32_t token_end=(link || image) ? t.url_offset+t.url_length+1 : (t.url_length ? t.url_offset+t.url_length : text_end+1);
+   const uint32_t token_start=image ? t.offset-2 : ((t.flags&InlayInlineCode) && !link && t.url_length ? t.url_offset : t.offset-1);
    if(stop<token_end) {
     // Keep closing syntax with the visible text, including hidden link destinations.
     if(stop>=text_end || t.length+2<=limit)return token_end;
@@ -554,22 +660,57 @@ float rich_line(InlayMeasure* m,EtchStr line,uint32_t base_id,float font,InlayDo
  else if(style.text_color.a!=0)desc.color=style.text_color;
  if(style.selection_color.a!=0)desc.selection_color=style.selection_color;
  if(math || has_image) {
-  auto row=etch_box_desc_default();row.width=etch_sizing_fixed(width);row.wrap=true;row.align_x=align;row.align_y=ETCH_ALIGN_Y_CENTER;row.gap=4;etch_begin_box(&row);
+  const auto text_fm=etch_font_metrics(base_font,font);
+  const float text_base=text_fm.ascent;
+  const float text_desc=text_fm.descent;
+  auto* preps=math ? static_cast<InlayMathPrepared*>(etch_frame_arena_alloc(ctx,size_t(count)*sizeof(InlayMathPrepared),alignof(InlayMathPrepared))) : nullptr;
+  auto* math_copies=math ? static_cast<EtchStr*>(etch_frame_arena_alloc(ctx,size_t(count)*sizeof(EtchStr),alignof(EtchStr))) : nullptr;
+  float max_ascent=text_base,max_descent=text_desc;
+  if(preps && math_copies) {
+   for(uint32_t i=0;i<count;++i) {
+    preps[i]={};math_copies[i]={};
+    if(!(m->tokens[low+i].flags&InlayInlineMath))continue;
+    const EtchStr src_m=spans[i].text;
+    char* cpy=src_m.length ? static_cast<char*>(etch_frame_arena_alloc(ctx,src_m.length,1)) : nullptr;
+    if(cpy)std::memcpy(cpy,src_m.chars,src_m.length);
+    math_copies[i]={cpy,cpy ? src_m.length : 0u,false};
+    if(inlay_math_prepare(math_copies[i],font,false,&preps[i])) {
+     max_ascent=std::fmax(max_ascent,preps[i].metrics.baseline);
+     max_descent=std::fmax(max_descent,std::fmax(0.f,preps[i].metrics.height-preps[i].metrics.baseline));
+    }
+   }
+  }
+  const float total_line_h=max_ascent+max_descent;
+  auto row=etch_box_desc_default();row.width=etch_sizing_fixed(width);row.wrap=true;row.align_x=align;row.align_y=ETCH_ALIGN_Y_TOP;row.gap=4;etch_begin_box(&row);
   for(uint32_t i=0;i<count;++i) {
    desc.id=etch_id_index(base_id,i+1);
    const auto& t=m->tokens[low+i];
-   if(t.flags&InlayInlineMath)native_box(spans[i].text,font,false,desc.id,width,desc.color.a!=0 && !etch_color_is_theme_auto(desc.color) ? desc.color : EtchColor{});
-   else if(t.flags&InlayInlineImage) {
+   if(t.flags&InlayInlineMath) {
+    const bool ok_prep=preps && preps[i].metrics.valid;
+    const float top_pad=ok_prep ? std::fmax(0.f,max_ascent-preps[i].metrics.baseline) : 0.f;
+    native_box(ok_prep ? math_copies[i] : spans[i].text,font,false,desc.id,width,
+               desc.color.a!=0 && !etch_color_is_theme_auto(desc.color) ? desc.color : EtchColor{},
+               false,ok_prep ? &preps[i] : nullptr,top_pad);
+   } else if(t.flags&InlayInlineImage) {
     const EtchStr alt=slice(source,t.offset,t.length);
     const EtchStr src=slice(source,t.url_offset,t.url_length);
     const auto img=resolve_doc_image(m->view,alt,src,width);
+    const float img_h=img.valid ? img.height : std::fmax(11.f,font*0.85f)*1.5f+8.f;
+    const float top_pad=std::fmax(0.f,(total_line_h-img_h)*0.5f);
+    if(top_pad>0.5f) {auto wrap=etch_box_desc_default();wrap.padding={0,0,top_pad,0};etch_begin_box(&wrap);}
     if(img.valid) {
      auto idesc=etch_image_desc_default();idesc.id=desc.id;idesc.texture=img.texture;
      idesc.width=etch_sizing_fixed(img.width);idesc.height=etch_sizing_fixed(img.height);
      idesc.radius=etch_corners_all(img.radius);
      etch_image(&idesc);
     } else draw_image_fallback(alt,desc.id,font,style,theme);
-   } else etch_text_spans(spans+i,1,&desc);
+    if(top_pad>0.5f)etch_end_box();
+   } else {
+    const float top_pad=std::fmax(0.f,max_ascent-text_base);
+    if(top_pad>0.5f) {auto wrap=etch_box_desc_default();wrap.padding={0,0,top_pad,0};etch_begin_box(&wrap);}
+    etch_text_spans(spans+i,1,&desc);
+    if(top_pad>0.5f)etch_end_box();
+   }
   }
   etch_end_box();
  } else etch_text_spans(spans,count,&desc);
@@ -655,7 +796,68 @@ bool is_code_keyword(const char* s,uint32_t len,bool sql_mode) noexcept {
  }
  return false;
 }
-void code_line(EtchStr line,EtchStr language,uint32_t id,float font,const EtchTheme& theme,const InlayDocStyle& style,bool wrap_lines=false) {
+bool code_supports_block_comment(EtchStr language) noexcept {
+ return !(ascii_ieq(language,"diff") || ascii_ieq(language,"patch") || ascii_ieq(language,"sh") ||
+          ascii_ieq(language,"bash") || ascii_ieq(language,"zsh") || ascii_ieq(language,"shell") ||
+          ascii_ieq(language,"yaml") || ascii_ieq(language,"yml") || ascii_ieq(language,"toml") ||
+          ascii_ieq(language,"python") || ascii_ieq(language,"py"));
+}
+bool code_supports_triple_string(EtchStr language) noexcept {
+ return ascii_ieq(language,"python") || ascii_ieq(language,"py") || ascii_ieq(language,"toml");
+}
+uint8_t advance_code_lex_state(EtchStr line,EtchStr language,uint8_t state) noexcept {
+ if(ascii_ieq(language,"diff") || ascii_ieq(language,"patch"))return 0;
+ const bool blk_cm=code_supports_block_comment(language);
+ const bool tri_str=code_supports_triple_string(language);
+ if(!blk_cm && !tri_str)return 0;
+ uint32_t pos=0;
+ while(pos<line.length) {
+  if(state==1) {
+   while(pos+1<line.length && !(line.chars[pos]=='*' && line.chars[pos+1]=='/'))++pos;
+   if(pos+1<line.length){pos+=2;state=0;continue;}
+   return 1;
+  }
+  if(state==2 || state==3) {
+   const char q=state==2 ? '"' : '\'';
+   while(pos<line.length) {
+    if(line.chars[pos]=='\\' && pos+1<line.length){pos+=2;continue;}
+    if(pos+2<line.length && line.chars[pos]==q && line.chars[pos+1]==q && line.chars[pos+2]==q){pos+=3;state=0;break;}
+    ++pos;
+   }
+   if(state!=0)return state;
+   continue;
+  }
+  const char c=line.chars[pos];
+  if(c=='/' && pos+1<line.length && line.chars[pos+1]=='/')return 0;
+  if(blk_cm && c=='/' && pos+1<line.length && line.chars[pos+1]=='*') {
+   pos+=2;
+   while(pos+1<line.length && !(line.chars[pos]=='*' && line.chars[pos+1]=='/'))++pos;
+   if(pos+1<line.length)pos+=2;else return 1;
+   continue;
+  }
+  if(tri_str && (c=='"' || c=='\'') && pos+2<line.length && line.chars[pos+1]==c && line.chars[pos+2]==c) {
+   pos+=3;
+   const uint8_t target=c=='"' ? 2u : 3u;
+   while(pos<line.length) {
+    if(line.chars[pos]=='\\' && pos+1<line.length){pos+=2;continue;}
+    if(pos+2<line.length && line.chars[pos]==c && line.chars[pos+1]==c && line.chars[pos+2]==c){pos+=3;break;}
+    ++pos;
+   }
+   if(pos>=line.length) {
+    // Check if loop ended right after closing triple quote.
+    if(!(pos>=6 && line.chars[pos-1]==c && line.chars[pos-2]==c && line.chars[pos-3]==c))return target;
+   }
+   continue;
+  }
+  if(c=='"' || c=='\'' || c=='`') {
+   ++pos;while(pos<line.length){const char nx=line.chars[pos++];if(nx=='\\' && pos<line.length)++pos;else if(nx==c)break;}
+   continue;
+  }
+  ++pos;
+ }
+ return state;
+}
+void code_line(EtchStr line,EtchStr language,uint32_t id,float font,const EtchTheme& theme,const InlayDocStyle& style,bool wrap_lines=false,uint8_t* io_lex_state=nullptr) {
  const uint16_t mono_font=effective_mono_font(style);
  const float code_font=effective_code_font_size(font,style);
  const float line_height=code_font*effective_line_scale(style);
@@ -681,20 +883,41 @@ void code_line(EtchStr line,EtchStr language,uint32_t id,float font,const EtchTh
  const bool json_like=ascii_ieq(language,"json") || ascii_ieq(language,"jsonc");
  const bool yaml_like=ascii_ieq(language,"yaml") || ascii_ieq(language,"yml") || ascii_ieq(language,"toml");
  const bool sql_like=ascii_ieq(language,"sql");
+ const bool blk_cm=code_supports_block_comment(language);
+ const bool tri_str=code_supports_triple_string(language);
+ const uint8_t entry_state=io_lex_state ? *io_lex_state : 0u;
+ uint8_t end_state=entry_state;
  const EtchColor type_col=theme.accent_secondary.a!=0 ? theme.accent_secondary : theme.accent;
  EtchTextSpan* spans=nullptr;uint32_t count=0,pos=0;
  for(uint32_t pass=0;pass<2;++pass) {
  count=0;pos=0;
+ uint8_t state=entry_state;
  while(pos<line.length) {
   uint32_t start=pos;auto span=etch_text_span_default();span.font_id=mono_font;span.font_size_px=code_font;span.color=theme.text_code;
+  if(state==1) {
+   while(pos+1<line.length && !(line.chars[pos]=='*' && line.chars[pos+1]=='/'))++pos;
+   if(pos+1<line.length){pos+=2;state=0;}else pos=line.length;
+   span.color=theme.syntax_comment;
+   span.text={line.chars+start,pos-start,false};if(spans)spans[count]=span;++count;continue;
+  }
+  if(state==2 || state==3) {
+   const char q=state==2 ? '"' : '\'';
+   while(pos<line.length) {
+    if(line.chars[pos]=='\\' && pos+1<line.length){pos+=2;continue;}
+    if(pos+2<line.length && line.chars[pos]==q && line.chars[pos+1]==q && line.chars[pos+2]==q){pos+=3;state=0;break;}
+    ++pos;
+   }
+   span.color=theme.syntax_string;
+   span.text={line.chars+start,pos-start,false};if(spans)spans[count]=span;++count;continue;
+  }
   const char c=line.chars[pos];
   if(uint8_t(c)>=0x80) {++pos;while(pos<line.length && (uint8_t(line.chars[pos])&0xc0)==0x80)++pos;}
   else if((c=='/' && pos+1<line.length && line.chars[pos+1]=='/') ||
           (c=='-' && pos+1<line.length && line.chars[pos+1]=='-' && (pos+2==line.length || line.chars[pos+2]==' ' || line.chars[pos+2]=='-'))) {
    pos=line.length;span.color=theme.syntax_comment;
-  } else if(c=='/' && pos+1<line.length && line.chars[pos+1]=='*') {
+  } else if(blk_cm && c=='/' && pos+1<line.length && line.chars[pos+1]=='*') {
    pos+=2;while(pos+1<line.length && !(line.chars[pos]=='*' && line.chars[pos+1]=='/'))++pos;
-   pos=(pos+1<line.length) ? pos+2 : line.length;
+   if(pos+1<line.length){pos+=2;}else{pos=line.length;state=1;}
    span.color=theme.syntax_comment;
   } else if(c=='#') {
    if(c_like) {
@@ -717,6 +940,16 @@ void code_line(EtchStr line,EtchStr language,uint32_t id,float font,const EtchTh
             (start==0 || line.chars[start-1]==' ')) {
    ++pos;while(pos<line.length && (is_code_ident_char(line.chars[pos]) || line.chars[pos]=='-'))++pos;
    span.color=type_col;
+  } else if(tri_str && (c=='"' || c=='\'') && pos+2<line.length && line.chars[pos+1]==c && line.chars[pos+2]==c) {
+   pos+=3;
+   bool closed=false;
+   while(pos<line.length) {
+    if(line.chars[pos]=='\\' && pos+1<line.length){pos+=2;continue;}
+    if(pos+2<line.length && line.chars[pos]==c && line.chars[pos+1]==c && line.chars[pos+2]==c){pos+=3;closed=true;break;}
+    ++pos;
+   }
+   if(!closed)state=c=='"' ? 2u : 3u;
+   span.color=theme.syntax_string;
   } else if(c=='"' || c=='\'' || c=='`') {
    ++pos;while(pos<line.length) {const char next=line.chars[pos++];if(next=='\\' && pos<line.length)++pos;else if(next==c)break;}
    uint32_t peek=pos;while(peek<line.length && line.chars[peek]==' ')++peek;
@@ -749,8 +982,10 @@ void code_line(EtchStr line,EtchStr language,uint32_t id,float font,const EtchTh
   }
   span.text={line.chars+start,pos-start,false};if(spans)spans[count]=span;++count;
  }
+ end_state=state;
  if(pass==0) {spans=static_cast<EtchTextSpan*>(etch_frame_arena_alloc(etch_current_context(),size_t(count)*sizeof(EtchTextSpan),alignof(EtchTextSpan)));if(!spans)return;}
  }
+ if(io_lex_state)*io_lex_state=end_state;
  auto desc=etch_rich_text_desc_default();desc.id=id;desc.selectable=true;desc.font_id=mono_font;desc.font_size_px=code_font;desc.line_height_px=line_height;desc.wrap=wrap_lines;
  if(style.selection_color.a!=0)desc.selection_color=style.selection_color;
  etch_text_spans(spans,count,&desc);
@@ -835,6 +1070,28 @@ void compute_table_col_widths(const InlayMeasure* measure,EtchStr source,const I
   used+=w;
  }
 }
+void get_table_col_widths(InlayMeasure* measure,EtchStr source,const InlayRow& info,uint32_t columns,
+                          float width,float font,const InlayDocStyle& style,const InlayDocViewDesc& view,
+                          float* out_widths) noexcept {
+ if(!columns)return;
+ if(columns>32) {compute_table_col_widths(measure,source,info,columns,width,font,style,view,out_widths);return;}
+ for(uint32_t i=0;i<measure->table_cols_count;++i) {
+  if(measure->table_cols[i].header_row==info.table_header && measure->table_cols[i].columns==columns) {
+   std::memcpy(out_widths,measure->table_cols[i].widths,size_t(columns)*sizeof(float));
+   return;
+  }
+ }
+ compute_table_col_widths(measure,source,info,columns,width,font,style,view,out_widths);
+ if(measure->table_cols_count==measure->table_cols_capacity) {
+  const uint32_t cap=measure->table_cols_capacity ? measure->table_cols_capacity*2 : 16;
+  auto* mem=static_cast<InlayTableCols*>(std::realloc(measure->table_cols,size_t(cap)*sizeof(InlayTableCols)));
+  if(!mem)return;
+  measure->table_cols=mem;measure->table_cols_capacity=cap;
+ }
+ auto& entry=measure->table_cols[measure->table_cols_count++];
+ entry.header_row=info.table_header;entry.columns=columns;
+ std::memcpy(entry.widths,out_widths,size_t(columns)*sizeof(float));
+}
 float block_lines(InlayMeasure* measure,const InlayBlock& b,EtchStr source,uint32_t id,float font,
                   InlayDocResult* result,const EtchTheme& theme,const InlayDocStyle& style,const InlayRow& info,bool estimate=false,
                   const EtchBoxDesc* pending_box=nullptr,PendingTaskToggle* toggle_out=nullptr,EtchColor color_override={},
@@ -844,6 +1101,7 @@ float block_lines(InlayMeasure* measure,const InlayBlock& b,EtchStr source,uint3
  const float width=std::fmax(1.f,measure->width-2*padding);
  float height=0;
  InlineRowBox row_box={pending_box,false};
+ uint8_t lex_state=info.code_lex_state;
  uint32_t pos=b.content_offset,end=pos+b.content_length,line_index=0;
  while(pos<end) {
   uint32_t next=pos;while(next<end && source.chars[next]!='\n')++next;
@@ -903,11 +1161,11 @@ float block_lines(InlayMeasure* measure,const InlayBlock& b,EtchStr source,uint3
     cbox.height=etch_sizing_fit(0,0);
     cbox.shrink_width=true;
     etch_begin_box(&cbox);
-    code_line(line,slice(source,b.language_offset,b.language_length),line_id,font,theme,style,true);
+    code_line(line,slice(source,b.language_offset,b.language_length),line_id,font,theme,style,true,&lex_state);
     etch_end_box();
     etch_end_box();
    } else {
-    code_line(line,slice(source,b.language_offset,b.language_length),line_id,font,theme,style,wrap_code);
+    code_line(line,slice(source,b.language_offset,b.language_length),line_id,font,theme,style,wrap_code,&lex_state);
    }
   }
   else if(b.kind==INLAY_TABLE) {
@@ -931,7 +1189,7 @@ float block_lines(InlayMeasure* measure,const InlayBlock& b,EtchStr source,uint3
    uint32_t start=0;table_row_range(&line,&start);
    float col_widths_stack[32]={};
    float* col_widths=columns<=32 ? col_widths_stack : nullptr;
-   if(col_widths)compute_table_col_widths(measure,source,info,columns,width,font,style,view,col_widths);
+   if(col_widths)get_table_col_widths(measure,source,info,columns,width,font,style,view,col_widths);
    const float eq_width=width/float(columns);
    float tallest=0;
    for(uint32_t column=0;column<columns;++column) {
@@ -978,13 +1236,36 @@ float block_lines(InlayMeasure* measure,const InlayBlock& b,EtchStr source,uint3
     if(estimate)height+=(height>0 ? 4.f : 0.f)+ad.line_height_px;
    } else if((b.kind==INLAY_LIST || b.kind==INLAY_TASK_LIST) && !continuation) {
     begin_inline_row(row_box);
-    uint32_t indent=0;while(indent<line.length && indent<3 && line.chars[indent]==' ')++indent;line.chars+=indent;line.length-=indent;
-    auto row=etch_box_desc_default();row.width=etch_sizing_fixed(width);row.gap=8;row.align_y=ETCH_ALIGN_Y_TOP;row.shrink_width=true;etch_begin_box(&row);
-    EtchStr marker=ETCH_STR_LIT("•");uint32_t trim=0;
+    uint32_t indent_bytes=0,indent_spaces=0;
+    while(indent_bytes<line.length && indent_spaces<16 && (line.chars[indent_bytes]==' ' || line.chars[indent_bytes]=='\t')) {
+     indent_spaces+=line.chars[indent_bytes]=='\t' ? 2u : 1u;
+     ++indent_bytes;
+    }
+    line.chars+=indent_bytes;line.length-=indent_bytes;
+    const uint32_t nest_level=indent_spaces/2u > 6u ? 6u : indent_spaces/2u;
+    const float nest_pad=float(nest_level)*std::fmax(16.f,font*1.1f);
+    auto row=etch_box_desc_default();row.width=etch_sizing_fixed(width);row.gap=8;row.align_y=ETCH_ALIGN_Y_TOP;row.shrink_width=true;
+    if(nest_pad>0.f)row.padding={nest_pad,0,0,0};
+    etch_begin_box(&row);
+    const EtchStr bullets[3]={ETCH_STR_LIT("•"),ETCH_STR_LIT("◦"),ETCH_STR_LIT("▪")};
+    EtchStr marker=bullets[nest_level<2 ? nest_level : 2];
+    uint32_t trim=0;
+    bool ordered=false;
     const bool task=line.length>=6 && line.chars[0]=='-' && line.chars[2]=='[';
     if(task)trim=6;
     else if(line.length>=2 && (line.chars[0]=='-' || line.chars[0]=='*' || line.chars[0]=='+'))trim=2;
-    else {while(trim<line.length && line.chars[trim]!=' ')++trim;if(trim<line.length)++trim;}
+    else {
+     uint32_t digits=0;while(digits<line.length && line.chars[digits]>='0' && line.chars[digits]<='9')++digits;
+     if(digits && digits+1<line.length && (line.chars[digits]=='.' || line.chars[digits]==')') && line.chars[digits+1]==' ') {
+      marker={line.chars,digits+1,false};
+      trim=digits+2;
+      ordered=true;
+     } else {
+      while(trim<line.length && line.chars[trim]!=' ')++trim;
+      if(trim<line.length)++trim;
+     }
+    }
+    const float marker_w=ordered ? std::fmax(20.f,font*1.4f) : std::fmax(14.f,font);
     if(pos==logical) {
      if(task) {
       bool checked=line.chars[3]!=' ';
@@ -1000,23 +1281,28 @@ float block_lines(InlayMeasure* measure,const InlayBlock& b,EtchStr source,uint3
        const auto& full_block=measure->doc->blocks[info.block];
        for(uint32_t scan=full_block.content_offset;scan<pos;) {
         uint32_t lend=scan;while(lend<pos && source.chars[lend]!='\n')++lend;
-        uint32_t ind=0;while(scan+ind<lend && ind<3 && source.chars[scan+ind]==' ')++ind;
+        uint32_t ind=0;while(scan+ind<lend && ind<16 && (source.chars[scan+ind]==' ' || source.chars[scan+ind]=='\t'))++ind;
         if(lend-(scan+ind)>=6 && source.chars[scan+ind]=='-' && source.chars[scan+ind+2]=='[')++item_index;
         scan=lend<pos ? lend+1 : pos;
        }
        *toggle_out={check_offset,info.block,item_index,checked,true};
       }
      } else {
+      if(ordered) {
+       auto mbox=etch_box_desc_default();mbox.width=etch_sizing_fit(marker_w,0);mbox.align_x=ETCH_ALIGN_X_RIGHT;
+       etch_begin_box(&mbox);
+      }
       auto md=etch_text_desc_default();md.font_size_px=font;md.font_id=effective_sans_font(style);md.wrap=false;
       md.line_height_px=font*effective_line_scale(style);
       md.color=style.muted_color.a!=0 ? style.muted_color : (style.text_color.a!=0 ? style.text_color : theme.text_muted);
       etch_text(marker,&md);
+      if(ordered)etch_end_box();
      }
     }
     auto item_body=etch_box_desc_default();item_body.axis=ETCH_AXIS_COL;
     item_body.width=etch_sizing_grow(0,0);item_body.height=etch_sizing_fit(0,0);item_body.shrink_width=true;
     etch_begin_box(&item_body);
-    line.chars+=trim;line.length-=trim;render_rich(line);
+    line.chars+=trim;line.length-=trim;render_rich(line,std::fmax(1.f,width-nest_pad-8.f-marker_w));
     etch_end_box();
     etch_end_box();
    } else render_rich(line);
@@ -1057,15 +1343,18 @@ bool prepare_view(InlayDoc* doc,InlayMeasure* measure,const InlayDocViewDesc& vi
   auto* ranges=static_cast<InlayDetails*>(std::realloc(measure->details,size_t(cap)*sizeof(InlayDetails)));if(!ranges)return false;
   measure->details=ranges;
   auto* data=static_cast<bool*>(std::realloc(measure->open,cap*sizeof(bool)));if(!data)return false;
-  auto* wraps=static_cast<bool*>(std::realloc(measure->code_wrap,cap*sizeof(bool)));
-  if(!wraps){measure->open=data;return false;}
-  for(uint32_t i=measure->open_capacity;i<cap;++i){data[i]=true;wraps[i]=false;}
-  measure->open=data;measure->code_wrap=wraps;measure->open_capacity=cap;
+  measure->open=data;
+  auto* wraps=static_cast<bool*>(std::realloc(measure->code_wrap,cap*sizeof(bool)));if(!wraps)return false;
+  measure->code_wrap=wraps;
+  auto* scx=static_cast<float*>(std::realloc(measure->code_scroll_x,size_t(cap)*sizeof(float)));if(!scx)return false;
+  for(uint32_t i=measure->open_capacity;i<cap;++i){data[i]=true;wraps[i]=false;scx[i]=0.f;}
+  measure->code_scroll_x=scx;measure->open_capacity=cap;
  }
  if(measure->width==0) {
-  for(uint32_t i=0;i<measure->open_capacity;++i){measure->open[i]=true;measure->code_wrap[i]=false;}
+  for(uint32_t i=0;i<measure->open_capacity;++i){measure->open[i]=true;measure->code_wrap[i]=false;measure->code_scroll_x[i]=0.f;}
   measure->doc_sel_active=false;measure->doc_sel_dragging=false;
  }
+ measure->table_cols_count=0;
  measure->doc=doc;
  const EtchStr source={doc->source,doc->source_size,false};
  for(uint32_t block=measure->width==0 ? 0 : measure->frozen_count;block<doc->block_count;++block)if(doc->blocks[block].kind==INLAY_DETAILS) {
@@ -1096,10 +1385,24 @@ bool prepare_view(InlayDoc* doc,InlayMeasure* measure,const InlayDocViewDesc& vi
   const uint32_t header=row;
   uint32_t last=row;
   bool zebra=false,need_separator=b.kind==INLAY_TABLE;
+  const bool is_code=b.kind==INLAY_CODE_BLOCK && !diagram_block(doc,b);
+  const EtchStr lang=is_code ? slice(source,b.language_offset,b.language_length) : EtchStr{};
+  uint32_t code_line_num=1,max_line_off=0,max_line_len=0;
+  uint8_t lex_st=0;
   do {const uint32_t stop=row_end(measure,view,row_width,b,block,pos,limit,decorate);
    const bool first=pos==b.content_offset;
    const bool separator=need_separator && !first && inlay_table_rule(source.chars+pos,stop-pos);
-   InlayRow next={block,pos,stop-pos,header,0,0,first,zebra,separator,false,b.kind};
+   InlayRow next={block,pos,stop-pos,header,0,code_line_num,1,0.f,0.f,0.f,lex_st,first,zebra,separator,false,b.kind};
+   if(is_code) {
+    uint32_t lp=pos;
+    while(lp<stop) {
+     uint32_t ln=lp;while(ln<stop && source.chars[ln]!='\n')++ln;
+     if(ln-lp>max_line_len){max_line_off=lp;max_line_len=ln-lp;}
+     lex_st=advance_code_lex_state(slice(source,lp,ln-lp),lang,lex_st);
+     ++code_line_num;
+     lp=ln<stop ? ln+1 : stop;
+    }
+   }
    if(first && b.kind==INLAY_TABLE) {
     const uint32_t columns=table_columns(table_line(source,next));
     next.table_columns=columns ? columns : 1;
@@ -1107,10 +1410,21 @@ bool prepare_view(InlayDoc* doc,InlayMeasure* measure,const InlayDocViewDesc& vi
    if(!first)need_separator=false;
    if(!separator){last=row;if(!first)zebra=!zebra;}
    const bool same=!reflow && block<measure->frozen_count && row<measure->count && measure->rows[row].block==block && measure->rows[row].offset==pos && measure->rows[row].length==stop-pos && measure->rows[row].kind==b.kind;
-   if(same)next.estimate=measure->rows[row].estimate;
+   if(same){next.estimate=measure->rows[row].estimate;next.last_scroll_x=measure->rows[row].last_scroll_x;}
    else measure->heights[row]=0;
    measure->rows[row++]=next;pos=stop;
   } while(pos<end);
+  if(is_code) {
+   const uint32_t total_lines=code_line_num>1 ? code_line_num-1 : 1;
+   float min_w=0.f;
+   if(row-header>1 && max_line_len>0) {
+    const InlayDocStyle rstyle=resolved_style(view);
+    min_w=std::ceil(etch_measure_text(slice(source,max_line_off,max_line_len),
+                                      effective_mono_font(rstyle),
+                                      effective_code_font_size(view.font_size_px,rstyle),0.f).x);
+   }
+   for(uint32_t r=header;r<row;++r){measure->rows[r].code_total_lines=total_lines;measure->rows[r].code_min_width=min_w;}
+  }
   measure->rows[last].last_in_block=true;
  }
  measure->count=row;measure->frozen_count=doc->frozen_count;
@@ -1142,12 +1456,100 @@ bool style_reflow_changed(const InlayDocStyle& a,const InlayDocStyle& b) noexcep
  for(int i=0;i<6;++i)if(a.heading_scale[i]!=b.heading_scale[i])return true;
  return false;
 }
+InlayMeasure* find_or_add_view(InlayDoc* doc,uint32_t view_id) noexcept {
+ for(uint32_t i=0;i<doc->view_count;++i)if(doc->views[i].id==view_id)return &doc->views[i];
+ if(doc->view_count==doc->view_capacity) {
+  const uint32_t cap=doc->view_capacity ? doc->view_capacity*2 : 4;
+  auto* mem=static_cast<InlayMeasure*>(std::realloc(doc->views,size_t(cap)*sizeof(InlayMeasure)));
+  if(!mem)return nullptr;
+  std::memset(mem+doc->view_capacity,0,size_t(cap-doc->view_capacity)*sizeof(InlayMeasure));
+  doc->views=mem;doc->view_capacity=cap;
+ }
+ auto* slot=&doc->views[doc->view_count++];
+ *slot={};
+ return slot;
+}
+size_t extract_plain_block_text(const InlayMeasure* measure,const InlayBlock& blk,EtchStr source,char* out) noexcept {
+ if(blk.kind==INLAY_CODE_BLOCK || blk.kind==INLAY_MATH_BLOCK) {
+  if(out && blk.content_length)std::memcpy(out,source.chars+blk.content_offset,blk.content_length);
+  return blk.content_length;
+ }
+ if(blk.kind==INLAY_THEMATIC_BREAK)return 0;
+ if(blk.kind==INLAY_IMAGE) {
+  if(out && blk.content_length)std::memcpy(out,source.chars+blk.content_offset,blk.content_length);
+  return blk.content_length;
+ }
+ // Walk cached inline tokens in the block's range to strip Markdown syntax while preserving structure.
+ const uint32_t start=blk.content_offset,end=blk.content_offset+blk.content_length;
+ uint32_t low=0,high=measure->token_count;
+ while(low<high) {
+  const uint32_t mid=low+(high-low)/2;
+  if(measure->tokens[mid].offset+measure->tokens[mid].length<=start)low=mid+1;else high=mid;
+ }
+ size_t wp=0;
+ uint32_t ti=low;
+ uint32_t pos=start;
+ bool first_line=true;
+ while(pos<end) {
+  uint32_t nl=pos;while(nl<end && source.chars[nl]!='\n')++nl;
+  if(blk.kind==INLAY_TABLE && inlay_table_rule(source.chars+pos,nl-pos)) {
+   pos=nl<end ? nl+1 : end;
+   continue;
+  }
+  uint32_t lstart=pos;
+  if(blk.kind==INLAY_BLOCKQUOTE || blk.kind==INLAY_ALERT) {
+   if(lstart+2<=nl && source.chars[lstart]=='>' && source.chars[lstart+1]==' ')lstart+=2;
+  } else if(blk.kind==INLAY_HEADING && first_line) {
+   uint32_t trim=blk.offset;while(trim<nl && source.chars[trim]==' ')++trim;trim+=blk.level+1;
+   if(lstart<trim)lstart=trim;
+  }
+  if(!first_line){if(out)out[wp]='\n';++wp;}
+  first_line=false;
+  while(ti<measure->token_count && measure->tokens[ti].offset+measure->tokens[ti].length<=lstart)++ti;
+  if(blk.kind==INLAY_TABLE) {
+   EtchStr line=slice(source,lstart,nl-lstart);
+   uint32_t cs=0;table_row_range(&line,&cs);
+   bool first_cell=true;
+   while(cs<line.length) {
+    const uint32_t ce=table_cell_end(line,cs);
+    if(!first_cell){if(out)out[wp]='\t';++wp;}
+    first_cell=false;
+    const uint32_t abs_a=lstart+cs,abs_b=lstart+ce;
+    while(ti<measure->token_count && measure->tokens[ti].offset+measure->tokens[ti].length<=abs_a)++ti;
+    uint32_t k=ti;
+    while(k<measure->token_count && measure->tokens[k].offset<abs_b) {
+     const auto& t=measure->tokens[k++];
+     const uint32_t a=t.offset>abs_a ? t.offset : abs_a;
+     const uint32_t b=t.offset+t.length<abs_b ? t.offset+t.length : abs_b;
+     if(b>a){if(out)std::memcpy(out+wp,source.chars+a,b-a);wp+=b-a;}
+    }
+    ti=k;
+    cs=ce+1;
+   }
+  } else {
+   bool emitted_tok=false;
+   while(ti<measure->token_count && measure->tokens[ti].offset<nl) {
+    const auto& t=measure->tokens[ti++];
+    const uint32_t a=t.offset>lstart ? t.offset : lstart;
+    const uint32_t b=t.offset+t.length<nl ? t.offset+t.length : nl;
+    if(b>a){if(out)std::memcpy(out+wp,source.chars+a,b-a);wp+=b-a;emitted_tok=true;}
+   }
+   if(!emitted_tok && nl>lstart) {
+    if(out)std::memcpy(out+wp,source.chars+lstart,nl-lstart);
+    wp+=nl-lstart;
+   }
+  }
+  pos=nl<end ? nl+1 : end;
+ }
+ return wp;
+}
 }
 
 extern "C" float inlay_doc_measure_height(InlayDoc* doc,uint32_t view_id,float width_px,float font_size_px) {
  if(!doc || !valid_dimensions(view_id,width_px,font_size_px))return 0;
  const InlayMeasure* matched=nullptr;
- for(auto& slot:doc->views) {
+ for(uint32_t vi=0;vi<doc->view_count;++vi) {
+  auto& slot=doc->views[vi];
   if(slot.id!=view_id || slot.view.width_px!=width_px || slot.font!=font_size_px)continue;
   matched=&slot;
   if(slot.width && slot.revision==doc->revision) {
@@ -1225,9 +1627,7 @@ extern "C" InlayDocResult inlay_doc_view(InlayDoc* doc,const InlayDocViewDesc* i
     etch_current_context()!=doc->context || !etch_frame_in_progress(doc->context))return result;
  const auto& view=*input;
  const InlayDocStyle style=resolved_style(view);
- InlayMeasure* measure=nullptr;
- for(auto& slot:doc->views)if(slot.id==view.id) {measure=&slot;break;}
- if(!measure)for(auto& slot:doc->views)if(!slot.id) {measure=&slot;break;}
+ InlayMeasure* measure=find_or_add_view(doc,view.id);
  if(!measure)return result;
  const bool flow=view.height_px==0;
  const float row_width=!flow && view.width_px>48 ? view.width_px-12 : view.width_px;
@@ -1283,6 +1683,18 @@ extern "C" InlayDocResult inlay_doc_view(InlayDoc* doc,const InlayDocViewDesc* i
  bool has_hovered_row=false;
  uint32_t hovered_row=0;
  bool hovered_row_is_button=false;
+ if(measure->code_scroll_x) {
+  for(uint32_t i=result.visible_first;i<result.visible_end;++i) {
+   const auto& rinfo=measure->rows[i];
+   if(rinfo.kind!=INLAY_CODE_BLOCK || rinfo.block>=measure->open_capacity)continue;
+   if(measure->code_wrap && measure->code_wrap[rinfo.block])continue;
+   const uint32_t rid=etch_id_index(etch_id_index(view.id,rinfo.block+1),rinfo.offset-doc->blocks[rinfo.block].content_offset+1);
+   const float cur_x=etch_scroll_offset(etch_id_index(rid,2)).x;
+   if(std::fabs(cur_x-rinfo.last_scroll_x)>0.5f) {
+    measure->code_scroll_x[rinfo.block]=cur_x;
+   }
+  }
+ }
  for(uint32_t i=result.visible_first;i<result.visible_end;++i) {
   const auto& info=measure->rows[i];
   auto b=doc->blocks[info.block];
@@ -1476,11 +1888,11 @@ extern "C" InlayDocResult inlay_doc_view(InlayDoc* doc,const InlayDocViewDesc* i
     etch_end_box();
    }
    const bool show_ln=view.show_code_line_numbers;
-   uint32_t start_line=1,chunk_lines=0,total_lines=1;
+   const uint32_t start_line=info.code_start_line ? info.code_start_line : 1u;
+   const uint32_t total_lines=info.code_total_lines ? info.code_total_lines : 1u;
+   uint32_t chunk_lines=0;
    float gutter_w=0.f;
    if(show_ln) {
-    for(uint32_t k=full.content_offset;k<b.content_offset;++k)if(source.chars[k]=='\n')++start_line;
-    for(uint32_t k=full.content_offset;k<full.content_offset+full.content_length;++k)if(source.chars[k]=='\n')++total_lines;
     uint32_t lp=b.content_offset,le=b.content_offset+b.content_length;
     while(lp<le) {
      uint32_t ln=lp;while(ln<le && source.chars[ln]!='\n')++ln;
@@ -1536,12 +1948,21 @@ extern "C" InlayDocResult inlay_doc_view(InlayDoc* doc,const InlayDocViewDesc* i
      }
      etch_end_box();
     }
-    auto scroll=etch_box_desc_default();scroll.id=etch_id_index(row_id,2);
+    const uint32_t chunk_scroll_id=etch_id_index(row_id,2);
+    if(info.block<measure->open_capacity && measure->code_scroll_x) {
+     const float target_x=measure->code_scroll_x[info.block];
+     const float cur_x=etch_scroll_offset(chunk_scroll_id).x;
+     if(std::fabs(cur_x-target_x)>0.5f) {
+      etch_set_scroll_offset(chunk_scroll_id,{target_x,0.f},true);
+     }
+     measure->rows[i].last_scroll_x=target_x;
+    }
+    auto scroll=etch_box_desc_default();scroll.id=chunk_scroll_id;
     scroll.width=etch_sizing_fixed(scroll_w);scroll.height=etch_sizing_fit(0,0);
     scroll.scroll_x=true;scroll.clip_children=true;
     etch_begin_box(&scroll);
     auto content=etch_box_desc_default();content.axis=ETCH_AXIS_COL;
-    content.width=etch_sizing_fit(0,0);content.height=etch_sizing_fit(0,0);content.gap=4;
+    content.width=etch_sizing_fit(info.code_min_width,0);content.height=etch_sizing_fit(0,0);content.gap=4;
     etch_begin_box(&content);
     block_lines(measure,b,source,scroll.id,view.font_size_px,&result,theme,style,info);
     etch_end_box();etch_end_box();
@@ -1630,8 +2051,10 @@ extern "C" InlayDocResult inlay_doc_view(InlayDoc* doc,const InlayDocViewDesc* i
     last_blk=bi;
     const auto& blk=doc->blocks[bi];
     if(blk.kind==INLAY_CODE_BLOCK && custom_fence_estimate(view,doc,blk,std::fmax(1.f,row_width-2*view.block_padding_px))>0.f)continue;
+    const size_t blen=extract_plain_block_text(measure,blk,source,nullptr);
+    if(blen==0)continue;
     if(total_len>0)total_len+=2;
-    total_len+=blk.content_length;
+    total_len+=blen;
    }
    if(total_len>0) {
     char* copy=static_cast<char*>(etch_frame_arena_alloc(doc->context,total_len+1,1));
@@ -1644,9 +2067,10 @@ extern "C" InlayDocResult inlay_doc_view(InlayDoc* doc,const InlayDocViewDesc* i
       last_blk=bi;
       const auto& blk=doc->blocks[bi];
       if(blk.kind==INLAY_CODE_BLOCK && custom_fence_estimate(view,doc,blk,std::fmax(1.f,row_width-2*view.block_padding_px))>0.f)continue;
+      const size_t blen=extract_plain_block_text(measure,blk,source,nullptr);
+      if(blen==0)continue;
       if(wp>0){copy[wp++]='\n';copy[wp++]='\n';}
-      std::memcpy(copy+wp,source.chars+blk.content_offset,blk.content_length);
-      wp+=blk.content_length;
+      wp+=extract_plain_block_text(measure,blk,source,copy+wp);
      }
      copy[wp]=0;
      etch_set_clipboard_text(copy);
@@ -1657,6 +2081,7 @@ extern "C" InlayDocResult inlay_doc_view(InlayDoc* doc,const InlayDocViewDesc* i
  result.measured_height_px=previous_height>0 ? previous_height : float(measure->total_height);
  if(pending_toggle.triggered && pending_toggle.source_offset<doc->source_size) {
   doc->source[pending_toggle.source_offset]=pending_toggle.checked ? 'x' : ' ';
+  ++doc->revision;
   etch_request_redraw(doc->context);
   if(view.task_toggle_fn) {
    view.task_toggle_fn(pending_toggle.block_index,pending_toggle.item_index,pending_toggle.checked,view.task_toggle_user_data);

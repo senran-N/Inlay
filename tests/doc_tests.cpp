@@ -42,7 +42,7 @@ bool markdown_and_scroll(EtchContext* ctx,InlayDoc* doc) {
  }
  for(uint32_t i=0;i<3;++i)frame();
  const InlayMeasure* cached=nullptr;
- for(const auto& m:doc->views)if(m.id==view.id)cached=&m;
+ for(uint32_t vi=0;vi<doc->view_count;++vi)if(doc->views[vi].id==view.id)cached=&doc->views[vi];
  if(!cached)return false;
  uint32_t previous_end=0,found=0;
  for(uint32_t i=0;i<cached->token_count;++i) {
@@ -454,7 +454,7 @@ bool streaming_row_id_and_scroll(EtchContext* ctx,InlayDoc* doc) {
  bool ok=inlay_doc_set_utf8(doc,ETCH_STR_LIT("Stream "));
  frame();
  const InlayMeasure* cached=nullptr;
- for(const auto& m:doc->views)if(m.id==view.id)cached=&m;
+ for(uint32_t vi=0;vi<doc->view_count;++vi)if(doc->views[vi].id==view.id)cached=&doc->views[vi];
  if(!cached || !cached->count)return false;
  const uint32_t para_row_id=doc_row_id(doc,view.id,cached->rows[0]);
  for(int i=0;i<100;++i) {
@@ -633,7 +633,7 @@ bool doc_images_highlights_footnotes_tasks(EtchContext* ctx,InlayDoc* doc,InlayD
  for(int i=0;i<2;++i){etch_begin_frame(ctx,&f);inlay_doc_view(doc,&view);etch_end_frame(ctx);}
  ok &= img_ctx.hits>=2;
  const InlayMeasure* found_view=nullptr;
- for(const auto& m:doc->views)if(m.id==view.id)found_view=&m;
+ for(uint32_t vi=0;vi<doc->view_count;++vi)if(doc->views[vi].id==view.id)found_view=&doc->views[vi];
  if(!found_view) {etch_destroy_loaded_texture(ctx,&tex);return false;}
  const auto& cached=*found_view;
  const uint32_t banner_id=etch_id_index(doc_row_id(doc,view.id,cached.rows[0]),1);
@@ -1029,6 +1029,146 @@ int main(int argc,char** argv) {
  ok &= doc_style_customization(ctx,streamed);
  ok &= doc_images_highlights_footnotes_tasks(ctx,reference,streamed);
  ok &= doc_v010_sticky_custom_fence_and_syntax(ctx,streamed);
+
+ // I1 regression: ordered/nested lists, inline parser upgrades (_/multi-tick/currency/balanced URL/nested link),
+ // dynamic >16 views, cross-chunk code lexer+hscroll sync, task revision bump, TeX math & Sugiyama diagrams.
+ {
+  bool i1=true;
+  auto* idoc=inlay_doc_create(ctx,nullptr);
+  i1 &= idoc!=nullptr;
+  bool i1_list=true,i1_inline=true,i1_code=true,i1_hscroll=true,i1_task=true,i1_views=true,i1_math=true,i1_sug=true;
+  if(idoc) {
+   const auto md=ETCH_STR_LIT(
+    "1. First item\n"
+    "2. Second item\n"
+    "  - Nested bullet\n\n"
+    "Use _italic_, __bold__, foo_bar_baz, ``a `b` c``, Costs $5 and $10, $x^2$, "
+    "[C](https://en.wikipedia.org/wiki/C_(programming_language)) and [**bold** link](https://example.org).\n\n"
+    "- [ ] Toggle me\n\n"
+    "```cpp\n"
+    "/* start multiline comment\n"
+    "line02\nline03\nline04\nline05\nline06\nline07\nline08\n"
+    "line09\nline10\nline11\nline12\nline13\nline14\nline15\nline16\n"
+    "still_in_comment_chunk_2_0123456789012345678901234567890123456789 */\n"
+    "int after = 42;\n"
+    "```\n");
+   i1 &= inlay_doc_set_utf8(idoc,md);
+   auto v=inlay_doc_view_desc_default();v.id=etch_id("i1-main");v.width_px=340;v.height_px=0;v.show_code_line_numbers=true;
+   auto fr=etch_frame_desc_default();fr.viewport_w=400;fr.viewport_h=900;
+   for(int k=0;k<2;++k){etch_begin_frame(ctx,&fr);inlay_doc_view(idoc,&v);etch_end_frame(ctx);}
+   // Ordered list markers preserved ("1.", "2.")
+   i1_list &= contains_label(ctx,ETCH_STR_LIT("1.")) && contains_label(ctx,ETCH_STR_LIT("2."));
+   // Inline token checks
+   const InlayMeasure& vm=idoc->views[0];
+   uint32_t mask=0;
+   bool currency_became_math=false;
+   for(uint32_t ti=0;ti<vm.token_count;++ti) {
+    const auto& t=vm.tokens[ti];
+    const EtchStr txt={md.chars+t.offset,t.length,false};
+    if(str_equal(txt,ETCH_STR_LIT("italic")) && t.flags==InlayInlineEmphasis)mask|=1u;
+    if(str_equal(txt,ETCH_STR_LIT("bold")) && t.flags==InlayInlineBold)mask|=2u;
+    if(str_equal(txt,ETCH_STR_LIT("a `b` c")) && t.flags==InlayInlineCode)mask|=4u;
+    if(str_equal(txt,ETCH_STR_LIT("x^2")) && t.flags==InlayInlineMath)mask|=8u;
+    if((t.flags&InlayInlineMath) && str_equal(txt,ETCH_STR_LIT("5 and ")))currency_became_math=true;
+    if(str_equal(txt,ETCH_STR_LIT("C")) && (t.flags&InlayInlineLink) &&
+       str_equal({md.chars+t.url_offset,t.url_length,false},ETCH_STR_LIT("https://en.wikipedia.org/wiki/C_(programming_language)")))mask|=16u;
+    if(str_equal(txt,ETCH_STR_LIT("bold")) && t.flags==(InlayInlineLink|InlayInlineBold) &&
+       str_equal({md.chars+t.url_offset,t.url_length,false},ETCH_STR_LIT("https://example.org")))mask|=32u;
+    if(t.flags==0 && txt.length>=11) {
+     for(uint32_t k=0;k+11<=txt.length;++k)if(!std::memcmp(txt.chars+k,"foo_bar_baz",11))mask|=64u;
+    }
+   }
+   i1_inline &= (mask==127u) && !currency_became_math;
+   // Code block chunk 2 carries lex_state=1 (inside /* ... */) and precomputed start_line=17!
+   uint32_t code_chunks=0,chunk1_rid=0,chunk2_rid=0;
+   bool saw_lex_carry=false;
+   for(uint32_t ri=0;ri<vm.count;++ri) {
+    if(vm.rows[ri].kind!=INLAY_CODE_BLOCK)continue;
+    ++code_chunks;
+    const uint32_t rid=doc_row_id(idoc,v.id,vm.rows[ri]);
+    if(code_chunks==1)chunk1_rid=rid;
+    if(code_chunks==2){chunk2_rid=rid;saw_lex_carry=(vm.rows[ri].code_lex_state==1u && vm.rows[ri].code_start_line==17u);}
+   }
+   i1_code &= code_chunks==2 && saw_lex_carry;
+   // Shared horizontal scroll across 16-line code chunks
+   if(chunk1_rid && chunk2_rid) {
+    etch_set_scroll_offset(etch_id_index(chunk1_rid,2),{60.f,0.f},true);
+    etch_begin_frame(ctx,&fr);inlay_doc_view(idoc,&v);etch_end_frame(ctx);
+    etch_begin_frame(ctx,&fr);inlay_doc_view(idoc,&v);etch_end_frame(ctx);
+    i1_hscroll &= etch_scroll_offset(etch_id_index(chunk2_rid,2)).x>30.f;
+   } else i1_hscroll=false;
+   // Task toggle bumps doc->revision
+   uint32_t task_row_id=0;
+   for(uint32_t ri=0;ri<vm.count;++ri)if(vm.rows[ri].kind==INLAY_TASK_LIST){task_row_id=doc_row_id(idoc,v.id,vm.rows[ri]);break;}
+   const uint32_t rev_before=idoc->revision;
+   if(task_row_id) {
+    const uint32_t cb_id=etch_id_index(etch_id_index(task_row_id,1),0x5441u);
+    i1_task &= etch_perform_a11y_action(cb_id,ETCH_A11Y_ACT_PRESS,0,{},ctx,nullptr);
+    etch_begin_frame(ctx,&fr);inlay_doc_view(idoc,&v);etch_end_frame(ctx);
+    i1_task &= idoc->revision>rev_before;
+   } else i1_task=false;
+   // Dynamic views pool (>16 views on the same document all work without dropping)
+   etch_begin_frame(ctx,&fr);
+   for(uint32_t k=0;k<20;++k) {
+    auto mv=v;mv.id=etch_id_index(etch_id("i1-multi"),k+1);mv.width_px=200;mv.height_px=120;
+    const auto mr=inlay_doc_view(idoc,&mv);
+    i1_views &= mr.total_rows>0;
+   }
+   etch_end_frame(ctx);
+   i1_views &= idoc->view_count>=21;
+
+   // TeX math engine checks: display limits, \sqrt[n]{x}, \binom, cases, aligned, vmatrix, \vec{i}, accents, \langle/\rangle
+   etch_begin_frame(ctx,&fr);
+   InlayMathPrepared disp_sum={},text_sum={};
+   i1_math &= inlay_math_prepare(ETCH_STR_LIT("\\sum_{i=1}^{n} x_i"),24,true,&disp_sum);
+   i1_math &= inlay_math_prepare(ETCH_STR_LIT("\\sum_{i=1}^{n} x_i"),24,false,&text_sum);
+   i1_math &= disp_sum.metrics.height>text_sum.metrics.height;
+   const auto sq2=inlay_measure_math(ETCH_STR_LIT("\\sqrt{x}"),24);
+   const auto sq3=inlay_measure_math(ETCH_STR_LIT("\\sqrt[3]{x}"),24);
+   i1_math &= sq3.valid && sq3.width>=sq2.width;
+   i1_math &= inlay_measure_math(ETCH_STR_LIT("\\binom{n}{k}"),24).valid;
+   i1_math &= inlay_measure_math(ETCH_STR_LIT("\\begin{cases}x & x>0\\\\-x & x\\le 0\\end{cases}"),24).valid;
+   i1_math &= inlay_measure_math(ETCH_STR_LIT("\\begin{aligned}a+b &= c\\\\d &= e+f\\end{aligned}"),24).valid;
+   i1_math &= inlay_measure_math(ETCH_STR_LIT("\\begin{vmatrix}a&b\\\\c&d\\end{vmatrix}"),24).valid;
+   i1_math &= inlay_measure_math(ETCH_STR_LIT("\\vec{i}+\\tilde{x}+\\bar{y}+\\dot{z}+\\underline{u}"),24).valid;
+   i1_math &= inlay_measure_math(ETCH_STR_LIT("\\left\\langle \\psi \\mid \\phi \\right\\rangle"),24).valid;
+   i1_math &= inlay_measure_math(ETCH_STR_LIT("x^{\\frac{a}{b}}_{\\frac{c}{d}}"),24).valid;
+
+   // Sugiyama diagram checks: shapes, multi-rank virtual waypoints, nested subgraphs, separated feedback lanes
+   InlayDiagramMeta meta={};
+   const auto dg_desc=inlay_diagram_desc_default();
+   const auto sug=inlay_diagram_layout_ex(ETCH_STR_LIT(
+    "flowchart TD\n"
+    "subgraph Outer\n"
+    "A([Start]) --> B{Decide}\n"
+    "subgraph Inner\n"
+    "B --> C(Work)\n"
+    "C --> D((Done))\n"
+    "end\n"
+    "end\n"
+    "A --> D\n"
+    "D -. retry1 .-> A\n"
+    "C -. retry2 .-> A\n"),&dg_desc,&meta);
+   i1_sug &= sug.valid && sug.node_count==4 && meta.subgraph_count==2 && meta.waypoint_count>=2;
+   if(sug.valid && meta.shapes && meta.subgraphs && meta.edge_paths && meta.subgraph_count==2) {
+    i1_sug &= meta.shapes[0]==InlayShapeRound && meta.shapes[1]==InlayShapeDiamond &&
+          meta.shapes[2]==InlayShapeRound && meta.shapes[3]==InlayShapeCircle;
+    const auto ob=meta.subgraphs[0].bounds,ib=meta.subgraphs[1].bounds;
+    i1_sug &= ob.x<=ib.x && ob.y<=ib.y && ob.x+ob.w>=ib.x+ib.w && ob.y+ob.h>=ib.y+ib.h;
+    i1_sug &= meta.edge_paths[4].feedback_lane==0 && meta.edge_paths[5].feedback_lane==1;
+   }
+   etch_end_frame(ctx);
+   i1 &= i1_list && i1_inline && i1_code && i1_hscroll && i1_task && i1_views && i1_math && i1_sug;
+   if(!i1)std::fprintf(stderr,"I1 failed: list=%d inline=%d(mask=%u,cur=%d) code=%d(chunks=%u,lex=%d) hscroll=%d(c2x=%.1f) task=%d views=%d math=%d sug=%d(v=%d,wp=%u,sg=%u)\n",
+                       i1_list,i1_inline,mask,currency_became_math,i1_code,code_chunks,saw_lex_carry,
+                       i1_hscroll,chunk2_rid?etch_scroll_offset(etch_id_index(chunk2_rid,2)).x:-1.f,
+                       i1_task,i1_views,i1_math,i1_sug,sug.valid,meta.waypoint_count,meta.subgraph_count);
+   inlay_doc_destroy(idoc);
+  }
+  if(!i1)std::fprintf(stderr,"I1 upgrades check FAILED\n");
+  ok &= i1;
+ }
+
  inlay_doc_destroy(reference);inlay_doc_destroy(streamed);etch_destroy_context(ctx);
  ok &= flow_document(nullptr);
  std::printf("32KB streaming equivalence: %s\n",ok ? "PASS" : "FAIL");return ok ? 0 : 1;
