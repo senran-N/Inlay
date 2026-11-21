@@ -497,7 +497,10 @@ float rich_line(InlayMeasure* m,EtchStr line,uint32_t base_id,float font,InlayDo
    span.padding_x=4;span.padding_y=1;span.bg_radius=theme.radius_small_px;
    span.id=etch_id_index(base_id,t.offset+1);
    line_height=std::fmax(line_height,etch_font_metrics(base_font,span.font_size_px).line_height+2*span.padding_y);
-   if(span.id && etch_clicked(span.id))result->clicked_link=slice(source,t.url_offset,t.url_length);
+   if(span.id) {
+    if(etch_hovered(span.id))etch_set_cursor(ETCH_CURSOR_HAND);
+    if(etch_clicked(span.id))result->clicked_link=slice(source,t.url_offset,t.url_length);
+   }
   }
   if(t.flags&(InlayInlineLink|InlayInlineCode)) {
    const bool link=(t.flags&InlayInlineLink)!=0;
@@ -506,6 +509,10 @@ float rich_line(InlayMeasure* m,EtchStr line,uint32_t base_id,float font,InlayDo
     url=slice(source,t.url_offset,t.url_length);
     span.color=style.link_color.a!=0 ? style.link_color : theme.accent;
     span.underline=true;span.id=etch_id_index(base_id,t.offset+1);
+    if(span.id) {
+     if(etch_hovered(span.id))etch_set_cursor(ETCH_CURSOR_HAND);
+     if(url.length)etch_set_tooltip_text(span.id,url);
+    }
    }
    EtchStr clicked_text=span.text;
    if(m->view.inline_decorator_fn) {
@@ -648,7 +655,7 @@ bool is_code_keyword(const char* s,uint32_t len,bool sql_mode) noexcept {
  }
  return false;
 }
-void code_line(EtchStr line,EtchStr language,uint32_t id,float font,const EtchTheme& theme,const InlayDocStyle& style) {
+void code_line(EtchStr line,EtchStr language,uint32_t id,float font,const EtchTheme& theme,const InlayDocStyle& style,bool wrap_lines=false) {
  const uint16_t mono_font=effective_mono_font(style);
  const float code_font=effective_code_font_size(font,style);
  const float line_height=code_font*effective_line_scale(style);
@@ -661,7 +668,7 @@ void code_line(EtchStr line,EtchStr language,uint32_t id,float font,const EtchTh
                              (line.chars[0]=='-' && line.chars[1]=='-' && line.chars[2]=='-')))span.color=theme.syntax_keyword;
   else if(line.chars[0]=='+')span.color=theme.syntax_string;
   else if(line.chars[0]=='-')span.color=theme.danger;
-  auto desc=etch_rich_text_desc_default();desc.id=id;desc.selectable=true;desc.font_id=mono_font;desc.font_size_px=code_font;desc.line_height_px=line_height;desc.wrap=false;
+  auto desc=etch_rich_text_desc_default();desc.id=id;desc.selectable=true;desc.font_id=mono_font;desc.font_size_px=code_font;desc.line_height_px=line_height;desc.wrap=wrap_lines;
   if(style.selection_color.a!=0)desc.selection_color=style.selection_color;
   etch_text_spans(&span,1,&desc);
   return;
@@ -744,9 +751,25 @@ void code_line(EtchStr line,EtchStr language,uint32_t id,float font,const EtchTh
  }
  if(pass==0) {spans=static_cast<EtchTextSpan*>(etch_frame_arena_alloc(etch_current_context(),size_t(count)*sizeof(EtchTextSpan),alignof(EtchTextSpan)));if(!spans)return;}
  }
- auto desc=etch_rich_text_desc_default();desc.id=id;desc.selectable=true;desc.font_id=mono_font;desc.font_size_px=code_font;desc.line_height_px=line_height;desc.wrap=false;
+ auto desc=etch_rich_text_desc_default();desc.id=id;desc.selectable=true;desc.font_id=mono_font;desc.font_size_px=code_font;desc.line_height_px=line_height;desc.wrap=wrap_lines;
  if(style.selection_color.a!=0)desc.selection_color=style.selection_color;
  etch_text_spans(spans,count,&desc);
+}
+EtchColor alert_accent_color(EtchStr source,const InlayBlock& full,const EtchTheme& theme) noexcept {
+ uint32_t pos=full.content_offset,end=pos+full.content_length;
+ if(pos<end && source.chars[pos]=='>')++pos;
+ if(pos<end && source.chars[pos]==' ')++pos;
+ if(pos+2<end && source.chars[pos]=='[' && source.chars[pos+1]=='!') {
+  uint32_t s=pos+2,e=s;
+  while(e<end && source.chars[e]!=']' && source.chars[e]!='\n' && source.chars[e]!='\r')++e;
+  const EtchStr tag=slice(source,s,e-s);
+  if(ascii_ieq(tag,"CAUTION"))return theme.danger;
+  if(ascii_ieq(tag,"WARNING"))return theme.warning;
+  if(ascii_ieq(tag,"TIP"))return theme.syntax_string;
+  if(ascii_ieq(tag,"IMPORTANT"))return theme.accent_secondary.a!=0 ? theme.accent_secondary : theme.accent;
+  if(ascii_ieq(tag,"NOTE"))return theme.accent;
+ }
+ return theme.accent;
 }
 void compute_table_col_widths(const InlayMeasure* measure,EtchStr source,const InlayRow& info,uint32_t columns,
                               float width,float font,const InlayDocStyle& style,const InlayDocViewDesc& view,
@@ -814,7 +837,8 @@ void compute_table_col_widths(const InlayMeasure* measure,EtchStr source,const I
 }
 float block_lines(InlayMeasure* measure,const InlayBlock& b,EtchStr source,uint32_t id,float font,
                   InlayDocResult* result,const EtchTheme& theme,const InlayDocStyle& style,const InlayRow& info,bool estimate=false,
-                  const EtchBoxDesc* pending_box=nullptr,PendingTaskToggle* toggle_out=nullptr,EtchColor color_override={}) {
+                  const EtchBoxDesc* pending_box=nullptr,PendingTaskToggle* toggle_out=nullptr,EtchColor color_override={},
+                  bool wrap_code=false,uint32_t code_start_line=0,float code_gutter_w=0.f,float code_row_w=0.f) {
  const auto& view=measure->view;
  const float padding=block_padding(view,b.kind);
  const float width=std::fmax(1.f,measure->width-2*padding);
@@ -839,7 +863,53 @@ float block_lines(InlayMeasure* measure,const InlayBlock& b,EtchStr source,uint3
                                      false,false,ETCH_ALIGN_X_LEFT,color_override);
    if(line_height>0)height+=(height>0 ? 4.f : 0.f)+line_height;
   };
-  if(b.kind==INLAY_CODE_BLOCK)code_line(line,slice(source,b.language_offset,b.language_length),line_id,font,theme,style);
+  if(b.kind==INLAY_CODE_BLOCK) {
+   if(wrap_code && code_gutter_w>0.f) {
+    const float code_font=effective_code_font_size(font,style);
+    const float line_h=code_font*effective_line_scale(style);
+    auto wrow=etch_box_desc_default();
+    wrow.axis=ETCH_AXIS_ROW;
+    wrow.width=etch_sizing_fixed(std::fmax(1.f,code_row_w));
+    wrow.height=etch_sizing_fit(0,0);
+    wrow.gap=10;
+    wrow.align_y=ETCH_ALIGN_Y_TOP;
+    etch_begin_box(&wrow);
+    auto gbox=etch_box_desc_default();
+    gbox.width=etch_sizing_fixed(code_gutter_w);
+    gbox.height=etch_sizing_fit(0,0);
+    gbox.padding={0,8,0,0};
+    gbox.align_x=ETCH_ALIGN_X_RIGHT;
+    gbox.border_color=style.code_border.a!=0 ? style.code_border : theme.border_subtle;
+    gbox.border_sides={0,1,0,0};
+    etch_begin_box(&gbox);
+    char nb[16];
+    const int n=std::snprintf(nb,sizeof(nb),"%u",code_start_line+line_index-1);
+    if(n>0) {
+     char* arena_s=static_cast<char*>(etch_frame_arena_alloc(measure->doc->context,size_t(n),1));
+     if(arena_s) {
+      std::memcpy(arena_s,nb,size_t(n));
+      auto lnd=etch_text_desc_default();
+      lnd.font_id=effective_mono_font(style);
+      lnd.font_size_px=std::fmax(10.f,code_font*0.92f);
+      lnd.line_height_px=line_h;
+      lnd.color=style.muted_color.a!=0 ? style.muted_color : theme.text_muted;
+      lnd.wrap=false;
+      etch_text({arena_s,uint32_t(n),false},&lnd);
+     }
+    }
+    etch_end_box();
+    auto cbox=etch_box_desc_default();
+    cbox.width=etch_sizing_grow(0,0);
+    cbox.height=etch_sizing_fit(0,0);
+    cbox.shrink_width=true;
+    etch_begin_box(&cbox);
+    code_line(line,slice(source,b.language_offset,b.language_length),line_id,font,theme,style,true);
+    etch_end_box();
+    etch_end_box();
+   } else {
+    code_line(line,slice(source,b.language_offset,b.language_length),line_id,font,theme,style,wrap_code);
+   }
+  }
   else if(b.kind==INLAY_TABLE) {
    const auto& header=measure->rows[info.table_header];
    const uint32_t columns=header.table_columns;
@@ -887,11 +957,26 @@ float block_lines(InlayMeasure* measure,const InlayBlock& b,EtchStr source,uint3
    if(estimate)return std::fmin(4096.f,tallest+2*view.table_cell_padding_y)+
     (float(info.first)+float(info.last_in_block))*padding;
   } else {
+   bool is_alert_tag=false;
    if((b.kind==INLAY_BLOCKQUOTE || b.kind==INLAY_ALERT) && !continuation) {
     if(line.length>=2 && line.chars[0]=='>' && line.chars[1]==' ') {line.chars+=2;line.length-=2;}
-    if(b.kind==INLAY_ALERT && logical==b.offset+2 && line.length>=3 && line.chars[0]=='[' && line.chars[1]=='!') {line.chars+=2;line.length-=2;if(line.chars[line.length-1]==']')--line.length;}
+    if(b.kind==INLAY_ALERT && logical==b.offset+2 && line.length>=3 && line.chars[0]=='[' && line.chars[1]=='!') {
+     line.chars+=2;line.length-=2;
+     if(line.length && line.chars[line.length-1]==']')--line.length;
+     is_alert_tag=true;
+    }
    }
-   if((b.kind==INLAY_LIST || b.kind==INLAY_TASK_LIST) && !continuation) {
+   if(is_alert_tag) {
+    begin_inline_row(row_box);
+    auto ad=etch_text_desc_default();
+    ad.font_id=effective_bold_font(style);
+    ad.font_size_px=std::fmax(11.f,font*0.86f);
+    ad.line_height_px=ad.font_size_px*1.3f;
+    ad.color=alert_accent_color(source,measure->doc->blocks[info.block],theme);
+    ad.wrap=false;
+    etch_text(line,&ad);
+    if(estimate)height+=(height>0 ? 4.f : 0.f)+ad.line_height_px;
+   } else if((b.kind==INLAY_LIST || b.kind==INLAY_TASK_LIST) && !continuation) {
     begin_inline_row(row_box);
     uint32_t indent=0;while(indent<line.length && indent<3 && line.chars[indent]==' ')++indent;line.chars+=indent;line.length-=indent;
     auto row=etch_box_desc_default();row.width=etch_sizing_fixed(width);row.gap=8;row.align_y=ETCH_ALIGN_Y_TOP;row.shrink_width=true;etch_begin_box(&row);
@@ -972,10 +1057,15 @@ bool prepare_view(InlayDoc* doc,InlayMeasure* measure,const InlayDocViewDesc& vi
   auto* ranges=static_cast<InlayDetails*>(std::realloc(measure->details,size_t(cap)*sizeof(InlayDetails)));if(!ranges)return false;
   measure->details=ranges;
   auto* data=static_cast<bool*>(std::realloc(measure->open,cap*sizeof(bool)));if(!data)return false;
-  for(uint32_t i=measure->open_capacity;i<cap;++i)data[i]=true;
-  measure->open=data;measure->open_capacity=cap;
+  auto* wraps=static_cast<bool*>(std::realloc(measure->code_wrap,cap*sizeof(bool)));
+  if(!wraps){measure->open=data;return false;}
+  for(uint32_t i=measure->open_capacity;i<cap;++i){data[i]=true;wraps[i]=false;}
+  measure->open=data;measure->code_wrap=wraps;measure->open_capacity=cap;
  }
- if(measure->width==0)for(uint32_t i=0;i<measure->open_capacity;++i)measure->open[i]=true;
+ if(measure->width==0) {
+  for(uint32_t i=0;i<measure->open_capacity;++i){measure->open[i]=true;measure->code_wrap[i]=false;}
+  measure->doc_sel_active=false;measure->doc_sel_dragging=false;
+ }
  measure->doc=doc;
  const EtchStr source={doc->source,doc->source_size,false};
  for(uint32_t block=measure->width==0 ? 0 : measure->frozen_count;block<doc->block_count;++block)if(doc->blocks[block].kind==INLAY_DETAILS) {
@@ -1185,6 +1275,14 @@ extern "C" InlayDocResult inlay_doc_view(InlayDoc* doc,const InlayDocViewDesc* i
  const EtchStr source={doc->source,doc->source_size,false};
  PendingTaskToggle pending_toggle={};
  bool group_open=false;
+ if(measure->doc_sel_active && (measure->doc_sel_anchor>=measure->count || measure->doc_sel_focus>=measure->count)) {
+  measure->doc_sel_active=false;measure->doc_sel_dragging=false;
+ }
+ const uint32_t sel_lo=measure->doc_sel_active ? (measure->doc_sel_anchor<measure->doc_sel_focus ? measure->doc_sel_anchor : measure->doc_sel_focus) : 0u;
+ const uint32_t sel_hi=measure->doc_sel_active ? (measure->doc_sel_anchor>measure->doc_sel_focus ? measure->doc_sel_anchor : measure->doc_sel_focus) : 0u;
+ bool has_hovered_row=false;
+ uint32_t hovered_row=0;
+ bool hovered_row_is_button=false;
  for(uint32_t i=result.visible_first;i<result.visible_end;++i) {
   const auto& info=measure->rows[i];
   auto b=doc->blocks[info.block];
@@ -1213,6 +1311,14 @@ extern "C" InlayDocResult inlay_doc_view(InlayDoc* doc,const InlayDocViewDesc* i
   }
   const bool is_custom_fence=b.kind==INLAY_CODE_BLOCK && info.first &&
    custom_fence_estimate(view,doc,doc->blocks[info.block],std::fmax(1.f,row_width-2*view.block_padding_px))>0.f;
+  if(!is_custom_fence && etch_hovered(row_id)) {
+   has_hovered_row=true;
+   hovered_row=i;
+   const uint32_t act=etch_active_id();
+   if(act && (act==etch_id_index(row_id,1) || act==etch_id_index(row_id,3) || act==etch_id_index(row_id,900))) {
+    hovered_row_is_button=true;
+   }
+  }
   const float padding=is_custom_fence ? view.block_padding_px : block_padding(view,b.kind);
   auto box=etch_box_desc_default();box.id=row_id;box.axis=ETCH_AXIS_COL;box.width=etch_sizing_fixed(row_width);box.height=etch_sizing_fit(0,0);
   box.padding=etch_padding_all(padding);box.gap=4;box.clip_children=true;box.shrink_width=true;
@@ -1224,10 +1330,27 @@ extern "C" InlayDocResult inlay_doc_view(InlayDoc* doc,const InlayDocViewDesc* i
    box.background=style.code_bg.a!=0 ? style.code_bg : theme.bg_elevated;
    box.border_color=style.code_border.a!=0 ? style.code_border : theme.border_subtle;
    box.border_width=1;box.radius=etch_corners_all(theme.radius_panel_px);
-  } else if(b.kind==INLAY_ALERT || b.kind==INLAY_BLOCKQUOTE) {
+  } else if(b.kind==INLAY_ALERT) {
+   const EtchColor acol=style.quote_border.a!=0 ? style.quote_border : alert_accent_color(source,doc->blocks[info.block],theme);
    box.background=style.quote_bg.a!=0 ? style.quote_bg : theme.bg_elevated;
-   box.border_color=style.quote_border.a!=0 ? style.quote_border : (b.kind==INLAY_ALERT ? theme.accent : theme.border_subtle);
-   box.border_width=1;box.radius=etch_corners_all(theme.radius_panel_px);
+   box.border_color=acol;
+   box.border_sides={3.f,0.f,0.f,0.f};
+   box.radius={2.f,6.f,6.f,2.f};
+   box.padding={padding+4.f,padding,padding*0.85f,padding*0.85f};
+  } else if(b.kind==INLAY_BLOCKQUOTE) {
+   box.background=style.quote_bg.a!=0 ? style.quote_bg : theme.bg_elevated;
+   box.border_color=style.quote_border.a!=0 ? style.quote_border : (theme.border_control.a!=0 ? theme.border_control : theme.border_subtle);
+   box.border_sides={2.5f,0.f,0.f,0.f};
+   box.radius={2.f,6.f,6.f,2.f};
+   box.padding={padding+4.f,padding,padding*0.85f,padding*0.85f};
+  }
+  if(measure->doc_sel_active && !is_custom_fence && i>=sel_lo && i<=sel_hi) {
+   const EtchColor sel_base=style.selection_color.a!=0 ? style.selection_color : (theme.selection.a!=0 ? theme.selection : theme.accent);
+   const EtchColor tint={sel_base.r,sel_base.g,sel_base.b,48};
+   box.background=box.background.a!=0 ? etch_color_blend_over(box.background,tint) : tint;
+   if(box.radius.tl==0.f && box.radius.tr==0.f && box.radius.br==0.f && box.radius.bl==0.f) {
+    box.radius=etch_corners_all(6.f);
+   }
   }
   // A split inline continuation may emit no spans after decoration.
   const EtchBoxDesc* pending_box=!info.first && view.inline_decorator_fn && source.chars[info.offset-1]!='\n' &&
@@ -1302,6 +1425,7 @@ extern "C" InlayDocResult inlay_doc_view(InlayDoc* doc,const InlayDocViewDesc* i
   } else if(b.kind==INLAY_CODE_BLOCK) {
    const auto& full=doc->blocks[info.block];
    const float code_inner_w=std::fmax(1.f,row_width-2*padding);
+   const bool wrap_code=info.block<measure->open_capacity && measure->code_wrap && measure->code_wrap[info.block];
    if(info.first && (!view.hide_code_copy_button || b.language_length || view.code_header_fn)) {
     const EtchStr lang=slice(source,full.language_offset,full.language_length);
     const EtchStr full_code=slice(source,full.content_offset,full.content_length);
@@ -1310,7 +1434,7 @@ extern "C" InlayDocResult inlay_doc_view(InlayDoc* doc,const InlayDocViewDesc* i
     hdr.height=etch_sizing_fit(0,0);
     hdr.padding={0,0,0,6};
     hdr.align_y=ETCH_ALIGN_Y_CENTER;
-    hdr.gap=8;
+    hdr.gap=6;
     hdr.border_color=style.code_border.a!=0 ? style.code_border : theme.border_subtle;
     hdr.border_sides={0,0,0,1};
     etch_begin_box(&hdr);
@@ -1321,6 +1445,24 @@ extern "C" InlayDocResult inlay_doc_view(InlayDoc* doc,const InlayDocViewDesc* i
     }
     auto sp=etch_box_desc_default();sp.width=etch_sizing_grow(0,0);sp.height=etch_sizing_fixed(1);sp.shrink_width=true;
     etch_box(&sp);
+    if(info.block<measure->open_capacity && measure->code_wrap) {
+     const uint32_t wrap_id=etch_id_index(row_id,3);
+     auto wbtn=etch_button_desc_default();
+     wbtn.id=wrap_id;
+     wbtn.variant=ETCH_BUTTON_GHOST;
+     wbtn.label=wrap_code ? ETCH_STR_LIT("Wrap: On") : ETCH_STR_LIT("Wrap");
+     wbtn.font_size_px=std::fmax(11.f,view.font_size_px*0.78f);
+     wbtn.padding=etch_padding_xy(6,2);
+     if(etch_button(&wbtn)) {
+      measure->code_wrap[info.block]=!measure->code_wrap[info.block];
+      for(uint32_t j=i;j<measure->count && measure->rows[j].block==info.block;++j) {
+       measure->heights[j]=0;
+       measure->rows[j].estimate=0;
+      }
+      if(!flow)etch_virtual_list_invalidate_heights(view.id);
+      etch_request_redraw(doc->context);
+     }
+    }
     if(view.code_header_fn) {
      view.code_header_fn(info.block,row_id,lang,full_code,view.code_header_user_data);
     }
@@ -1334,65 +1476,77 @@ extern "C" InlayDocResult inlay_doc_view(InlayDoc* doc,const InlayDocViewDesc* i
     etch_end_box();
    }
    const bool show_ln=view.show_code_line_numbers;
-   float scroll_w=code_inner_w;
+   uint32_t start_line=1,chunk_lines=0,total_lines=1;
+   float gutter_w=0.f;
    if(show_ln) {
-    uint32_t start_line=1,chunk_lines=0,total_lines=1;
     for(uint32_t k=full.content_offset;k<b.content_offset;++k)if(source.chars[k]=='\n')++start_line;
     for(uint32_t k=full.content_offset;k<full.content_offset+full.content_length;++k)if(source.chars[k]=='\n')++total_lines;
-    {
-     uint32_t lp=b.content_offset,le=b.content_offset+b.content_length;
-     while(lp<le) {
-      uint32_t ln=lp;while(ln<le && source.chars[ln]!='\n')++ln;
-      ++chunk_lines;
-      lp=ln<le ? ln+1 : le;
-     }
+    uint32_t lp=b.content_offset,le=b.content_offset+b.content_length;
+    while(lp<le) {
+     uint32_t ln=lp;while(ln<le && source.chars[ln]!='\n')++ln;
+     ++chunk_lines;
+     lp=ln<le ? ln+1 : le;
     }
-    const float gutter_w=total_lines>=1000 ? 40.f : (total_lines>=100 ? 32.f : 24.f);
-    const float code_font=effective_code_font_size(view.font_size_px,style);
-    const float line_h=code_font*effective_line_scale(style);
-    scroll_w=std::fmax(1.f,code_inner_w-gutter_w-10.f);
-    auto row_wrap=etch_box_desc_default();
-    row_wrap.axis=ETCH_AXIS_ROW;
-    row_wrap.width=etch_sizing_fixed(code_inner_w);
-    row_wrap.height=etch_sizing_fit(0,0);
-    row_wrap.gap=10;
-    etch_begin_box(&row_wrap);
-    auto gutter=etch_box_desc_default();
-    gutter.axis=ETCH_AXIS_COL;
-    gutter.width=etch_sizing_fixed(gutter_w);
-    gutter.height=etch_sizing_fit(0,0);
-    gutter.padding={0,8,0,0};
-    gutter.gap=4;
-    gutter.align_x=ETCH_ALIGN_X_RIGHT;
-    gutter.border_color=style.code_border.a!=0 ? style.code_border : theme.border_subtle;
-    gutter.border_sides={0,1,0,0};
-    etch_begin_box(&gutter);
-    auto lnd=etch_text_desc_default();
-    lnd.font_id=effective_mono_font(style);
-    lnd.font_size_px=std::fmax(10.f,code_font*0.92f);
-    lnd.line_height_px=line_h;
-    lnd.color=style.muted_color.a!=0 ? style.muted_color : theme.text_muted;
-    lnd.wrap=false;
-    for(uint32_t li=0;li<chunk_lines;++li) {
-     char nb[16];
-     const int n=std::snprintf(nb,sizeof(nb),"%u",start_line+li);
-     if(n>0) {
-      char* arena_s=static_cast<char*>(etch_frame_arena_alloc(doc->context,size_t(n),1));
-      if(arena_s) {std::memcpy(arena_s,nb,size_t(n));etch_text({arena_s,uint32_t(n),false},&lnd);}
-     }
-    }
-    etch_end_box();
+    gutter_w=total_lines>=1000 ? 40.f : (total_lines>=100 ? 32.f : 24.f);
    }
-   auto scroll=etch_box_desc_default();scroll.id=etch_id_index(row_id,2);
-   scroll.width=etch_sizing_fixed(scroll_w);scroll.height=etch_sizing_fit(0,0);
-   scroll.scroll_x=true;scroll.clip_children=true;
-   etch_begin_box(&scroll);
-   auto content=etch_box_desc_default();content.axis=ETCH_AXIS_COL;
-   content.width=etch_sizing_fit(0,0);content.height=etch_sizing_fit(0,0);content.gap=4;
-   etch_begin_box(&content);
-   block_lines(measure,b,source,scroll.id,view.font_size_px,&result,theme,style,info);
-   etch_end_box();etch_end_box();
-   if(show_ln)etch_end_box();
+   if(wrap_code) {
+    auto scroll=etch_box_desc_default();scroll.id=etch_id_index(row_id,2);
+    scroll.axis=ETCH_AXIS_COL;
+    scroll.width=etch_sizing_fixed(code_inner_w);scroll.height=etch_sizing_fit(0,0);
+    scroll.gap=4;scroll.clip_children=true;scroll.shrink_width=true;
+    etch_begin_box(&scroll);
+    block_lines(measure,b,source,scroll.id,view.font_size_px,&result,theme,style,info,false,nullptr,nullptr,{},
+                true,start_line,show_ln ? gutter_w : 0.f,code_inner_w);
+    etch_end_box();
+   } else {
+    float scroll_w=code_inner_w;
+    if(show_ln) {
+     const float code_font=effective_code_font_size(view.font_size_px,style);
+     const float line_h=code_font*effective_line_scale(style);
+     scroll_w=std::fmax(1.f,code_inner_w-gutter_w-10.f);
+     auto row_wrap=etch_box_desc_default();
+     row_wrap.axis=ETCH_AXIS_ROW;
+     row_wrap.width=etch_sizing_fixed(code_inner_w);
+     row_wrap.height=etch_sizing_fit(0,0);
+     row_wrap.gap=10;
+     etch_begin_box(&row_wrap);
+     auto gutter=etch_box_desc_default();
+     gutter.axis=ETCH_AXIS_COL;
+     gutter.width=etch_sizing_fixed(gutter_w);
+     gutter.height=etch_sizing_fit(0,0);
+     gutter.padding={0,8,0,0};
+     gutter.gap=4;
+     gutter.align_x=ETCH_ALIGN_X_RIGHT;
+     gutter.border_color=style.code_border.a!=0 ? style.code_border : theme.border_subtle;
+     gutter.border_sides={0,1,0,0};
+     etch_begin_box(&gutter);
+     auto lnd=etch_text_desc_default();
+     lnd.font_id=effective_mono_font(style);
+     lnd.font_size_px=std::fmax(10.f,code_font*0.92f);
+     lnd.line_height_px=line_h;
+     lnd.color=style.muted_color.a!=0 ? style.muted_color : theme.text_muted;
+     lnd.wrap=false;
+     for(uint32_t li=0;li<chunk_lines;++li) {
+      char nb[16];
+      const int n=std::snprintf(nb,sizeof(nb),"%u",start_line+li);
+      if(n>0) {
+       char* arena_s=static_cast<char*>(etch_frame_arena_alloc(doc->context,size_t(n),1));
+       if(arena_s) {std::memcpy(arena_s,nb,size_t(n));etch_text({arena_s,uint32_t(n),false},&lnd);}
+      }
+     }
+     etch_end_box();
+    }
+    auto scroll=etch_box_desc_default();scroll.id=etch_id_index(row_id,2);
+    scroll.width=etch_sizing_fixed(scroll_w);scroll.height=etch_sizing_fit(0,0);
+    scroll.scroll_x=true;scroll.clip_children=true;
+    etch_begin_box(&scroll);
+    auto content=etch_box_desc_default();content.axis=ETCH_AXIS_COL;
+    content.width=etch_sizing_fit(0,0);content.height=etch_sizing_fit(0,0);content.gap=4;
+    etch_begin_box(&content);
+    block_lines(measure,b,source,scroll.id,view.font_size_px,&result,theme,style,info);
+    etch_end_box();etch_end_box();
+    if(show_ln)etch_end_box();
+   }
   } else {
    const bool estimate=view.inline_decorator_fn && (measure->heights[i]==collapsed_height ||
                        (measure->heights[i]==0 && (refresh || etch_element_bounds(row_id).h<=0)));
@@ -1429,6 +1583,77 @@ extern "C" InlayDocResult inlay_doc_view(InlayDoc* doc,const InlayDocViewDesc* i
   if(group_open)etch_end_box();
   etch_end_box();
  } else etch_end_virtual_list();
+ {
+  const uint32_t act=etch_active_id();
+  if(act!=0 && act!=measure->doc_sel_last_active) {
+   if(has_hovered_row && !hovered_row_is_button) {
+    measure->doc_sel_dragging=true;
+    measure->doc_sel_drag_active_id=act;
+    measure->doc_sel_anchor=hovered_row;
+    measure->doc_sel_focus=hovered_row;
+    if(measure->doc_sel_active) {
+     measure->doc_sel_active=false;
+     etch_request_redraw(doc->context);
+    }
+   } else if(measure->doc_sel_active) {
+    measure->doc_sel_active=false;
+    measure->doc_sel_dragging=false;
+    etch_request_redraw(doc->context);
+   }
+  }
+  if(measure->doc_sel_dragging) {
+   if(act==0 || act!=measure->doc_sel_drag_active_id) {
+    measure->doc_sel_dragging=false;
+   } else if(has_hovered_row && hovered_row!=measure->doc_sel_focus) {
+    measure->doc_sel_focus=hovered_row;
+    if(measure->doc_sel_focus!=measure->doc_sel_anchor) {
+     measure->doc_sel_active=true;
+     etch_clear_text_selection(measure->doc_sel_drag_active_id);
+     etch_request_redraw(doc->context);
+    }
+   }
+  }
+  measure->doc_sel_last_active=act;
+  if(measure->doc_sel_active && etch_key_pressed(27u,false)) {
+   measure->doc_sel_active=false;
+   measure->doc_sel_dragging=false;
+   etch_request_redraw(doc->context);
+  }
+  if(measure->doc_sel_active && etch_shortcut(ETCH_MOD_PRIMARY,'c',false)) {
+   const uint32_t lo=measure->doc_sel_anchor<measure->doc_sel_focus ? measure->doc_sel_anchor : measure->doc_sel_focus;
+   const uint32_t hi=measure->doc_sel_anchor>measure->doc_sel_focus ? measure->doc_sel_anchor : measure->doc_sel_focus;
+   size_t total_len=0;
+   uint32_t last_blk=UINT32_MAX;
+   for(uint32_t r=lo;r<=hi && r<measure->count;++r) {
+    const uint32_t bi=measure->rows[r].block;
+    if(bi==last_blk || bi>=doc->block_count)continue;
+    last_blk=bi;
+    const auto& blk=doc->blocks[bi];
+    if(blk.kind==INLAY_CODE_BLOCK && custom_fence_estimate(view,doc,blk,std::fmax(1.f,row_width-2*view.block_padding_px))>0.f)continue;
+    if(total_len>0)total_len+=2;
+    total_len+=blk.content_length;
+   }
+   if(total_len>0) {
+    char* copy=static_cast<char*>(etch_frame_arena_alloc(doc->context,total_len+1,1));
+    if(copy) {
+     size_t wp=0;
+     last_blk=UINT32_MAX;
+     for(uint32_t r=lo;r<=hi && r<measure->count;++r) {
+      const uint32_t bi=measure->rows[r].block;
+      if(bi==last_blk || bi>=doc->block_count)continue;
+      last_blk=bi;
+      const auto& blk=doc->blocks[bi];
+      if(blk.kind==INLAY_CODE_BLOCK && custom_fence_estimate(view,doc,blk,std::fmax(1.f,row_width-2*view.block_padding_px))>0.f)continue;
+      if(wp>0){copy[wp++]='\n';copy[wp++]='\n';}
+      std::memcpy(copy+wp,source.chars+blk.content_offset,blk.content_length);
+      wp+=blk.content_length;
+     }
+     copy[wp]=0;
+     etch_set_clipboard_text(copy);
+    }
+   }
+  }
+ }
  result.measured_height_px=previous_height>0 ? previous_height : float(measure->total_height);
  if(pending_toggle.triggered && pending_toggle.source_offset<doc->source_size) {
   doc->source[pending_toggle.source_offset]=pending_toggle.checked ? 'x' : ' ';

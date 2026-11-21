@@ -38,7 +38,10 @@ struct InlayMeasure {
  uint32_t count,capacity,frozen_count;
  InlayDetails* details;
  bool* open;
+ bool* code_wrap;
  uint32_t open_capacity;
+ bool doc_sel_active,doc_sel_dragging;
+ uint32_t doc_sel_anchor,doc_sel_focus,doc_sel_drag_active_id,doc_sel_last_active;
  InlayInline* tokens;
  uint32_t token_count,token_capacity,parsed_tail;
 };

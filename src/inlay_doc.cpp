@@ -154,8 +154,8 @@ InlayDoc* inlay_doc_create(EtchContext* context,const InlayDocConfig* config) {
  d->source=static_cast<char*>(std::malloc(d->source_capacity));d->blocks=static_cast<InlayBlock*>(std::malloc(size_t(d->block_capacity)*sizeof(InlayBlock)));
  if(!d->source || !d->blocks) {inlay_doc_destroy(d);return nullptr;}return d;
 }
-void inlay_doc_destroy(InlayDoc* d) {if(d) {for(auto& view:d->views) {std::free(view.rows);std::free(view.heights);std::free(view.open);std::free(view.details);std::free(view.tokens);}std::free(d->source);std::free(d->blocks);std::free(d);}}
-void inlay_doc_clear(InlayDoc* d) {if(d) {d->source_size=0;d->block_count=0;d->frozen_count=0;d->tail_start=0;d->utf8_carry_len=0;for(auto& view:d->views)view.width=0;++d->revision;etch_request_redraw(d->context);}}
+void inlay_doc_destroy(InlayDoc* d) {if(d) {for(auto& view:d->views) {std::free(view.rows);std::free(view.heights);std::free(view.open);std::free(view.code_wrap);std::free(view.details);std::free(view.tokens);}std::free(d->source);std::free(d->blocks);std::free(d);}}
+void inlay_doc_clear(InlayDoc* d) {if(d) {d->source_size=0;d->block_count=0;d->frozen_count=0;d->tail_start=0;d->utf8_carry_len=0;for(auto& view:d->views){view.width=0;view.doc_sel_active=false;view.doc_sel_dragging=false;}++d->revision;etch_request_redraw(d->context);}}
 bool inlay_doc_append_utf8(InlayDoc* d,EtchStr chunk) {
  if(!d || (!chunk.chars && chunk.length) || chunk.length>max_bytes-d->source_size-d->utf8_carry_len)return false;
  const uintptr_t ptr=reinterpret_cast<uintptr_t>(chunk.chars),base=reinterpret_cast<uintptr_t>(d->source);
