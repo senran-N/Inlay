@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.11.0] - 2026-11-22
+
+- Require Etch 0.25 and upgrade the public C99 ABI (`include/inlay/inlay_c.h`) with
+  `INLAY_ABI_VERSION`, `INLAY_API` export macros, `inlay_abi_version()`, and versioned
+  `uint32_t struct_size` descriptors across all public C input structs.
+- Vendor `third_party/md4c` (v0.6.0 MIT) to power a full CommonMark + GFM nested AST
+  (nested lists, blockquotes/GitHub alerts, tables/code inside containers, reference
+  links, autolinks, display math, `<details>`, footnotes, and custom/Mermaid fences)
+  with O(1) amortized incremental prefix freezing and byte-by-byte streaming equivalence.
+- Add unified character-level cross-block document selection and copy
+  (`InlayDocSelection`, `inlay_doc_view_selection`, `inlay_doc_view_set_selection`,
+  `inlay_doc_view_select_all`, `inlay_doc_view_clear_selection`,
+  `inlay_doc_view_copy_plain_text`, `inlay_doc_view_copy_markdown`, mouse drag across
+  blocks, `Ctrl+A`, `Ctrl+C`, and `Escape`).
+- Upgrade the Windows WebView2 portal backend with dynamic `dcomp.dll`
+  DirectComposition (`ICoreWebView2CompositionController`, DPI-scaled rounded-corner
+  and partial viewport clipping, and `SendMouseInput` forwarding) with graceful
+  automatic fallback to classic `ICoreWebView2Controller`.
+
 ## [0.10.1] - 2026-11-20
 
 - Require Etch 0.24 so downstream `find_package(Inlay 0.10)` consumers adopt Etch 0.24 native file/folder dialogs and configurable desktop drawers cleanly.
