@@ -188,7 +188,8 @@ int main(int argc, char **argv) {
   visibility_api.set_underlay_bounds = record_bounds;
   d.backend = &visibility_api;
   p = inlay_portal_create(ctx, &d);
-  for (int hidden = 0; hidden < 2; ++hidden) {
+  for (int step = 0; step < 3; ++step) {
+    const bool hidden = (step == 1);
     etch_begin_frame(ctx, &fd);
     auto parent = etch_box_desc_default();
     parent.width = etch_sizing_fixed(400);
@@ -208,6 +209,19 @@ int main(int argc, char **argv) {
     if (!hidden) {
       const auto bounds = etch_element_bounds(flow.id);
       ok &= bounds.h > 0 && native_visible.y >= bounds.y + bounds.h;
+      const EtchVec2 center = {native_visible.x + native_visible.w * .5f,
+                               native_visible.y + native_visible.h * .5f};
+      // Step 2 verifies hiding in step 1 did NOT permanently clobber host input policy!
+      ok &= inlay_portal_inject_pointer(p, center, true) && inlay_portal_has_focus(p);
+      inlay_portal_inject_pointer(p, center, false);
+      if (step == 2) {
+        // Explicit host disable stays disabled even while geometrically visible.
+        inlay_portal_set_input_enabled(p, false);
+        ok &= !inlay_portal_inject_pointer(p, center, true) && !inlay_portal_has_focus(p);
+        inlay_portal_inject_pointer(p, center, false);
+      }
+    } else {
+      ok &= !inlay_portal_has_focus(p);
     }
     inlay_portal_frame_submitted(p);
   }

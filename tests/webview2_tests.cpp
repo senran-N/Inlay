@@ -54,6 +54,7 @@ int main(int argc, char **argv) {
     std::printf("Default loader: started=%d called=%d HRESULT=0x%08lx\n",
                 backend != nullptr, state.called, static_cast<unsigned long>(state.result));
   if (backend) {
+    api->set_underlay_bounds(backend, {0, 0, 640, 480}, {0, 40, 640, 400});
     api->set_underlay_bounds(backend, {0, 0, 640, 480}, {0, 0, 640, 480});
     api->destroy(backend);
   }

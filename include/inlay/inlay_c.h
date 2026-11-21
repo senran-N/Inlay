@@ -153,6 +153,8 @@ bool inlay_surface_dispatch(InlaySurface*,EtchStr name,EtchStr payload_json);
 bool inlay_surface_enable_hmr(InlaySurface*,const char* script_path);
 bool inlay_surface_poll_hmr(InlaySurface*);
 void inlay_surface_view(InlaySurface*,const InlaySurfaceViewDesc*);
+/* Milliseconds until the next scheduled JS timer expires, 0 if due now, or -1 if none. */
+int32_t inlay_surface_next_timer_ms(const InlaySurface*);
 InlaySurfaceStats inlay_surface_stats(const InlaySurface*);
 EtchStr inlay_surface_error(const InlaySurface*);
 /* Native nodes/text survive until the next script/state/event evaluation. */

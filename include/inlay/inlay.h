@@ -68,4 +68,7 @@ inline bool doc_view_is_at_bottom(uint32_t view_id) noexcept {
 inline void doc_view_scroll_to_bottom(uint32_t view_id,bool stop_momentum=true) noexcept {
  inlay_doc_view_scroll_to_bottom(view_id,stop_momentum);
 }
+inline int32_t surface_next_timer_ms(const Surface* s) noexcept {
+ return inlay_surface_next_timer_ms(s);
+}
 }

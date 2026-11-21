@@ -8,6 +8,7 @@
 #include <objbase.h>
 #include <WebView2.h>
 // clang-format on
+#include <cmath>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
@@ -24,8 +25,10 @@ struct ControllerHandler {
 struct WebPortal {
   EnvironmentHandler environment_handler;
   ControllerHandler controller_handler;
-  ULONG references;
+  volatile LONG references;
+  DWORD com_thread;
   HWND parent;
+  HWND child_hwnd;
   HMODULE loader;
   ICoreWebView2Controller *controller;
   ICoreWebView2 *web;
@@ -34,19 +37,70 @@ struct WebPortal {
   void (*completed)(void *, int32_t);
   void *user;
   RECT bounds;
-  bool visible;
+  RECT clip_rect;
+  bool visible, clipped, has_rgn;
 };
-ULONG retain(WebPortal *p) { return ++p->references; }
+ULONG retain(WebPortal *p) {
+  return static_cast<ULONG>(InterlockedIncrement(&p->references));
+}
 ULONG release(WebPortal *p) {
-  const ULONG n = --p->references;
+  const ULONG n = static_cast<ULONG>(InterlockedDecrement(&p->references));
   if (!n) {
     std::free(p->navigation);
     FreeLibrary(p->loader);
-    if (p->com_initialized)
+    if (p->com_initialized && GetCurrentThreadId() == p->com_thread)
       CoUninitialize();
     std::free(p);
   }
   return n;
+}
+HWND find_webview_child(WebPortal *p) {
+  if (p->child_hwnd && IsWindow(p->child_hwnd) && GetParent(p->child_hwnd) == p->parent)
+    return p->child_hwnd;
+  HWND first = nullptr;
+  int count = 0;
+  for (HWND child = GetWindow(p->parent, GW_CHILD); child;
+       child = GetWindow(child, GW_HWNDNEXT)) {
+    ++count;
+    if (!first)
+      first = child;
+    RECT wr = {};
+    if (GetWindowRect(child, &wr)) {
+      MapWindowPoints(nullptr, p->parent, reinterpret_cast<POINT *>(&wr), 2);
+      if (wr.left == p->bounds.left && wr.top == p->bounds.top &&
+          wr.right == p->bounds.right && wr.bottom == p->bounds.bottom) {
+        p->child_hwnd = child;
+        return child;
+      }
+    }
+  }
+  if (count == 1)
+    p->child_hwnd = first;
+  return p->child_hwnd;
+}
+void apply_bounds(WebPortal *p) {
+  if (!p->controller)
+    return;
+  p->controller->lpVtbl->put_Bounds(p->controller, p->bounds);
+  p->controller->lpVtbl->put_IsVisible(p->controller, p->visible);
+  HWND child = find_webview_child(p);
+  if (!child)
+    return;
+  if (p->visible && p->clipped) {
+    HRGN rgn = CreateRectRgn(p->clip_rect.left - p->bounds.left,
+                             p->clip_rect.top - p->bounds.top,
+                             p->clip_rect.right - p->bounds.left,
+                             p->clip_rect.bottom - p->bounds.top);
+    if (rgn) {
+      if (SetWindowRgn(child, rgn, TRUE))
+        p->has_rgn = true;
+      else
+        DeleteObject(rgn);
+    }
+  } else if (p->has_rgn) {
+    SetWindowRgn(child, nullptr, TRUE);
+    p->has_rgn = false;
+  }
 }
 wchar_t *wide(const char *bytes, uint32_t length) {
   const int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, bytes,
@@ -128,8 +182,7 @@ controller_ready(ICoreWebView2CreateCoreWebView2ControllerCompletedHandler *h,
   p->controller = controller;
   controller->lpVtbl->AddRef(controller);
   controller->lpVtbl->get_CoreWebView2(controller, &p->web);
-  controller->lpVtbl->put_Bounds(controller, p->bounds);
-  controller->lpVtbl->put_IsVisible(controller, p->visible);
+  apply_bounds(p);
   if (p->web)
     navigate(p);
   if (p->completed)
@@ -216,6 +269,7 @@ void *create(void *user, uint32_t w, uint32_t h) {
     return nullptr;
   }
   p->com_initialized = true;
+  p->com_thread = GetCurrentThreadId();
   p->parent = static_cast<HWND>(options->underlay_hwnd);
   p->bounds = {0, 0, static_cast<LONG>(w), static_cast<LONG>(h)};
   p->environment_handler = {{&environment_vtable}, p};
@@ -236,9 +290,12 @@ void destroy(void *backend) {
   if (p->controller) {
     p->controller->lpVtbl->Close(p->controller);
     p->controller->lpVtbl->Release(p->controller);
+    p->controller = nullptr;
   }
-  if (p->web)
+  if (p->web) {
     p->web->lpVtbl->Release(p->web);
+    p->web = nullptr;
+  }
   release(p);
 }
 bool load(WebPortal *p, EtchStr text, bool html) {
@@ -263,21 +320,24 @@ uint32_t poll(void *, InlayPortalDirtyRect *, uint32_t) { return 0; }
 void ack(void *, bool) {}
 void bounds(void *b, EtchRect rect, EtchRect clip) {
   auto *p = static_cast<WebPortal *>(b);
-  // A child-HWND browser cannot reproduce partial/rounded Etch clipping. Hide
-  // it when partially clipped; hosts use the texture backend for transformed
-  // views.
-  p->visible = clip.w > 0 && clip.h > 0 && clip.x <= rect.x &&
-               clip.y <= rect.y && clip.x + clip.w >= rect.x + rect.w &&
-               clip.y + clip.h >= rect.y + rect.h;
   const float scale = static_cast<float>(GetDpiForWindow(p->parent)) / 96.f;
-  p->bounds = {static_cast<LONG>(rect.x * scale),
-               static_cast<LONG>(rect.y * scale),
-               static_cast<LONG>((rect.x + rect.w) * scale),
-               static_cast<LONG>((rect.y + rect.h) * scale)};
-  if (p->controller) {
-    p->controller->lpVtbl->put_Bounds(p->controller, p->bounds);
-    p->controller->lpVtbl->put_IsVisible(p->controller, p->visible);
-  }
+  const LONG bl = static_cast<LONG>(std::lround(rect.x * scale));
+  const LONG bt = static_cast<LONG>(std::lround(rect.y * scale));
+  const LONG br = static_cast<LONG>(std::lround((rect.x + rect.w) * scale));
+  const LONG bb = static_cast<LONG>(std::lround((rect.y + rect.h) * scale));
+  const float ix0 = rect.x > clip.x ? rect.x : clip.x;
+  const float iy0 = rect.y > clip.y ? rect.y : clip.y;
+  const float ix1 = (rect.x + rect.w) < (clip.x + clip.w) ? (rect.x + rect.w) : (clip.x + clip.w);
+  const float iy1 = (rect.y + rect.h) < (clip.y + clip.h) ? (rect.y + rect.h) : (clip.y + clip.h);
+  const LONG vl = static_cast<LONG>(std::lround(ix0 * scale));
+  const LONG vt = static_cast<LONG>(std::lround(iy0 * scale));
+  const LONG vr = static_cast<LONG>(std::lround(ix1 * scale));
+  const LONG vb = static_cast<LONG>(std::lround(iy1 * scale));
+  p->bounds = {bl, bt, br, bb};
+  p->clip_rect = {vl, vt, vr, vb};
+  p->visible = clip.w > 0 && clip.h > 0 && vr > vl && vb > vt;
+  p->clipped = p->visible && (vl > bl || vt > bt || vr < br || vb < bb);
+  apply_bounds(p);
 }
 const InlayPortalBackendVTable api = {
     create,  destroy, load_url, load_html, resize, poll, nullptr,

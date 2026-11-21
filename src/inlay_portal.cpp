@@ -14,7 +14,7 @@ struct InlayPortal {
   EtchElementGeometry geometry;
   bool has_geometry;
   bool pending_draw;
-  bool input_enabled, focused, captured, pointer_down;
+  bool host_input_enabled, geom_visible, focused, captured, pointer_down;
   InlayPortalStats stats;
 };
 namespace {
@@ -161,6 +161,15 @@ const InlayPortalBackendVTable mock_api = {
 bool valid_size(uint32_t w, uint32_t h) noexcept {
   return w >= 1 && h >= 1 && w <= 8192 && h <= 8192;
 }
+void cancel_portal_input(InlayPortal *p) noexcept {
+  if (p->captured && p->api.inject_pointer)
+    p->api.inject_pointer(p->backend, {-1, -1}, false);
+  p->captured = false;
+  p->focused = false;
+}
+bool portal_accepts_input(const InlayPortal *p) noexcept {
+  return p && p->has_geometry && p->host_input_enabled && p->geom_visible;
+}
 EtchLoadedTexture blank_texture(EtchContext *ctx, uint32_t w,
                                 uint32_t h) noexcept {
   void *pixels = std::calloc(size_t(w) * h, 4);
@@ -198,7 +207,7 @@ InlayPortal *inlay_portal_create(EtchContext *ctx,
   if (!p)
     return nullptr;
   p->context = ctx;
-  p->input_enabled = true;
+  p->host_input_enabled = true;
   p->api = *api;
   p->width = d.width;
   p->height = d.height;
@@ -258,9 +267,8 @@ bool inlay_portal_resize(InlayPortal *p, uint32_t w, uint32_t h) {
   p->width = w;
   p->height = h;
   p->has_geometry = false;
-  const bool enabled = p->input_enabled;
-  inlay_portal_set_input_enabled(p, false);
-  p->input_enabled = enabled;
+  p->geom_visible = false;
+  cancel_portal_input(p);
   return true;
 }
 bool inlay_portal_poll(InlayPortal *p) {
@@ -334,14 +342,14 @@ bool inlay_portal_sync_geometry(InlayPortal *p) {
   if (!p || etch_current_context() != p->context)
     return false;
   p->has_geometry = etch_element_geometry(p->id, &p->geometry);
-  if (!p->has_geometry || p->geometry.visible_bounds.w <= 0 ||
-      p->geometry.visible_bounds.h <= 0 || p->geometry.opacity <= 0)
-    inlay_portal_set_input_enabled(p, false);
+  p->geom_visible = p->has_geometry && p->geometry.visible_bounds.w > 0 &&
+                    p->geometry.visible_bounds.h > 0 && p->geometry.opacity > 0;
+  if (!p->geom_visible)
+    cancel_portal_input(p);
   if (p->api.set_underlay_bounds)
     p->api.set_underlay_bounds(
         p->backend, p->has_geometry ? p->geometry.bounds : EtchRect{},
-        p->has_geometry && p->geometry.opacity > 0
-            ? p->geometry.visible_bounds : EtchRect{});
+        p->geom_visible ? p->geometry.visible_bounds : EtchRect{});
   return p->has_geometry;
 }
 bool inlay_portal_inject_pointer(InlayPortal *p, EtchVec2 screen, bool down) {
@@ -350,7 +358,7 @@ bool inlay_portal_inject_pointer(InlayPortal *p, EtchVec2 screen, bool down) {
     return false;
   const bool pressed = down && !p->pointer_down;
   p->pointer_down = down;
-  if (!p->has_geometry || !p->input_enabled)
+  if (!portal_accepts_input(p))
     return false;
   const auto &g = p->geometry;
   if (g.local_scale.x <= 0 || g.local_scale.y <= 0)
@@ -385,22 +393,21 @@ bool inlay_portal_inject_pointer(InlayPortal *p, EtchVec2 screen, bool down) {
   return true;
 }
 void inlay_portal_inject_wheel(InlayPortal *p, EtchVec2 delta) {
-  if (p && p->input_enabled && p->focused && p->api.inject_wheel &&
+  if (portal_accepts_input(p) && p->focused && p->api.inject_wheel &&
       std::isfinite(delta.x) && std::isfinite(delta.y))
     p->api.inject_wheel(p->backend, delta);
 }
 void inlay_portal_inject_key(InlayPortal *p, uint32_t key, bool down,
                              uint16_t mods) {
-  if (p && p->input_enabled && p->focused && p->api.inject_key)
+  if (portal_accepts_input(p) && p->focused && p->api.inject_key)
     p->api.inject_key(p->backend, key, down, mods);
 }
 void inlay_portal_inject_text(InlayPortal *p, EtchStr text) {
-  if (p && p->input_enabled && p->focused && text.chars && p->api.inject_text)
+  if (portal_accepts_input(p) && p->focused && text.chars && p->api.inject_text)
     p->api.inject_text(p->backend, text);
 }
 bool inlay_portal_query_ime_rect(InlayPortal *p, EtchRect *out) {
-  if (!p || !out || !p->has_geometry || !p->focused || !p->input_enabled ||
-      !p->api.query_ime_rect)
+  if (!out || !portal_accepts_input(p) || !p->focused || !p->api.query_ime_rect)
     return false;
   EtchRect r;
   if (!p->api.query_ime_rect(p->backend, &r))
@@ -419,18 +426,14 @@ InlayPortalStats inlay_portal_stats(const InlayPortal *p) {
   return s;
 }
 bool inlay_portal_has_focus(const InlayPortal *p) {
-  return p && p->input_enabled && p->focused;
+  return portal_accepts_input(p) && p->focused;
 }
 void inlay_portal_set_input_enabled(InlayPortal *p, bool enabled) {
   if (!p)
     return;
-  if (!enabled) {
-    if (p->captured && p->api.inject_pointer)
-      p->api.inject_pointer(p->backend, {-1, -1}, false);
-    p->captured = false;
-    p->focused = false;
-  }
-  p->input_enabled = enabled;
+  if (!enabled)
+    cancel_portal_input(p);
+  p->host_input_enabled = enabled;
 }
 bool inlay_portal_mock_advance(InlayPortal *p, uint32_t phase) {
   if (!p || p->api.create != mock_create)

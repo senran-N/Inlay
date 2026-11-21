@@ -46,7 +46,7 @@ int main() {
  auto cpp_view=inlay::doc_view_desc_default();
  cpp_view.id=etch::id("cpp-zero-cast");cpp_view.width_px=240;cpp_view.height_px=0;
  cpp_view.style=&style;
- ok &= cpp_doc && cpp_surf && cpp_portal &&
+ ok &= cpp_doc && cpp_surf && cpp_portal && inlay::surface_next_timer_ms(cpp_surf)==-1 &&
        inlay_doc_set_utf8(cpp_doc,ETCH_STR_LIT("Zero-cast ==C++20== wrapper"));
  if(ok) {
   inlay::doc_view_scroll_to_bottom(cpp_view.id,true);

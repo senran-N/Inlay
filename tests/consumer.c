@@ -30,7 +30,7 @@ int main(void) {
  EtchContext* ctx=etch_create_context(&c);if(!ctx)return 1;
  InlayDoc* doc=inlay_doc_create(ctx,NULL);if(!doc)return 1;
  const InlaySurfaceDesc surface=inlay_surface_desc_default();
- if(surface.max_tick_ms<=0 || inlay_surface_stats(NULL).js_ticks || inlay_surface_set_script(NULL,ETCH_STR_LIT("")))return 1;
+ if(surface.max_tick_ms<=0 || inlay_surface_stats(NULL).js_ticks || inlay_surface_next_timer_ms(NULL)!=-1 || inlay_surface_set_script(NULL,ETCH_STR_LIT("")))return 1;
  InlaySurface* scripted=inlay_surface_create(ctx,NULL);
  if(scripted){
   if(!inlay_surface_set_state_json(scripted,ETCH_STR_LIT("{\"value\":3}")) || !inlay_surface_set_script(scripted,ETCH_STR_LIT("function render(s){return ui.scroll({},ui.input({value:String(s.value)}),ui.toggle({label:'Live',checked:true}),ui.progress({value:0.5}),ui.slider({value:0.2,min:0,max:1}),ui.badge('v0.9'),ui.divider({}),ui.image({alt:'pic'}));}")))return 1;

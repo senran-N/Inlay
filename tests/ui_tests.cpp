@@ -294,6 +294,124 @@ bool expanded_surface_primitives(EtchContext *ctx, const InlaySurfaceDesc &desc)
     inlay_surface_destroy(surface);
     return ok;
 }
+bool i2_reactive_reconciler_upgrades(EtchContext *ctx, const InlaySurfaceDesc &desc) {
+    auto *s = inlay_surface_create(ctx, &desc);
+    if (!s)
+        return false;
+    bool ok = check(inlay_surface_next_timer_ms(nullptr) == -1 && inlay_surface_next_timer_ms(s) == -1,
+                    "no timers returns -1");
+    auto frame = etch_frame_desc_default();
+    frame.viewport_w = 400;
+    frame.viewport_h = 300;
+    const InlaySurfaceViewDesc view = {etch_id("i2-reconciler"), 360, 260};
+    const auto step = [&] {
+        etch_begin_frame(ctx, &frame);
+        inlay_surface_view(s, &view);
+        etch_end_frame(ctx);
+    };
+
+    // 1. Zero-idle timer deadline: 5000ms timer reports remaining ms without spinning redraws.
+    ok &= check(inlay_surface_set_script(s, ETCH_STR_LIT(
+        "setTimeout(()=>{state.fired=true},5000);"
+        "function render(){return ui.text('wait');}")),
+        "future timer script");
+    for (int i = 0; i < 6; ++i)
+        step();
+    const int32_t next_ms = inlay_surface_next_timer_ms(s);
+    ok &= check(next_ms > 1000 && next_ms <= 5000, "next_timer_ms reports future deadline");
+    ok &= check(!etch_needs_redraw(ctx), "future timer settles idle without busy-spin");
+
+    // 2. Sibling-scoped & keyed node ID stability across conditional mount/unmount and list prepend.
+    ok &= check(inlay_surface_set_script(s, ETCH_STR_LIT(
+        "function render(st){"
+        "const items=st.prepend?['z','a','b']:['a','b'];"
+        "return ui.box({axis:'column'},"
+        "  st.banner?ui.text('Banner'):null,"
+        "  ui.input({value:st.q||'',onChange:v=>{st.q=v}}),"
+        "  ...items.map(k=>ui.text({key:k,text:k})));}"
+        "function onEvent(n,v,st){if(n==='banner')st.banner=v;if(n==='prepend')st.prepend=v;}")),
+        "keyed/sibling script");
+    uint32_t cnt = 0;
+    const auto *n0 = inlay_surface_nodes(s, &cnt);
+    ok &= check(cnt == 4 && n0[1].kind == INLAY_UI_INPUT, "initial sibling/keyed count");
+    const uint32_t input_id_before = cnt >= 4 ? n0[1].id : 0u;
+    const uint32_t key_a_before = cnt >= 4 ? n0[2].id : 0u;
+    const uint32_t root_eid = etch_id_index(view.id, n0[0].id);
+    const uint32_t inp_eid = etch_id_index(root_eid, input_id_before);
+    step();
+    ok &= check(etch_perform_a11y_action(inp_eid, ETCH_A11Y_ACT_FOCUS, 0, {}, ctx, nullptr),
+                "focus sibling input");
+    step();
+    ok &= check(inlay_surface_dispatch(s, ETCH_STR_LIT("banner"), ETCH_STR_LIT("true")),
+                "mount conditional sibling before input");
+    ok &= check(inlay_surface_dispatch(s, ETCH_STR_LIT("prepend"), ETCH_STR_LIT("true")),
+                "prepend keyed item before 'a'");
+    const auto *n1 = inlay_surface_nodes(s, &cnt);
+    ok &= check(cnt == 6 && n1[2].kind == INLAY_UI_INPUT && n1[2].id == input_id_before,
+                "conditional mount keeps input node ID invariant");
+    ok &= check(cnt == 6 && n1[4].id == key_a_before,
+                "keyed list prepend keeps 'a' node ID invariant");
+    step();
+    // Typing into the still-focused input exercises both focus preservation AND closure onChange!
+    SDL_Event ev = {};
+    ev.type = SDL_EVENT_TEXT_INPUT;
+    ev.text.text = "ok";
+    etch_process_event(ctx, &ev);
+    step();
+    const auto st_json = inlay_surface_state_json(s);
+    ok &= check(st_json.chars && std::strstr(st_json.chars, "\"q\":\"ok\"") != nullptr,
+                "focus preserved across conditional mount + closure onChange fires");
+
+    // 3. First-class JS closures + useState hook + event batching (2 widgets -> 1 JS tick).
+    ok &= check(inlay_surface_set_state_json(s, ETCH_STR_LIT("{}")), "clear state for hooks");
+    ok &= check(inlay_surface_set_script(s, ETCH_STR_LIT(
+        "function render(){"
+        "const [count,setCount]=useState(10);"
+        "const [on,setOn]=useState(false);"
+        "return ui.box({axis:'column'},"
+        "  ui.text('C='+count+','+(on?'Y':'N')),"
+        "  ui.button({text:'+1',onClick:()=>setCount(c=>c+1)}),"
+        "  ui.toggle({label:'Flag',checked:on,onChange:v=>setOn(v)}));}")),
+        "useState + closure script");
+    const auto *hn = inlay_surface_nodes(s, &cnt);
+    ok &= check(cnt == 4 && hn[1].text.length == 6 && !std::memcmp(hn[1].text.chars, "C=10,N", 6),
+                "useState initial render");
+    const uint32_t hroot = etch_id_index(view.id, hn[0].id);
+    const uint32_t hbtn = etch_id_index(hroot, hn[2].id);
+    const uint32_t htog = etch_id_index(hroot, hn[3].id);
+    step();
+    const uint64_t ticks_before_batch = inlay_surface_stats(s).js_ticks;
+    // Trigger BOTH button press and toggle press in the same frame!
+    ok &= check(etch_perform_a11y_action(hbtn, ETCH_A11Y_ACT_PRESS, 0, {}, ctx, nullptr),
+                "queue hook button press");
+    ok &= check(etch_perform_a11y_action(htog, ETCH_A11Y_ACT_PRESS, 0, {}, ctx, nullptr),
+                "queue hook toggle press");
+    step();
+    ok &= check(inlay_surface_stats(s).js_ticks == ticks_before_batch + 1,
+                "multiple widget events batch into 1 JS tick");
+    hn = inlay_surface_nodes(s, &cnt);
+    ok &= check(cnt == 4 && hn[1].text.length == 6 && !std::memcmp(hn[1].text.chars, "C=11,Y", 6),
+                "useState closures updated both states");
+    const auto clean_state = inlay_surface_state_json(s);
+    ok &= check(clean_state.length == 2 && !std::memcmp(clean_state.chars, "{}", 2),
+                "useState does not pollute state JSON");
+
+    // 4. Lazy state JSON serialization: 3 dispatches do NOT invoke toJSON until state_json() is read.
+    ok &= check(inlay_surface_set_script(s, ETCH_STR_LIT(
+        "let ser=0;state.n=0;state.toJSON=()=>{ser++;return {n:state.n,ser};};"
+        "function render(st){return ui.text(String(st.n));}"
+        "function onEvent(name,v,st){if(name==='inc')st.n++;}")),
+        "lazy state serialization script");
+    for (int i = 0; i < 3; ++i)
+        ok &= inlay_surface_dispatch(s, ETCH_STR_LIT("inc"), ETCH_STR_LIT("null"));
+    const auto lazy_json = inlay_surface_state_json(s);
+    ok &= check(lazy_json.chars && std::strstr(lazy_json.chars, "\"n\":3") != nullptr &&
+                    std::strstr(lazy_json.chars, "\"ser\":2") != nullptr,
+                "state JSON serialized lazily on read, not per dispatch tick");
+
+    inlay_surface_destroy(s);
+    return ok;
+}
 } // namespace
 int main(int argc, char **argv) {
     auto config = etch_context_desc_default();
@@ -312,6 +430,7 @@ int main(int argc, char **argv) {
     bool ok = reactive_controls(context, functional_desc);
     ok &= styled_surface_controls(context, functional_desc);
     ok &= expanded_surface_primitives(context, functional_desc);
+    ok &= i2_reactive_reconciler_upgrades(context, functional_desc);
     const auto script = ETCH_STR_LIT(
         "function render(s){return "
         "h('box',{axis:'column',gap:8,padding:12,bg:'var(--etch-bg-elevated)',radius:'panel',"
