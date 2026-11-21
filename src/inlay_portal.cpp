@@ -361,10 +361,10 @@ INLAY_API bool inlay_portal_inject_pointer(InlayPortal *p, EtchVec2 screen, bool
   if (!p || !p->api.inject_pointer || !std::isfinite(screen.x) ||
       !std::isfinite(screen.y))
     return false;
-  const bool pressed = down && !p->pointer_down;
-  p->pointer_down = down;
   if (!portal_accepts_input(p))
     return false;
+  const bool pressed = down && !p->pointer_down;
+  p->pointer_down = down;
   const auto &g = p->geometry;
   if (g.local_scale.x <= 0 || g.local_scale.y <= 0)
     return false;
