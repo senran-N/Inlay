@@ -111,6 +111,11 @@ INLAY_API InlayDiagramDesc inlay_diagram_desc_default(void) {
  d.rank_gap_px = 48.f;
  d.viewport_width_px = 640.f;
  d.viewport_height_px = 400.f;
+ d.max_width_px = 0.f;
+ d.min_scale = 0.f;
+ d.has_custom_fonts = false;
+ d.font_id = ETCH_FONT_SANS;
+ d.bold_font_id = ETCH_FONT_SEMIBOLD;
  return d;
 }
 

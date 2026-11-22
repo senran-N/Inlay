@@ -424,14 +424,18 @@ bool theme_pixels(const char* dark_png,const char* light_png) {
   etch_pop_theme();etch_end_frame(ctx);
   ok &= graph.valid && etch_render_headless_png(ctx,520,360,paths[i],theme.bg_canvas);
   const auto row=etch_element_bounds(doc_row_id(doc,view.id,doc->views[0].rows[0]));
-  const auto native=etch_element_bounds(doc_row_id(doc,view.id,doc->views[0].rows[2]));
+  const uint32_t native_row_id=doc_row_id(doc,view.id,doc->views[0].rows[2]);
+  const auto native=etch_element_bounds(etch_id_index(native_row_id,7));
   const auto diagram=etch_element_bounds(box.id);
+  const EtchColor expected_alert_bg=etch_color_blend_over(
+   theme.bg_elevated,
+   EtchColor{theme.accent.r,theme.accent.g,theme.accent.b,uint8_t(std::round(0.09f*255.f))});
   auto* img=SDL_LoadPNG(paths[i]);
   if(img) {
-   ok &= sample_pixel(img,int(row.x+row.w-20),int(row.y+18),theme.bg_elevated,&panel_light[i]);
+   ok &= sample_pixel(img,int(row.x+row.w-20),int(row.y+18),expected_alert_bg,&panel_light[i]);
    ok &= sample_pixel(img,int(diagram.x+node.x+node.w-10),int(diagram.y+node.y+18),
                       theme.bg_elevated,&node_light[i]);
-   ok &= sample_pixel(img,int(native.x+22),int(native.y+30),theme.bg_elevated,&native_light[i]);
+   ok &= sample_pixel(img,int(native.x+22),int(native.y+18),theme.bg_elevated,&native_light[i]);
    SDL_DestroySurface(img);
   } else ok=false;
  }
@@ -1047,11 +1051,346 @@ bool phase4_md4c_selection_and_abi(EtchContext* ctx) {
  if(!ok)std::fprintf(stderr,"Phase 4 check FAILED: abi=%d ast=%d sel=%d\n",abi_ok,ast_ok,sel_ok);
  return ok;
 }
+
+bool upgrade_v011_regression(EtchContext* ctx,const char* autofit_png) {
+ bool ok=true;
+ auto f=etch_frame_desc_default();f.viewport_w=520;f.viewport_h=900;
+
+ // 1. Mermaid auto-fit, per-rank rank_gaps[], richer flowchart syntax (RL/BT, quoted labels, <br/>, ---/==>/<-->, directives)
+ bool mermaid_ok=true;
+ {
+  etch_begin_frame(ctx,&f);
+  const auto wide_lr=ETCH_STR_LIT(
+   "flowchart LR\n"
+   "classDef hot fill:#f96\n"
+   "direction LR\n"
+   "A[\"Input (raw)<br/>Stage 1\"] -->|very long descriptive edge label| B[Parse] ==> C[Validate]\n"
+   "C <--> D[Emit] --- E[Done]\n"
+   "class A hot\n"
+   "style B stroke:#333\n"
+   "linkStyle 0 stroke-width:2px\n");
+  auto dd_nat=inlay_diagram_desc_default();
+  const auto nat=inlay_diagram_layout(wide_lr,&dd_nat);
+  mermaid_ok &= nat.valid && nat.horizontal && nat.node_count==5 && nat.edge_count==4 &&
+                nat.scale==1.0f && nat.natural_width==nat.width && nat.natural_width>480.f;
+  if(nat.valid && nat.node_count==5) {
+   // Multiline <br/> node A is taller than single-line node B.
+   mermaid_ok &= nat.nodes[0].bounds.h > nat.nodes[1].bounds.h + 8.f;
+   // Per-rank gap: A->B gap (with long label) must be significantly wider than B->C and C->D gaps!
+   const float gap01=nat.nodes[1].bounds.x - (nat.nodes[0].bounds.x + nat.nodes[0].bounds.w);
+   const float gap12=nat.nodes[2].bounds.x - (nat.nodes[1].bounds.x + nat.nodes[1].bounds.w);
+   const float gap23=nat.nodes[3].bounds.x - (nat.nodes[2].bounds.x + nat.nodes[2].bounds.w);
+   mermaid_ok &= gap01 > gap12 + 30.f && std::fabs(gap12 - gap23) < 2.f;
+  }
+  // Native auto-fit to max_width_px = 420 (should scale < 1.0f and fit strictly <= 420)
+  auto dd_fit=inlay_diagram_desc_default();
+  dd_fit.max_width_px=420.f;
+  dd_fit.min_scale=0.5f;
+  const auto fit=inlay_diagram_layout(wide_lr,&dd_fit);
+  mermaid_ok &= fit.valid && fit.scale<1.0f && fit.scale>=0.5f &&
+                fit.natural_width>420.f && fit.width<=420.1f;
+
+  // RL and BT directions
+  const auto rl=inlay_diagram_layout(ETCH_STR_LIT("flowchart RL\nA[Start] --> B[End]"),&dd_nat);
+  const auto bt=inlay_diagram_layout(ETCH_STR_LIT("flowchart BT\nA[Bottom] --> B[Top]"),&dd_nat);
+  mermaid_ok &= rl.valid && rl.horizontal && rl.node_count==2 && rl.nodes[0].bounds.x > rl.nodes[1].bounds.x;
+  mermaid_ok &= bt.valid && !bt.horizontal && bt.node_count==2 && bt.nodes[0].bounds.y > bt.nodes[1].bounds.y;
+  etch_end_frame(ctx);
+
+  // Mermaid in inlay_doc_view: streaming placeholder, exact first-frame height (no 200px jump), Fit/100% toggle,
+  // diagram_header_fn, Copy->"Copied", and headless PNG zero-clipping check.
+  auto* mdoc=inlay_doc_create(ctx,nullptr);
+  mermaid_ok &= mdoc!=nullptr;
+  if(mdoc) {
+   // Streaming incomplete Mermaid renders cleanly as placeholder (no crash, no layout error).
+   mermaid_ok &= inlay_doc_set_utf8(mdoc,ETCH_STR_LIT("```mermaid\nflowchart LR\nA[Stream] --> B["));
+   uint32_t diag_hdr_calls=0;
+   auto mv=inlay_doc_view_desc_default();
+   mv.id=etch_id("v011-mermaid");mv.width_px=440;mv.height_px=0;
+   mv.diagram_header_user_data=&diag_hdr_calls;
+   mv.diagram_header_fn=[](uint32_t,uint32_t row_id,EtchStr lang,EtchStr,void* user) {
+    if(str_equal(lang,ETCH_STR_LIT("mermaid")))++(*static_cast<uint32_t*>(user));
+    auto b=etch_box_desc_default();
+    b.id=etch_id_index(row_id,888);b.width=etch_sizing_fixed(18);b.height=etch_sizing_fixed(16);
+    etch_box(&b);
+   };
+   etch_begin_frame(ctx,&f);inlay_doc_view(mdoc,&mv);etch_end_frame(ctx);
+   mermaid_ok &= contains_label(ctx,ETCH_STR_LIT("Mermaid..."));
+
+   // Complete wide flowchart LR: first frame measures exact height (not 200px!), fits <= inner_w, shows "100%" toggle!
+   mermaid_ok &= inlay_doc_set_utf8(mdoc,ETCH_STR_LIT(
+    "```mermaid\nflowchart LR\nA[Alpha Node] --> B[Beta Node] --> C[Gamma Node] --> D[Delta Node]\n```\n"));
+   etch_begin_frame(ctx,&f);
+   const auto mres1=inlay_doc_view(mdoc,&mv);
+   etch_end_frame(ctx);
+   const auto& mvm=mdoc->views[0];
+   const uint32_t mrow_id=doc_row_id(mdoc,mv.id,mvm.rows[0]);
+   const auto dbox_fit=etch_element_bounds(etch_id_index(mrow_id,7));
+   mermaid_ok &= mres1.total_rows==1 && mvm.heights[0]>0.f && std::fabs(mvm.heights[0]-200.f)>10.f &&
+                 diag_hdr_calls>0 && contains_label(ctx,ETCH_STR_LIT("Mermaid")) &&
+                 contains_label(ctx,ETCH_STR_LIT("100%")) && contains_label(ctx,ETCH_STR_LIT("Copy")) &&
+                 dbox_fit.w>0.f && dbox_fit.w<=mv.width_px-2.f*12.f+1.f;
+   if(autofit_png) {
+    // Render headless PNG and verify rightmost fitted node pixels are visibly drawn inside the box (zero clipping).
+    const EtchTheme thm=etch_get_theme(ctx);
+    mermaid_ok &= etch_render_headless_png(ctx,520,900,autofit_png,thm.bg_canvas);
+    auto* img=SDL_LoadPNG(autofit_png);
+    if(img) {
+     uint32_t edge_ink=0;
+     const int rx0=int(dbox_fit.x+dbox_fit.w-30);
+     const int rx1=int(dbox_fit.x+dbox_fit.w-2);
+     const int ry0=int(dbox_fit.y+4);
+     const int ry1=int(dbox_fit.y+dbox_fit.h-4);
+     for(int y=ry0;y<ry1;++y)for(int x=rx0;x<rx1;++x) {
+      uint8_t r=0,g=0,b=0,a=0;
+      if(SDL_ReadSurfacePixel(img,x,y,&r,&g,&b,&a) &&
+         (std::abs(int(r)-thm.bg_elevated.r)>10 || std::abs(int(g)-thm.bg_elevated.g)>10 || std::abs(int(b)-thm.bg_elevated.b)>10))++edge_ink;
+     }
+     mermaid_ok &= edge_ink>15;
+     SDL_DestroySurface(img);
+    } else mermaid_ok=false;
+   }
+   // Click Copy -> "Copied", click 100% -> "Fit"
+   const uint32_t copy_id=etch_id_index(mrow_id,1);
+   const uint32_t fit_id=etch_id_index(mrow_id,4);
+   mermaid_ok &= etch_perform_a11y_action(copy_id,ETCH_A11Y_ACT_PRESS,0,{},ctx,nullptr);
+   etch_begin_frame(ctx,&f);inlay_doc_view(mdoc,&mv);etch_end_frame(ctx);
+   etch_begin_frame(ctx,&f);inlay_doc_view(mdoc,&mv);etch_end_frame(ctx);
+   mermaid_ok &= contains_label(ctx,ETCH_STR_LIT("Copied"));
+   mermaid_ok &= etch_perform_a11y_action(fit_id,ETCH_A11Y_ACT_PRESS,0,{},ctx,nullptr);
+   etch_begin_frame(ctx,&f);inlay_doc_view(mdoc,&mv);etch_end_frame(ctx);
+   etch_begin_frame(ctx,&f);inlay_doc_view(mdoc,&mv);etch_end_frame(ctx);
+   mermaid_ok &= contains_label(ctx,ETCH_STR_LIT("Fit")) && mvm.diagram_full_scale[0];
+   inlay_doc_destroy(mdoc);
+  }
+ }
+ ok &= mermaid_ok;
+
+ // 2. Decoupled inline code pill styling (inline_code_no_border, padding_y=0, radius=4)
+ bool inline_code_ok=true;
+ {
+  auto* doc=inlay_doc_create(ctx,nullptr);
+  inline_code_ok &= doc && inlay_doc_set_utf8(doc,ETCH_STR_LIT("Check `pill` here.\n"));
+  InlayDocStyle st=inlay_doc_style_default();
+  st.code_border=etch_rgba8(220,30,30,255);
+  st.inline_code_bg=etch_rgba8(25,55,95,255);
+  st.inline_code_color=etch_rgba8(110,240,190,255);
+  st.inline_code_padding_x=4.5f;
+  st.inline_code_padding_y=0.f;
+  st.inline_code_radius_px=4.f;
+  st.inline_code_no_border=true;
+  auto v=inlay_doc_view_desc_default();
+  v.id=etch_id("v011-inline-code");v.width_px=320;v.height_px=0;v.style=&st;
+  etch_begin_frame(ctx,&f);inlay_doc_view(doc,&v);etch_end_frame(ctx);
+  inline_code_ok &= has_prim_color(ctx,etch_color_pack_rgba8(st.inline_code_bg)) &&
+                    has_prim_color(ctx,etch_color_pack_rgba8(st.inline_code_color)) &&
+                    !has_prim_color(ctx,etch_color_pack_rgba8(st.code_border));
+  inlay_doc_destroy(doc);
+ }
+ ok &= inline_code_ok;
+
+ // 3. Bold headings + Alert semantic border preservation with quote_border set + synthetic multi-block alert text
+ bool heading_alert_ok=true;
+ {
+  auto* doc=inlay_doc_create(ctx,nullptr);
+  heading_alert_ok &= doc && inlay_doc_set_utf8(doc,ETCH_STR_LIT(
+   "# First Bold Heading\n\n"
+   "Paragraph text.\n\n"
+   "## Second Heading\n\n"
+   "> [!WARNING]\n> Alert body\n>\n> - Nested alert item\n\n"
+   "> Regular blockquote\n"));
+  InlayDocStyle st=inlay_doc_style_default();
+  st.quote_border=etch_rgba8(190,80,245,255);
+  st.alert_colors[INLAY_ALERT_WARNING-1]=etch_rgba8(245,165,20,255);
+  auto v=inlay_doc_view_desc_default();
+  v.id=etch_id("v011-head-alert");v.width_px=380;v.height_px=0;v.style=&st;
+  for(int k=0;k<2;++k){etch_begin_frame(ctx,&f);inlay_doc_view(doc,&v);etch_end_frame(ctx);}
+  const auto& vm=doc->views[0];
+  // Heading uses ETCH_FONT_SEMIBOLD by default (when bold_font_id == ETCH_INVALID_FONT)
+  heading_alert_ok &= vm.vis_seg_count>=2 && vm.vis_segs[0].font_id==ETCH_FONT_SEMIBOLD &&
+                      vm.vis_segs[1].font_id==ETCH_FONT_SANS;
+  // Alert border keeps semantic warning color (NOT overwritten by style.quote_border!), while plain quote uses quote_border!
+  heading_alert_ok &= has_prim_color(ctx,etch_color_pack_rgba8(st.alert_colors[INLAY_ALERT_WARNING-1])) &&
+                      has_prim_color(ctx,etch_color_pack_rgba8(st.quote_border)) &&
+                      contains_label(ctx,ETCH_STR_LIT("WARNING"));
+  // Verify synthetic non-code alert block reads from doc->ast_text (NOT doc->source[0])!
+  InlayDoc* sdoc=inlay_doc_create(ctx,nullptr);
+  heading_alert_ok &= sdoc && inlay_doc_set_utf8(sdoc,ETCH_STR_LIT("WRONG_SOURCE_PREFIX\n\n> [!CAUTION]\n> Line 1\n"));
+  if(sdoc && sdoc->block_count>=2) {
+   const char* tag="[!CAUTION]";
+   const uint32_t tlen=10;
+   if(sdoc->ast_text_capacity < sdoc->ast_text_size + tlen) {
+    auto* mem=static_cast<char*>(std::realloc(sdoc->ast_text, sdoc->ast_text_size + tlen + 64));
+    if(mem){sdoc->ast_text=mem;sdoc->ast_text_capacity=sdoc->ast_text_size+tlen+64;}
+   }
+   if(sdoc->ast_text) {
+    const uint32_t po=sdoc->ast_text_size;
+    std::memcpy(sdoc->ast_text+po,tag,tlen);
+    sdoc->ast_text_size+=tlen;
+    sdoc->blocks[1].flags |= INLAY_BLOCK_FLAG_SYNTHETIC;
+    sdoc->blocks[1].content_offset=0;
+    sdoc->blocks[1].content_length=tlen;
+    sdoc->block_meta[1].pool_offset=po;
+    sdoc->block_meta[1].pool_length=tlen;
+    ++sdoc->revision;
+    auto sv=inlay_doc_view_desc_default();sv.id=etch_id("v011-synth-alert");sv.width_px=320;sv.height_px=0;
+    etch_begin_frame(ctx,&f);inlay_doc_view(sdoc,&sv);etch_end_frame(ctx);
+    heading_alert_ok &= contains_label(ctx,ETCH_STR_LIT("CAUTION"));
+   }
+  }
+  inlay_doc_destroy(sdoc);
+  inlay_doc_destroy(doc);
+ }
+ ok &= heading_alert_ok;
+
+ // 4. Multi-chunk (>16 line) seamless code block borders + show_code_line_numbers reflow + code_header_bg
+ bool code_seamless_ok=true;
+ {
+  auto* doc=inlay_doc_create(ctx,nullptr);
+  const auto long_code=ETCH_STR_LIT(
+   "```cpp\n"
+   "int l01=1;\nint l02=2;\nint l03=3;\nint l04=4;\nint l05=5;\nint l06=6;\nint l07=7;\nint l08=8;\n"
+   "int l09=9;\nint l10=10;\nint l11=11;\nint l12=12;\nint l13=13;\nint l14=14;\nint l15=15;\nint l16=16;\n"
+   "int l17=17;\nint l18=18;\nint l19=19;\nint l20=20;\n"
+   "```\n");
+  code_seamless_ok &= doc && inlay_doc_set_utf8(doc,long_code);
+  InlayDocStyle st=inlay_doc_style_default();
+  st.code_border=etch_rgba8(60,110,170,255);
+  st.code_header_bg=etch_rgba8(18,28,44,255);
+  auto v=inlay_doc_view_desc_default();
+  v.id=etch_id("v011-code-chunks");v.width_px=380;v.height_px=0;v.style=&st;v.show_code_line_numbers=false;
+  for(int k=0;k<2;++k){etch_begin_frame(ctx,&f);inlay_doc_view(doc,&v);etch_end_frame(ctx);}
+  const auto& vm=doc->views[0];
+  code_seamless_ok &= vm.count==2 && has_prim_color(ctx,etch_color_pack_rgba8(st.code_header_bg));
+  if(vm.count==2) {
+   const uint32_t r1_id=doc_row_id(doc,v.id,vm.rows[0]);
+   const uint32_t r2_id=doc_row_id(doc,v.id,vm.rows[1]);
+   const auto l16=etch_element_bounds(etch_id_index(etch_id_index(r1_id,2),16));
+   const auto l17=etch_element_bounds(etch_id_index(etch_id_index(r2_id,2),1));
+   const float seam_gap=l17.y - (l16.y + l16.h);
+   // Seamless spacing (~4px) instead of double 12px card padding (~24px)!
+   code_seamless_ok &= l16.h>0.f && l17.h>0.f && seam_gap>=2.f && seam_gap<=8.f;
+   // Verify no horizontal interior border rect of style.code_border sits across the seam between r1 and r2!
+   const auto r1_b=etch_element_bounds(r1_id);
+   const uint32_t border_rgba=etch_color_pack_rgba8(st.code_border);
+   bool interior_h_border=false;
+   for(uint32_t j=0;j<etch_frame_prim_count(ctx);++j) {
+    EtchPrim pr={};
+    if(!etch_get_frame_prim(ctx,j,&pr) || pr.style.y!=border_rgba)continue;
+    if(pr.bounds.z > r1_b.w*0.5f && pr.bounds.w <= 3.f && std::fabs(pr.bounds.y - (r1_b.y + r1_b.h)) < 3.f) {
+     interior_h_border=true;
+    }
+   }
+   code_seamless_ok &= !interior_h_border;
+  }
+  // Toggle show_code_line_numbers triggers reflow immediately and emits line number "17"!
+  v.show_code_line_numbers=true;
+  etch_begin_frame(ctx,&f);inlay_doc_view(doc,&v);etch_end_frame(ctx);
+  code_seamless_ok &= contains_label(ctx,ETCH_STR_LIT("17"));
+  inlay_doc_destroy(doc);
+ }
+ ok &= code_seamless_ok;
+
+ // 5. Inline math merged runs, table link URL stripping + wide horizontal scroll, structured click metadata, cached custom fence
+ bool misc_ok=true;
+ {
+  auto* doc=inlay_doc_create(ctx,nullptr);
+  misc_ok &= doc && inlay_doc_set_utf8(doc,ETCH_STR_LIT(
+   "Start **bold** `tag` $x^2$ end.\n\n"
+   "$$\na + b + c + d + e + f + g + h + i + j + k + l + m + n + o + p\n$$\n\n"
+   "| Item | Link |\n| --- | --- |\n| Short | [Go](https://example.org/extremely/long/url/that/must/not/inflate/table/column/width) |\n\n"
+   "| C1 | C2 | C3 | C4 | C5 | C6 |\n| --- | --- | --- | --- | --- | --- |\n| AlphaCol | BetaCol | GammaCol | DeltaCol | EpsilonCol | ZetaCol |\n\n"
+   "> ```nested-custom\n> payload\n> ```\n"));
+  struct MiscState { uint32_t code_id, est_calls; float last_avail_w; } ms={etch_id("v011-click-tag"),0,0.f};
+  auto v=inlay_doc_view_desc_default();
+  v.id=etch_id("v011-misc");v.width_px=340;v.height_px=0;
+  v.inline_decorator_user_data=&ms;
+  v.inline_decorator_fn=[](InlayInlineKind kind,EtchStr text,EtchStr,EtchTextSpan* sp,void* user) {
+   auto& s=*static_cast<MiscState*>(user);
+   if(kind==INLAY_INLINE_CODE && str_equal(text,ETCH_STR_LIT("tag"))) { sp->id=s.code_id; return true; }
+   return false;
+  };
+  v.custom_fence_user_data=&ms;
+  v.custom_fence_estimate_fn=[](EtchStr lang,EtchStr,float avail_w,float,void* user) -> float {
+   auto& s=*static_cast<MiscState*>(user);
+   if(str_equal(lang,ETCH_STR_LIT("nested-custom"))) { ++s.est_calls; s.last_avail_w=avail_w; return 32.f; }
+   return 0.f;
+  };
+  v.custom_fence_render_fn=[](uint32_t,uint32_t row_id,EtchStr,EtchStr,float avail_w,float,void*) {
+   auto b=etch_box_desc_default();
+   b.id=etch_id_index(row_id,55);b.width=etch_sizing_fixed(avail_w);b.height=etch_sizing_fixed(32.f);
+   etch_box(&b);
+  };
+  for(int k=0;k<3;++k){etch_begin_frame(ctx,&f);inlay_doc_view(doc,&v);etch_end_frame(ctx);}
+  const auto& vm=doc->views[0];
+  // 1) Inline math merged run: "Start " + "bold" + " " + "tag" + " " merged into 1 vis_seg before $x^2$, and " end." = 1 vis_seg after!
+  uint32_t row0_segs=0;
+  for(uint32_t s=0;s<vm.vis_seg_count;++s) if(vm.vis_segs[s].block_index==0u) ++row0_segs;
+  misc_ok &= row0_segs==2u;
+  // 2) Table URL stripping + wide 6-column table horizontal scroll
+  bool found_url_tbl=false,found_wide_tbl=false;
+  for(uint32_t t=0;t<vm.table_cols_count;++t) {
+   if(vm.table_cols[t].columns==2u) {
+    found_url_tbl=true;
+    // Link column ("Go") should NOT dominate over "Item"/"Short" (both roughly equal, well below 60% of 316px).
+    misc_ok &= vm.table_cols[t].widths[1] < 185.f;
+   }
+   if(vm.table_cols[t].columns==6u) {
+    found_wide_tbl=true;
+    misc_ok &= vm.table_cols[t].total_width > (v.width_px - 2.f*v.block_padding_px);
+   }
+  }
+  misc_ok &= found_url_tbl && found_wide_tbl;
+  // 3) Nested custom fence received reduced width (< width_px - 2*padding) and was cached (not called on steady-state frames!)
+  const uint32_t est_after_settle=ms.est_calls;
+  etch_begin_frame(ctx,&f);inlay_doc_view(doc,&v);etch_end_frame(ctx);
+  misc_ok &= ms.last_avail_w < (v.width_px - 2.f*v.block_padding_px - 10.f) && ms.est_calls==est_after_settle;
+  // 4) Structured click metadata on decorated INLAY_INLINE_CODE with ETCH_MOD_CTRL
+  const auto tag_bounds=etch_element_bounds(ms.code_id);
+  misc_ok &= tag_bounds.w>0.f && tag_bounds.h>0.f;
+  if(tag_bounds.w>0.f) {
+   auto cf=f;
+   cf.pointer_pos={tag_bounds.x+tag_bounds.w*0.5f,tag_bounds.y+tag_bounds.h*0.5f};
+   cf.key_mods=ETCH_MOD_CTRL;
+   cf.pointer_down=true;
+   etch_begin_frame(ctx,&cf);const auto r_down=inlay_doc_view(doc,&v);etch_end_frame(ctx);
+   cf.pointer_down=false;
+   etch_begin_frame(ctx,&cf);const auto r_up=inlay_doc_view(doc,&v);etch_end_frame(ctx);
+   const auto& hit=r_up.clicked_link.length ? r_up : r_down;
+   misc_ok &= str_equal(hit.clicked_link,ETCH_STR_LIT("tag")) &&
+              hit.clicked_kind==INLAY_INLINE_CODE &&
+              hit.clicked_bounds.w>0.f &&
+              hit.clicked_block_index==0u &&
+              (hit.clicked_mods & ETCH_MOD_CTRL)!=0;
+  }
+  inlay_doc_destroy(doc);
+ }
+ ok &= misc_ok;
+
+ if(!ok)std::fprintf(stderr,"v0.11 upgrade check FAILED: mermaid=%d inline_code=%d head_alert=%d code_seamless=%d misc=%d\n",
+                     mermaid_ok,inline_code_ok,heading_alert_ok,code_seamless_ok,misc_ok);
+ return ok;
+}
 }
 int main(int argc,char** argv) {
  if(argc==4) {
   const bool theme=theme_pixels(argv[1],argv[2]);
-  return flow_document(argv[3]) && theme ? 0 : 1;
+  const bool flow=flow_document(argv[3]);
+  // Also run headless PNG verification of narrow-width Mermaid flowchart LR auto-fit (stored under build/).
+  char af_png[512]={};
+  const char* slash=std::strrchr(argv[3],'/');
+  const char* bslash=std::strrchr(argv[3],'\\');
+  const char* sep=(bslash && (!slash || bslash>slash)) ? bslash : slash;
+  if(sep && size_t(sep - argv[3]) + 32 < sizeof(af_png)) {
+   const size_t dir_len=size_t(sep - argv[3]) + 1;
+   std::memcpy(af_png,argv[3],dir_len);
+   std::memcpy(af_png+dir_len,"document-mermaid-autofit.png",29);
+  }
+  auto cfg=etch_context_desc_default();cfg.headless=true;
+  auto* ctx=etch_create_context(&cfg);
+  const bool v11=ctx && upgrade_v011_regression(ctx,af_png[0] ? af_png : nullptr);
+  if(ctx)etch_destroy_context(ctx);
+  return flow && theme && v11 ? 0 : 1;
  }
  auto config=etch_context_desc_default();config.headless=true;
  auto* ctx=etch_create_context(&config);if(!ctx)return 1;
@@ -1276,6 +1615,7 @@ int main(int argc,char** argv) {
  ok &= doc_images_highlights_footnotes_tasks(ctx,reference,streamed);
  ok &= doc_v010_sticky_custom_fence_and_syntax(ctx,streamed);
  ok &= phase4_md4c_selection_and_abi(ctx);
+ ok &= upgrade_v011_regression(ctx,nullptr);
 
  // I1 regression: ordered/nested lists, inline parser upgrades (_/multi-tick/currency/balanced URL/nested link),
  // dynamic >16 views, cross-chunk code lexer+hscroll sync, task revision bump, TeX math & Sugiyama diagrams.

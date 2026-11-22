@@ -1534,7 +1534,7 @@ INLAY_API bool inlay_surface_poll_hmr(InlaySurface *s) {
     return ok;
 }
 INLAY_API void inlay_surface_view(InlaySurface *s, const InlaySurfaceViewDesc *input_in) {
-    InlaySurfaceViewDesc input = {};
+    InlaySurfaceViewDesc input = inlay_surface_view_desc_default();
     if (!s || !inlay_read_abi_struct(input_in, &input) || !input.id || !std::isfinite(input.width_px) ||
         !std::isfinite(input.height_px) || input.width_px <= 0 || input.height_px <= 0 ||
         etch_current_context() != s->etch || !etch_frame_in_progress(s->etch) || s->running)

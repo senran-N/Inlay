@@ -20,6 +20,8 @@ using UiKind=InlayUiKind;
 using UiNode=InlayUiNode;
 using ActionFn=InlayActionFn;
 using DiagramDesc=InlayDiagramDesc;
+using DiagramNode=InlayDiagramNode;
+using DiagramEdge=InlayDiagramEdge;
 using DiagramResult=InlayDiagramResult;
 using MathDesc=InlayMathDesc;
 using MathResult=InlayMathResult;
@@ -59,6 +61,15 @@ inline PortalViewDesc portal_view_desc_default() noexcept { return inlay_portal_
 inline PortalWebView2Options portal_webview2_options_default() noexcept { return inlay_portal_webview2_options_default(); }
 inline MathDesc math_desc_default() noexcept { return inlay_math_desc_default(); }
 inline DiagramDesc diagram_desc_default() noexcept { return inlay_diagram_desc_default(); }
+inline DiagramResult diagram_layout(EtchStr source,const DiagramDesc* desc) noexcept {
+ return inlay_diagram_layout(source,desc);
+}
+inline DiagramResult diagram_view(EtchStr source,const DiagramDesc* desc) noexcept {
+ return inlay_diagram_view(source,desc);
+}
+inline DocResult doc_view(Doc* doc,const DocViewDesc* desc) noexcept {
+ return inlay_doc_view(doc,desc);
+}
 inline Doc* create_doc(etch::Context* ctx,const DocConfig* cfg=nullptr) noexcept {
  return inlay_doc_create(to_c_context(ctx),cfg);
 }

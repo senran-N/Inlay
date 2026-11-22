@@ -1738,6 +1738,8 @@ INLAY_API void inlay_doc_destroy(InlayDoc* d) {
   std::free(view.open);
   std::free(view.code_wrap);
   std::free(view.code_scroll_x);
+  std::free(view.diagram_full_scale);
+  std::free(view.copied_until_ms);
   std::free(view.details);
   std::free(view.table_cols);
   std::free(view.plain_text);

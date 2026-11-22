@@ -978,7 +978,7 @@ INLAY_API InlayMathResult inlay_measure_math(EtchStr tex, float size) {
     return inlay_math_prepare(tex, size, true, &prep) ? prep.metrics : InlayMathResult{};
 }
 INLAY_API InlayMathResult inlay_draw_math(EtchStr tex, const InlayMathDesc* desc_in) {
-    InlayMathDesc desc = {};
+    InlayMathDesc desc = inlay_math_desc_default();
     if (!inlay_read_abi_struct(desc_in, &desc) || !std::isfinite(desc.pos.x) || !std::isfinite(desc.pos.y)) return {};
     InlayMathPrepared prep = {};
     if (!inlay_math_prepare(tex, desc.font_size_px, true, &prep)) return {};

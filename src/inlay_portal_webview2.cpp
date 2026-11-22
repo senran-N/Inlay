@@ -508,7 +508,7 @@ HRESULT on_environment_ready(WebPortal *p, HRESULT result,
 }
 
 void *create(void *user, uint32_t w, uint32_t h) {
-  InlayPortalWebView2Options options = {};
+  InlayPortalWebView2Options options = inlay_portal_webview2_options_default();
   if (!inlay_read_abi_struct(static_cast<const InlayPortalWebView2Options *>(user),
                              &options))
     return nullptr;

@@ -12,7 +12,6 @@ inline bool inlay_read_abi_struct(const T* input, T* out) noexcept {
   return true;
  }
  if(sz<uint32_t(sizeof(uint32_t)) || sz>uint32_t(sizeof(T)))return false;
- std::memset(out,0,sizeof(T));
  std::memcpy(out,input,sz);
  out->struct_size=uint32_t(sizeof(T));
  return true;
@@ -83,7 +82,7 @@ struct InlayRow {
  uint32_t list_item_index;               /* UINT32_MAX if none */
  float estimate,last_scroll_x,code_min_width;
  uint8_t code_lex_state;
- bool first,zebra,separator,last_in_block;
+ bool first,zebra,separator,last_in_block,is_custom_fence;
  InlayBlockKind kind;
 };
 
@@ -109,7 +108,7 @@ inline bool inlay_table_rule(const char* text,uint32_t length) noexcept {
 }
 
 struct InlayDetails {uint32_t summary,summary_end,body,end;};
-struct InlayTableCols {uint32_t header_row,columns;float widths[32];};
+struct InlayTableCols {uint32_t header_row,columns;float total_width;float widths[32];};
 
 struct InlaySelSegment {
  uint32_t element_id;
@@ -139,6 +138,8 @@ struct InlayMeasure {
  bool* open;
  bool* code_wrap;
  float* code_scroll_x;
+ bool* diagram_full_scale;
+ uint64_t* copied_until_ms;
  uint32_t open_capacity;
  InlayTableCols* table_cols;
  uint32_t table_cols_count,table_cols_capacity;
@@ -185,6 +186,12 @@ const InlayRefDef* inlay_doc_find_ref_def(const InlayDoc* doc,const char* label,
 enum InlayDiagramShape : uint8_t {
  InlayShapeRect=0, InlayShapeRound=1, InlayShapeDiamond=2, InlayShapeCircle=3
 };
+enum InlayDiagramEdgeStyle : uint8_t {
+ InlayEdgeStyleNone=0u,
+ InlayEdgeStyleNoArrow=1u<<0,
+ InlayEdgeStyleThick=1u<<1,
+ InlayEdgeStyleBidir=1u<<2
+};
 struct InlayDiagramSubgraph {
  EtchStr title;
  EtchRect bounds;
@@ -197,11 +204,13 @@ struct InlayDiagramEdgePath {
 };
 struct InlayDiagramMeta {
  const InlayDiagramShape* shapes;
+ const uint8_t* edge_styles;
  const InlayDiagramSubgraph* subgraphs;
  uint32_t subgraph_count;
  const InlayDiagramEdgePath* edge_paths;
  const EtchVec2* waypoints;
  uint32_t waypoint_count;
+ bool reversed_dir;
 };
 struct InlayMathPrepared {
  const void* root;

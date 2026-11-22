@@ -96,6 +96,21 @@ typedef struct InlayDocStyle {
  float line_height_scale;
  float heading_scale[6];
  float code_font_scale; /* Optical scale for inline code and code blocks (0 = 1.0). */
+ /* Extended styling fields (zero = default for full ABI backward compatibility). */
+ EtchColor inline_code_bg;
+ EtchColor inline_code_border;
+ EtchColor inline_code_color;
+ EtchColor code_color;
+ EtchColor code_header_bg;
+ float inline_code_padding_x; /* 0 = default 4.5f */
+ float inline_code_padding_y; /* <= 0 = default 0.0f */
+ float inline_code_radius_px; /* 0 = default 4.0f */
+ bool inline_code_no_border;  /* Omit inline code border even if code_border is set. */
+ EtchColor alert_colors[5];   /* NOTE, TIP, IMPORTANT, WARNING, CAUTION (alpha 0 = semantic default). */
+ float alert_bg_alpha;        /* 0 = default 0.09f subtle wash; < 0 disables wash. */
+ EtchColor table_bg;
+ EtchColor table_zebra_bg;
+ EtchColor table_header_color;
 } InlayDocStyle;
 typedef struct InlayImageResult {
  struct SDL_GPUTexture* texture;
@@ -141,12 +156,18 @@ typedef struct InlayDocViewDesc {
  InlayCodeHeaderFn code_header_fn;
  void* code_header_user_data;
  bool show_code_line_numbers;
+ InlayCodeHeaderFn diagram_header_fn;
+ void* diagram_header_user_data;
 } InlayDocViewDesc;
 typedef struct InlayDocResult {
  EtchStr clicked_link;
  uint32_t visible_first,visible_end,total_rows;
  float measured_height_px;
  bool at_bottom;
+ InlayInlineKind clicked_kind;
+ EtchRect clicked_bounds;
+ uint32_t clicked_block_index;
+ uint16_t clicked_mods;
 } InlayDocResult;
 typedef struct InlayDocSelection {
  uint32_t anchor;
@@ -170,11 +191,25 @@ typedef struct InlayDiagramDesc {
  float font_size_px,node_gap_px,rank_gap_px;
  uint32_t canvas_id;
  float viewport_width_px,viewport_height_px;
+ float max_width_px;      /* 0 = unconstrained; > 0 auto-fits natively in layout space. */
+ float min_scale;         /* 0 = default 0.62f. */
+ bool has_custom_fonts;   /* When true, uses font_id / bold_font_id instead of defaults. */
+ uint16_t font_id;
+ uint16_t bold_font_id;
 } InlayDiagramDesc;
 typedef struct InlayDiagramNode {EtchStr id,label;EtchRect bounds;uint32_t rank;} InlayDiagramNode;
 typedef struct InlayDiagramEdge {uint32_t from,to;bool reversed,dashed;EtchStr label;} InlayDiagramEdge;
 /* Layout spans belong to the active Etch frame arena and expire at frame end. */
-typedef struct InlayDiagramResult {const InlayDiagramNode* nodes;const InlayDiagramEdge* edges;uint32_t node_count,edge_count;float width,height;bool valid,horizontal,sequence;} InlayDiagramResult;
+typedef struct InlayDiagramResult {
+ const InlayDiagramNode* nodes;
+ const InlayDiagramEdge* edges;
+ uint32_t node_count,edge_count;
+ float width,height;
+ bool valid,horizontal,sequence;
+ float scale;          /* 1.0f unscaled, < 1.0f natively auto-fitted. */
+ float natural_width;  /* Unscaled layout width before auto-fit. */
+ float natural_height; /* Unscaled layout height before auto-fit. */
+} InlayDiagramResult;
 INLAY_API InlayDiagramDesc inlay_diagram_desc_default(void);
 INLAY_API InlayDiagramResult inlay_diagram_layout(EtchStr source,const InlayDiagramDesc* desc);
 INLAY_API InlayDiagramResult inlay_diagram_view(EtchStr source,const InlayDiagramDesc* desc);

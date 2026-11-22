@@ -1,4 +1,5 @@
 #include "inlay_internal.h"
+#include <SDL3/SDL_timer.h>
 #include <cstdio>
 #include <cstring>
 #include <cmath>
@@ -71,8 +72,8 @@ struct NativeDraw {
  EtchStr source;
  InlayDiagramResult diagram_result;
  InlayDiagramMeta diagram_meta;
+ InlayDiagramDesc diagram_desc;
  InlayMathPrepared math_prep;
- float font;
  bool diagram;
  EtchTheme theme;
  EtchColor text_color;
@@ -82,9 +83,7 @@ void draw_native(EtchRect, void* user) {
  const auto& draw = *static_cast<NativeDraw*>(user);
  etch_push_theme(&draw.theme);
  if (draw.diagram) {
-  auto desc = inlay_diagram_desc_default();
-  desc.font_size_px = draw.font;
-  inlay_diagram_draw_ex(draw.diagram_result, desc, &draw.diagram_meta);
+  inlay_diagram_draw_ex(draw.diagram_result, draw.diagram_desc, &draw.diagram_meta);
  } else {
   const EtchColor col = draw.text_color.a != 0 ? draw.text_color : etch_get_theme(etch_current_context()).text_primary;
   inlay_math_draw_prepared(draw.math_prep, {0, 0}, col);
@@ -92,55 +91,78 @@ void draw_native(EtchRect, void* user) {
  etch_pop_theme();
 }
 
-void native_box(EtchStr source, float font, bool diagram, uint32_t id, float max_width, EtchColor text_color = {},
-                bool display_math = true, const InlayMathPrepared* pre_math = nullptr, float top_pad = 0.f) {
+float native_math_box(EtchStr source, float font, uint32_t id, float max_width, EtchColor text_color = {},
+                      bool display_math = true, const InlayMathPrepared* pre_math = nullptr, float top_pad = 0.f) {
  auto* ctx = etch_current_context();
  EtchStr copied = source;
  if (!pre_math) {
   auto* copy = source.length ? static_cast<char*>(etch_frame_arena_alloc(ctx, source.length, 1)) : nullptr;
-  if (source.length && !copy) { etch_text(source, nullptr); return; }
+  if (source.length && !copy) { etch_text(source, nullptr); return 0.f; }
   if (copy) std::memcpy(copy, source.chars, source.length);
   copied = {copy, source.length, false};
  }
- float width = 0, height = 0;
- InlayDiagramResult diagram_result = {};
- InlayDiagramMeta diagram_meta = {};
  InlayMathPrepared math_prep = {};
- if (diagram) {
-  auto desc = inlay_diagram_desc_default();
-  desc.font_size_px = font;
-  diagram_result = inlay_diagram_layout_ex(copied, &desc, &diagram_meta);
-  if (!diagram_result.valid) { etch_text(copied, nullptr); return; }
-  width = diagram_result.width;
-  height = diagram_result.height;
+ if (pre_math) {
+  math_prep = *pre_math;
  } else {
-  if (pre_math) math_prep = *pre_math;
-  else if (!inlay_math_prepare(copied, font, display_math, &math_prep)) { etch_text(copied, nullptr); return; }
-  width = math_prep.metrics.width;
-  height = math_prep.metrics.height;
+  if (!inlay_math_prepare(copied, font, display_math, &math_prep)) { etch_text(copied, nullptr); return 0.f; }
+  if (display_math && max_width > 0.f && math_prep.metrics.width > max_width) {
+   constexpr float kMathMinScale = 0.55f;
+   float s = std::fmax(kMathMinScale, std::fmin(1.0f, max_width / math_prep.metrics.width));
+   InlayMathPrepared scaled = {};
+   if (inlay_math_prepare(copied, std::fmax(8.0f, font * s), true, &scaled)) {
+    math_prep = scaled;
+    for (int iter = 0; iter < 2 && math_prep.metrics.width > max_width && s > kMathMinScale; ++iter) {
+     s = std::fmax(kMathMinScale, s * (max_width / math_prep.metrics.width) * 0.99f);
+     if (inlay_math_prepare(copied, std::fmax(8.0f, font * s), true, &scaled)) math_prep = scaled;
+     else break;
+    }
+   }
+  }
  }
- const float extra_h = (diagram || display_math) ? 8.f : 0.f;
- const float box_h = height + extra_h + top_pad;
+ const float width = math_prep.metrics.width;
+ const float height = math_prep.metrics.height;
+ const bool needs_hscroll = width > max_width + 0.5f;
+ const float scroll_pad_b = (display_math && needs_hscroll) ? 14.f : 0.f;
+ const float extra_h = display_math ? (8.f + scroll_pad_b) : 0.f;
+ const bool needs_vscroll = (height + extra_h + top_pad) > 4096.f;
+ const float box_h = std::fmin(height + extra_h + top_pad, 4096.f);
+ if (display_math && max_width > 0.f) {
+  auto wrap = etch_box_desc_default();
+  wrap.width = etch_sizing_fixed(max_width);
+  wrap.height = etch_sizing_fit(0, 0);
+  wrap.align_x = needs_hscroll ? ETCH_ALIGN_X_LEFT : ETCH_ALIGN_X_CENTER;
+  etch_begin_box(&wrap);
+ }
  auto box = etch_box_desc_default();
  box.id = id;
  box.width = etch_sizing_fixed(std::fmin(width, max_width));
- box.height = etch_sizing_fixed(std::fmin(box_h, 4096.f));
- box.scroll_y = box_h > 4096.f;
- box.scroll_x = width > max_width;
+ box.height = etch_sizing_fixed(box_h);
+ box.scroll_y = needs_vscroll;
+ box.scroll_x = needs_hscroll;
  box.clip_children = true;
  if (top_pad > 0.f) box.padding = {0, 0, top_pad, 0};
  etch_begin_box(&box);
- auto content = etch_box_desc_default();
- content.width = etch_sizing_fixed(width);
- content.height = etch_sizing_fixed(height + extra_h);
- etch_begin_box(&content);
+ if (needs_hscroll || needs_vscroll) {
+  auto content = etch_box_desc_default();
+  content.width = etch_sizing_fixed(width);
+  content.height = etch_sizing_fixed(height + extra_h);
+  etch_begin_box(&content);
+ }
  auto* draw = static_cast<NativeDraw*>(etch_frame_arena_alloc(ctx, sizeof(NativeDraw), alignof(NativeDraw)));
  if (draw) {
-  *draw = {copied, diagram_result, diagram_meta, math_prep, font, diagram, etch_get_theme(ctx), text_color};
+  *draw = {copied, {}, {}, {}, math_prep, false, etch_get_theme(ctx), text_color};
   etch_draw_after_layout(draw_native, draw, false);
  }
+ if (needs_hscroll || needs_vscroll) etch_end_box();
  etch_end_box();
- etch_end_box();
+ if (display_math && max_width > 0.f) etch_end_box();
+ return box_h;
+}
+
+float baseline_top_lead(uint16_t font_id, float font_size, float line_h) noexcept {
+ const auto fm = etch_font_metrics(font_id, font_size);
+ return std::fmax(0.0f, 0.5f * (line_h - (fm.ascent + fm.descent)));
 }
 
 InlayDocStyle resolved_style(const InlayDocViewDesc& view) noexcept {
@@ -596,7 +618,8 @@ EtchAlignX table_alignment(EtchStr rule, uint32_t* start) noexcept {
 }
 
 float estimate_row(const InlayDocViewDesc& view, const InlayDocStyle& style, float width, const InlayBlock& b,
-                   EtchStr text, bool first, bool last, bool diagram, uint32_t columns = 1, EtchStr img_src = {}) {
+                   EtchStr text, bool first, bool last, bool diagram, uint32_t columns = 1, EtchStr img_src = {},
+                   uint32_t block_idx = 0) {
  const float padding = block_padding(view, b.kind);
  const float eff_w = std::fmax(1.f, width - block_nest_indent(b, view.font_size_px));
  if (diagram) return 200;
@@ -636,17 +659,23 @@ float estimate_row(const InlayDocViewDesc& view, const InlayDocStyle& style, flo
  }
  const bool has_code_header = code && first && (!view.hide_code_copy_button || b.language_length || view.code_header_fn);
  const float header = has_code_header
-  ? std::fmax((!view.hide_code_copy_button || view.code_header_fn) ? 32.f : 0.f, b.language_length ? line_height : 0.f) + 4.f
+  ? std::fmax((!view.hide_code_copy_button || view.code_header_fn) ? 30.f : 0.f, b.language_length ? line_height : 0.f) + 4.f
   : (b.kind == INLAY_FOOTNOTE && first ? 8.f : 0.f);
- return std::fmax(0.f, height - 4) + 2 * padding + header;
+ const float v_pad = code
+  ? ((first ? (has_code_header ? 8.f : padding) : 2.f) + (last ? padding : 2.f))
+  : (2 * padding + ((b.kind == INLAY_HEADING && first && block_idx > 0u) ? (b.level <= 2u ? 8.f : 5.f) : 0.f));
+ return std::fmax(0.f, height - 4) + v_pad + header;
 }
 
 float initial_row_height(const InlayMeasure& m, const InlayRow& row) {
  if (skipped_row(m, row)) return m.view.height_px == 0 ? 0.f : 1.f;
  const auto& block = m.doc->blocks[row.block];
  if (row.kind == INLAY_DETAILS && row.first && !details_body(m, row)) return 32 + 2 * m.view.block_padding_px;
- const float custom_h = custom_fence_estimate(m.view, m.doc, row.block, std::fmax(1.f, m.width - 2 * m.view.block_padding_px));
- if (custom_h > 0.f) return custom_h + 2 * m.view.block_padding_px;
+ if (row.is_custom_fence) {
+  const float eff_w = std::fmax(32.f, m.width - block_nest_indent(block, m.view.font_size_px));
+  const float custom_h = custom_fence_estimate(m.view, m.doc, row.block, std::fmax(1.f, eff_w - 2 * m.view.block_padding_px));
+  if (custom_h > 0.f) return custom_h + 2 * m.view.block_padding_px;
+ }
  const EtchStr source = doc_source_str(m.doc);
  const EtchStr img_src = block.kind == INLAY_IMAGE ? slice(source, block.language_offset, block.language_length) : EtchStr{};
  EtchStr row_text = (block.flags & INLAY_BLOCK_FLAG_SYNTHETIC)
@@ -654,7 +683,7 @@ float initial_row_height(const InlayMeasure& m, const InlayRow& row) {
   : table_line(source, row, block.kind == INLAY_TABLE ? block.quote_depth : 0u);
  return estimate_row(m.view, m.style, m.width, block, row_text,
                      row.first, row.last_in_block, diagram_block(m.doc, block),
-                     row.kind == INLAY_TABLE ? m.rows[row.table_header].table_columns : 1u, img_src);
+                     row.kind == INLAY_TABLE ? m.rows[row.table_header].table_columns : 1u, img_src, row.block);
 }
 
 float block_height(uint32_t index, void* user) {
@@ -990,7 +1019,11 @@ bool ascii_ieq(EtchStr a, const char* lit) noexcept {
  return true;
 }
 
-EtchColor alert_accent_from_kind(uint8_t alert_kind, const EtchTheme& theme) noexcept {
+EtchColor alert_accent_from_kind(uint8_t alert_kind, const InlayDocStyle& style, const EtchTheme& theme) noexcept {
+ if (alert_kind >= INLAY_ALERT_NOTE && alert_kind <= INLAY_ALERT_CAUTION) {
+  const EtchColor custom = style.alert_colors[alert_kind - 1u];
+  if (custom.a != 0) return custom;
+ }
  switch (alert_kind) {
   case INLAY_ALERT_CAUTION: return theme.danger;
   case INLAY_ALERT_WARNING: return theme.warning;
@@ -1000,8 +1033,8 @@ EtchColor alert_accent_from_kind(uint8_t alert_kind, const EtchTheme& theme) noe
  }
 }
 
-EtchColor alert_accent_color(EtchStr source, const InlayBlock& full, const EtchTheme& theme) noexcept {
- if (full.alert_kind != INLAY_ALERT_NONE) return alert_accent_from_kind(full.alert_kind, theme);
+EtchColor alert_accent_color(EtchStr source, const InlayBlock& full, const InlayDocStyle& style, const EtchTheme& theme) noexcept {
+ if (full.alert_kind != INLAY_ALERT_NONE) return alert_accent_from_kind(full.alert_kind, style, theme);
  uint32_t pos = full.content_offset, end = pos + full.content_length;
  if (pos < end && source.chars[pos] == '>') ++pos;
  if (pos < end && source.chars[pos] == ' ') ++pos;
@@ -1009,13 +1042,13 @@ EtchColor alert_accent_color(EtchStr source, const InlayBlock& full, const EtchT
   uint32_t s = pos + 2u, e = s;
   while (e < end && source.chars[e] != ']' && source.chars[e] != '\n' && source.chars[e] != '\r') ++e;
   const EtchStr tag = slice(source, s, e - s);
-  if (ascii_ieq(tag, "CAUTION")) return theme.danger;
-  if (ascii_ieq(tag, "WARNING")) return theme.warning;
-  if (ascii_ieq(tag, "TIP")) return theme.syntax_string;
-  if (ascii_ieq(tag, "IMPORTANT")) return theme.accent_secondary.a != 0 ? theme.accent_secondary : theme.accent;
-  if (ascii_ieq(tag, "NOTE")) return theme.accent;
+  if (ascii_ieq(tag, "CAUTION")) return alert_accent_from_kind(INLAY_ALERT_CAUTION, style, theme);
+  if (ascii_ieq(tag, "WARNING")) return alert_accent_from_kind(INLAY_ALERT_WARNING, style, theme);
+  if (ascii_ieq(tag, "TIP")) return alert_accent_from_kind(INLAY_ALERT_TIP, style, theme);
+  if (ascii_ieq(tag, "IMPORTANT")) return alert_accent_from_kind(INLAY_ALERT_IMPORTANT, style, theme);
+  if (ascii_ieq(tag, "NOTE")) return alert_accent_from_kind(INLAY_ALERT_NOTE, style, theme);
  }
- return theme.accent;
+ return alert_accent_from_kind(INLAY_ALERT_NOTE, style, theme);
 }
 
 // Compute trimmed list line bounds (after stripping quote prefix, indent, and list marker)
@@ -1078,8 +1111,7 @@ void build_plain_text_index(InlayMeasure* m) noexcept {
   if (skipped_row(*m, row)) continue;
   const auto& full_blk = doc->blocks[row.block];
   if (full_blk.kind == INLAY_THEMATIC_BREAK || full_blk.kind == INLAY_IMAGE || full_blk.kind == INLAY_MATH_BLOCK ||
-      diagram_block(doc, full_blk) ||
-      custom_fence_estimate(m->view, doc, row.block, std::fmax(1.f, m->width - 2 * m->view.block_padding_px)) > 0.f) {
+      diagram_block(doc, full_blk) || row.is_custom_fence) {
    continue;
   }
   const bool new_block = row.block != prev_block;
@@ -1152,6 +1184,26 @@ void build_plain_text_index(InlayMeasure* m) noexcept {
      }
      pos = next < e ? next + 1u : e;
     }
+   }
+  } else if (full_blk.flags & INLAY_BLOCK_FLAG_SYNTHETIC) {
+   const EtchStr synth_buf = block_code_str(doc, row.block);
+   uint32_t pos = row.offset;
+   const uint32_t end = pos + row.length <= synth_buf.length ? (pos + row.length) : synth_buf.length;
+   bool first_line = true;
+   while (pos < end) {
+    uint32_t next = pos;
+    while (next < end && synth_buf.chars[next] != '\n') ++next;
+    uint32_t ll = next - pos;
+    if (ll && synth_buf.chars[pos + ll - 1u] == '\r') --ll;
+    EtchStr line = {synth_buf.chars + pos, ll, false};
+    if (full_blk.kind == INLAY_ALERT && line.length >= 3u && line.chars[0] == '[' && line.chars[1] == '!') {
+     pos = next < end ? next + 1u : end;
+     continue;
+    }
+    if (!first_line) append_plain_bytes(m, "\n", 1u);
+    first_line = false;
+    append_plain_bytes(m, line.chars, line.length);
+    pos = next < end ? next + 1u : end;
    }
   } else {
    uint32_t pos = row.offset;
@@ -1278,12 +1330,17 @@ float rich_line(InlayMeasure* m, EtchStr line, uint32_t base_id, float font, Inl
   if (t.flags & InlayInlineCode) {
    span.font_id = mono_font;
    span.font_size_px = effective_code_font_size(font, style);
-   span.background = style.code_bg.a != 0 ? style.code_bg : theme.surface_subtle;
-   if (style.code_border.a != 0) span.border_color = style.code_border;
-   span.color = theme.text_code;
-   span.padding_x = 4;
-   span.padding_y = 1;
-   span.bg_radius = theme.radius_small_px;
+   span.background = style.inline_code_bg.a != 0 ? style.inline_code_bg
+    : (style.code_bg.a != 0 ? style.code_bg : theme.surface_subtle);
+   if (!style.inline_code_no_border) {
+    if (style.inline_code_border.a != 0) span.border_color = style.inline_code_border;
+    else if (style.code_border.a != 0) span.border_color = style.code_border;
+   }
+   span.color = style.inline_code_color.a != 0 ? style.inline_code_color
+    : (style.code_color.a != 0 ? style.code_color : theme.text_code);
+   span.padding_x = style.inline_code_padding_x > 0.f ? style.inline_code_padding_x : 4.5f;
+   span.padding_y = style.inline_code_padding_y > 0.f ? style.inline_code_padding_y : 0.0f;
+   span.bg_radius = style.inline_code_radius_px > 0.f ? style.inline_code_radius_px : 4.0f;
   }
   if (t.flags & InlayInlineFootnote) {
    const EtchColor fn_col = style.link_color.a != 0 ? style.link_color : theme.accent;
@@ -1299,7 +1356,13 @@ float rich_line(InlayMeasure* m, EtchStr line, uint32_t base_id, float font, Inl
    if (span.id) {
     push_u32(&m->vis_span_ids, &m->vis_span_count, &m->vis_span_cap, span.id);
     if (etch_hovered(span.id)) etch_set_cursor(ETCH_CURSOR_HAND);
-    if (etch_clicked(span.id)) result->clicked_link = slice(source, t.url_offset, t.url_length);
+    if (etch_clicked(span.id)) {
+     result->clicked_link = slice(source, t.url_offset, t.url_length);
+     result->clicked_kind = INLAY_INLINE_LINK;
+     result->clicked_bounds = etch_element_bounds(span.id);
+     result->clicked_block_index = block_index;
+     result->clicked_mods = etch_key_mods();
+    }
    }
   }
   if (t.flags & (InlayInlineLink | InlayInlineCode)) {
@@ -1312,11 +1375,6 @@ float rich_line(InlayMeasure* m, EtchStr line, uint32_t base_id, float font, Inl
     span.color = style.link_color.a != 0 ? style.link_color : theme.accent;
     span.underline = true;
     span.id = etch_id_index(base_id, t.offset + 1u);
-    if (span.id) {
-     push_u32(&m->vis_span_ids, &m->vis_span_count, &m->vis_span_cap, span.id);
-     if (etch_hovered(span.id)) etch_set_cursor(ETCH_CURSOR_HAND);
-     if (url.length) etch_set_tooltip_text(span.id, url);
-    }
    }
    EtchStr clicked_text = span.text;
    if (m->view.inline_decorator_fn) {
@@ -1345,7 +1403,15 @@ float rich_line(InlayMeasure* m, EtchStr line, uint32_t base_id, float font, Inl
    }
    if (span.id) {
     push_u32(&m->vis_span_ids, &m->vis_span_count, &m->vis_span_cap, span.id);
-    if (etch_clicked(span.id)) result->clicked_link = link ? url : clicked_text;
+    if (etch_hovered(span.id)) etch_set_cursor(ETCH_CURSOR_HAND);
+    if (link && url.length) etch_set_tooltip_text(span.id, url);
+    if (etch_clicked(span.id)) {
+     result->clicked_link = link ? url : clicked_text;
+     result->clicked_kind = link ? INLAY_INLINE_LINK : INLAY_INLINE_CODE;
+     result->clicked_bounds = etch_element_bounds(span.id);
+     result->clicked_block_index = block_index;
+     result->clicked_mods = etch_key_mods();
+    }
    }
   }
   math |= (t.flags & InlayInlineMath) != 0;
@@ -1367,8 +1433,9 @@ float rich_line(InlayMeasure* m, EtchStr line, uint32_t base_id, float font, Inl
 
  if (math || has_image) {
   const auto text_fm = etch_font_metrics(base_font, font);
-  const float text_base = text_fm.ascent;
-  const float text_desc = text_fm.descent;
+  const float text_lead = baseline_top_lead(base_font, font, line_height);
+  const float text_base = text_lead + text_fm.ascent;
+  const float text_desc = std::fmax(text_fm.descent, line_height - text_base);
   auto* preps = math ? static_cast<InlayMathPrepared*>(etch_frame_arena_alloc(ctx, size_t(count) * sizeof(InlayMathPrepared), alignof(InlayMathPrepared))) : nullptr;
   auto* math_copies = math ? static_cast<EtchStr*>(etch_frame_arena_alloc(ctx, size_t(count) * sizeof(EtchStr), alignof(EtchStr))) : nullptr;
   float max_ascent = text_base, max_descent = text_desc;
@@ -1393,26 +1460,42 @@ float rich_line(InlayMeasure* m, EtchStr line, uint32_t base_id, float font, Inl
   row.wrap = true;
   row.align_x = align;
   row.align_y = ETCH_ALIGN_Y_TOP;
-  row.gap = 4;
+  row.gap = 0;
   etch_begin_box(&row);
-  for (uint32_t i = 0; i < count; ++i) {
-   desc.id = etch_id_index(base_id, i + 1u);
+  for (uint32_t i = 0; i < count;) {
    const auto& t = m->tokens[low + i];
-   const uint32_t tok_len = spans[i].text.length;
-   const uint32_t seg_start = io_doc_cursor ? *io_doc_cursor : 0u;
+   desc.id = etch_id_index(base_id, i + 1u);
    if (t.flags & InlayInlineMath) {
+    const uint32_t tok_len = spans[i].text.length;
     const bool ok_prep = preps && preps[i].metrics.valid;
     const float top_pad = ok_prep ? std::fmax(0.f, max_ascent - preps[i].metrics.baseline) : 0.f;
-    native_box(ok_prep ? math_copies[i] : spans[i].text, font, false, desc.id, width,
-               desc.color.a != 0 && !etch_color_is_theme_auto(desc.color) ? desc.color : EtchColor{},
-               false, ok_prep ? &preps[i] : nullptr, top_pad);
+    const float pad_l = i > 0u ? 2.f : 0.f;
+    const float pad_r = (i + 1u < count) ? 2.f : 0.f;
+    if (pad_l > 0.f || pad_r > 0.f) {
+     auto flank = etch_box_desc_default();
+     flank.padding = {pad_l, pad_r, 0.f, 0.f};
+     etch_begin_box(&flank);
+    }
+    native_math_box(ok_prep ? math_copies[i] : spans[i].text, font, desc.id, std::fmax(1.f, width - pad_l - pad_r),
+                    desc.color.a != 0 && !etch_color_is_theme_auto(desc.color) ? desc.color : EtchColor{},
+                    false, ok_prep ? &preps[i] : nullptr, top_pad);
+    if (pad_l > 0.f || pad_r > 0.f) etch_end_box();
+    if (io_doc_cursor) *io_doc_cursor += tok_len;
+    ++i;
    } else if (t.flags & InlayInlineImage) {
+    const uint32_t tok_len = spans[i].text.length;
     const EtchStr alt = slice(source, t.offset, t.length);
     const EtchStr src = slice(source, t.url_offset, t.url_length);
     const auto img = resolve_doc_image(m->view, alt, src, width);
     const float img_h = img.valid ? img.height : std::fmax(11.f, font * 0.85f) * 1.5f + 8.f;
     const float top_pad = std::fmax(0.f, (total_line_h - img_h) * 0.5f);
-    if (top_pad > 0.5f) { auto wrap = etch_box_desc_default(); wrap.padding = {0, 0, top_pad, 0}; etch_begin_box(&wrap); }
+    const float pad_l = i > 0u ? 2.f : 0.f;
+    const float pad_r = (i + 1u < count) ? 2.f : 0.f;
+    if (top_pad > 0.5f || pad_l > 0.f || pad_r > 0.f) {
+     auto wrap = etch_box_desc_default();
+     wrap.padding = {pad_l, pad_r, top_pad, 0.f};
+     etch_begin_box(&wrap);
+    }
     if (img.valid) {
      auto idesc = etch_image_desc_default();
      idesc.id = desc.id;
@@ -1422,18 +1505,29 @@ float rich_line(InlayMeasure* m, EtchStr line, uint32_t base_id, float font, Inl
      idesc.radius = etch_corners_all(img.radius);
      etch_image(&idesc);
     } else draw_image_fallback(alt, desc.id, font, style, theme);
-    if (top_pad > 0.5f) etch_end_box();
+    if (top_pad > 0.5f || pad_l > 0.f || pad_r > 0.f) etch_end_box();
+    if (io_doc_cursor) *io_doc_cursor += tok_len;
+    ++i;
    } else {
+    // Merge contiguous non-math/non-image spans into a single etch_text_spans run!
+    uint32_t run_end = i + 1u;
+    uint32_t run_bytes = spans[i].text.length;
+    while (run_end < count && !(m->tokens[low + run_end].flags & (InlayInlineMath | InlayInlineImage))) {
+     run_bytes += spans[run_end].text.length;
+     ++run_end;
+    }
+    const uint32_t seg_start = io_doc_cursor ? *io_doc_cursor : 0u;
     const float top_pad = std::fmax(0.f, max_ascent - text_base);
     if (top_pad > 0.5f) { auto wrap = etch_box_desc_default(); wrap.padding = {0, 0, top_pad, 0}; etch_begin_box(&wrap); }
-    etch_text_spans(spans + i, 1, &desc);
+    etch_text_spans(spans + i, run_end - i, &desc);
     if (io_doc_cursor) {
-     apply_segment_selection(m, desc.id, seg_start, tok_len);
-     record_vis_seg(m, {desc.id, row_index, block_index, seg_start, tok_len, base_font, 0, font, line_height, true});
+     apply_segment_selection(m, desc.id, seg_start, run_bytes);
+     record_vis_seg(m, {desc.id, row_index, block_index, seg_start, run_bytes, base_font, 0, font, line_height, true});
+     *io_doc_cursor += run_bytes;
     }
     if (top_pad > 0.5f) etch_end_box();
+    i = run_end;
    }
-   if (io_doc_cursor) *io_doc_cursor += tok_len;
   }
   etch_end_box();
  } else {
@@ -1591,17 +1685,44 @@ void code_line(InlayMeasure* m, EtchStr line, EtchStr language, uint32_t id, flo
   return;
  }
  const uint32_t seg_start = io_doc_cursor ? *io_doc_cursor : 0u;
+ const EtchColor base_code_color = style.code_color.a != 0 ? style.code_color : theme.text_code;
  if (ascii_ieq(language, "diff") || ascii_ieq(language, "patch")) {
   auto span = etch_text_span_default();
   span.font_id = mono_font;
   span.font_size_px = code_font;
   span.text = line;
-  span.color = theme.text_code;
-  if (line.length >= 2u && line.chars[0] == '@' && line.chars[1] == '@') span.color = theme.accent;
-  else if (line.length >= 3u && ((line.chars[0] == '+' && line.chars[1] == '+' && line.chars[2] == '+') ||
-                                 (line.chars[0] == '-' && line.chars[1] == '-' && line.chars[2] == '-'))) span.color = theme.syntax_keyword;
-  else if (line.chars[0] == '+') span.color = theme.syntax_string;
-  else if (line.chars[0] == '-') span.color = theme.danger;
+  span.color = base_code_color;
+  EtchColor row_bg = {0, 0, 0, 0};
+  EtchColor row_accent = {0, 0, 0, 0};
+  const bool is_hunk = (line.length >= 2u && line.chars[0] == '@' && line.chars[1] == '@');
+  const bool is_hdr = (line.length >= 3u && ((line.chars[0] == '+' && line.chars[1] == '+' && line.chars[2] == '+') ||
+                                             (line.chars[0] == '-' && line.chars[1] == '-' && line.chars[2] == '-')));
+  const bool is_add = (!is_hdr && line.chars[0] == '+');
+  const bool is_del = (!is_hdr && line.chars[0] == '-');
+  if (is_hunk) {
+   span.color = theme.accent;
+   row_bg = {theme.accent.r, theme.accent.g, theme.accent.b, 20};
+  } else if (is_hdr) {
+   span.color = theme.syntax_keyword;
+  } else if (is_add) {
+   span.color = theme.syntax_string;
+   row_bg = {theme.syntax_string.r, theme.syntax_string.g, theme.syntax_string.b, 32};
+   row_accent = theme.syntax_string;
+  } else if (is_del) {
+   span.color = theme.danger;
+   row_bg = {theme.danger.r, theme.danger.g, theme.danger.b, 32};
+   row_accent = theme.danger;
+  }
+  auto row_box = etch_box_desc_default();
+  row_box.width = etch_sizing_grow(0, 0);
+  row_box.padding = {6.0f, 4.0f, 0.5f, 0.5f};
+  row_box.background = row_bg;
+  if (row_accent.a != 0) {
+   row_box.border_color = row_accent;
+   row_box.border_sides = {2.0f, 0.0f, 0.0f, 0.0f};
+  }
+  row_box.radius = etch_corners_all(3.0f);
+  etch_begin_box(&row_box);
   auto desc = etch_rich_text_desc_default();
   desc.id = id;
   desc.selectable = true;
@@ -1611,6 +1732,7 @@ void code_line(InlayMeasure* m, EtchStr line, EtchStr language, uint32_t id, flo
   desc.wrap = wrap_lines;
   if (style.selection_color.a != 0) desc.selection_color = style.selection_color;
   etch_text_spans(&span, 1, &desc);
+  etch_end_box();
   if (io_doc_cursor) {
    apply_segment_selection(m, id, seg_start, line.length);
    record_vis_seg(m, {id, row_index, block_index, seg_start, line.length, mono_font, 0, code_font, line_height, wrap_lines});
@@ -1642,7 +1764,7 @@ void code_line(InlayMeasure* m, EtchStr line, EtchStr language, uint32_t id, flo
    auto span = etch_text_span_default();
    span.font_id = mono_font;
    span.font_size_px = code_font;
-   span.color = theme.text_code;
+   span.color = base_code_color;
    if (state == 1) {
     while (pos + 1u < line.length && !(line.chars[pos] == '*' && line.chars[pos + 1u] == '/')) ++pos;
     if (pos + 1u < line.length) { pos += 2u; state = 0; } else pos = line.length;
@@ -1764,22 +1886,22 @@ void code_line(InlayMeasure* m, EtchStr line, EtchStr language, uint32_t id, flo
  }
 }
 
-void compute_table_col_widths(const InlayMeasure* measure, EtchStr source, const InlayRow& info, uint32_t columns,
-                              float width, float font, const InlayDocStyle& style, const InlayDocViewDesc& view,
-                              float* out_widths) noexcept {
- if (!columns) return;
- if (columns == 1u) { out_widths[0] = width; return; }
+float compute_table_col_widths(const InlayMeasure* measure, EtchStr source, const InlayRow& info, uint32_t columns,
+                               float width, float font, const InlayDocStyle& style, const InlayDocViewDesc& view,
+                               float* out_widths) noexcept {
+ if (!columns) return width;
+ if (columns == 1u) { out_widths[0] = width; return width; }
  constexpr uint32_t kMaxAutoCols = 32;
  if (columns > kMaxAutoCols) {
-  const float eq = width / float(columns);
-  for (uint32_t c = 0; c < columns; ++c) out_widths[c] = eq;
-  return;
+  const float col_w = std::fmax(88.f, width / float(columns));
+  for (uint32_t c = 0; c < columns; ++c) out_widths[c] = col_w;
+  return col_w * float(columns);
  }
  float natural[kMaxAutoCols] = {};
  const uint16_t sans_fid = effective_sans_font(style);
  const uint16_t bold_fid = effective_bold_font(style);
  const float min_col = std::fmin(52.f, width / float(columns));
- const float max_col = std::fmax(min_col, width * 0.62f);
+ const float max_col_fit = std::fmax(min_col, width * 0.62f);
  for (uint32_t c = 0; c < columns; ++c) natural[c] = min_col;
  const uint16_t qd = measure->doc->blocks[info.block].quote_depth;
  uint32_t scanned = 0;
@@ -1796,9 +1918,45 @@ void compute_table_col_widths(const InlayMeasure* measure, EtchStr source, const
    const uint32_t cstop = table_cell_end(rstr, cstart);
    char buf[256];
    uint32_t blen = 0;
+   auto append_plain = [&](uint32_t s0, uint32_t s1) noexcept {
+    for (uint32_t m = s0; m < s1 && blen < 254u; ++m) {
+     const char mc = rstr.chars[m];
+     if (mc == '`' || mc == '*' || mc == '~' || mc == '=' || mc == '$') continue;
+     if (mc == '\\' && m + 1u < s1 && (rstr.chars[m + 1u] == '|' || rstr.chars[m + 1u] == '\\')) {
+      buf[blen++] = rstr.chars[++m];
+      continue;
+     }
+     buf[blen++] = mc;
+    }
+   };
    for (uint32_t k = cstart; k < cstop && blen < 254u; ++k) {
     const char ch = rstr.chars[k];
-    if (ch == '`' || ch == '*' || ch == '$') continue;
+    if (ch == '`' || ch == '*' || ch == '~' || ch == '=' || ch == '$') continue;
+    // Strip raw image/link URLs: ![alt](url), [text](url), [text][ref]
+    if ((ch == '!' && k + 1u < cstop && rstr.chars[k + 1u] == '[') ||
+        (ch == '[' && !(k + 1u < cstop && rstr.chars[k + 1u] == '^'))) {
+     const uint32_t open_b = (ch == '!') ? (k + 1u) : k;
+     uint32_t close_b = 0;
+     if (scan_link_bracket(rstr.chars, open_b + 1u, cstop, &close_b)) {
+      uint32_t close_u = 0;
+      if (close_b + 1u < cstop && rstr.chars[close_b + 1u] == '(' &&
+          scan_balanced_paren_url(rstr.chars, close_b + 2u, cstop, &close_u)) {
+       append_plain(open_b + 1u, close_b);
+       k = close_u;
+       continue;
+      }
+      if (ch == '[' && close_b + 1u < cstop && rstr.chars[close_b + 1u] == '[' &&
+          scan_link_bracket(rstr.chars, close_b + 2u, cstop, &close_u)) {
+       append_plain(open_b + 1u, close_b);
+       k = close_u;
+       continue;
+      }
+     }
+    }
+    if (ch == '\\' && k + 1u < cstop && (rstr.chars[k + 1u] == '|' || rstr.chars[k + 1u] == '\\')) {
+     buf[blen++] = rstr.chars[++k];
+     continue;
+    }
     if (ch == '\\' && k + 1u < cstop && ((rstr.chars[k + 1u] >= 'a' && rstr.chars[k + 1u] <= 'z') || (rstr.chars[k + 1u] >= 'A' && rstr.chars[k + 1u] <= 'Z'))) {
      ++k;
      while (k + 1u < cstop && ((rstr.chars[k + 1u] >= 'a' && rstr.chars[k + 1u] <= 'z') || (rstr.chars[k + 1u] >= 'A' && rstr.chars[k + 1u] <= 'Z'))) ++k;
@@ -1812,17 +1970,35 @@ void compute_table_col_widths(const InlayMeasure* measure, EtchStr source, const
    uint32_t b0 = 0;
    while (b0 < blen && buf[b0] == ' ') ++b0;
    const float tw = blen > b0 ? etch_measure_text({buf + b0, blen - b0, false}, fid, cf, 0.f).x : 0.f;
-   const float cw = std::fmin(max_col, std::fmax(min_col, tw + 2.f * view.table_cell_padding_x + 16.f));
+   const float cw = std::fmax(min_col, tw + 2.f * view.table_cell_padding_x + 16.f);
    natural[c] = std::fmax(natural[c], cw);
    cstart = cstop + 1u;
   }
  }
+ float col_floor[kMaxAutoCols] = {};
+ float min_total = 0.f;
+ for (uint32_t c = 0; c < columns; ++c) {
+  col_floor[c] = std::fmax(44.f, std::fmin(88.f, natural[c]));
+  min_total += col_floor[c];
+ }
+ if (min_total > width + 0.5f) {
+  // Columns exceed available width: keep readable column widths and scroll horizontally!
+  float total_w = 0.f;
+  for (uint32_t c = 0; c < columns; ++c) {
+   out_widths[c] = std::fmax(col_floor[c], std::fmin(natural[c], 260.f));
+   total_w += out_widths[c];
+  }
+  return total_w;
+ }
  float sum = 0.f;
- for (uint32_t c = 0; c < columns; ++c) sum += natural[c];
+ for (uint32_t c = 0; c < columns; ++c) {
+  natural[c] = std::fmin(max_col_fit, natural[c]);
+  sum += natural[c];
+ }
  if (sum <= 0.f) {
   const float eq = width / float(columns);
   for (uint32_t c = 0; c < columns; ++c) out_widths[c] = eq;
-  return;
+  return width;
  }
  float used = 0.f;
  for (uint32_t c = 0; c < columns; ++c) {
@@ -1830,31 +2006,34 @@ void compute_table_col_widths(const InlayMeasure* measure, EtchStr source, const
   out_widths[c] = w;
   used += w;
  }
+ return width;
 }
 
-void get_table_col_widths(InlayMeasure* measure, EtchStr source, const InlayRow& info, uint32_t columns,
-                          float width, float font, const InlayDocStyle& style, const InlayDocViewDesc& view,
-                          float* out_widths) noexcept {
- if (!columns) return;
- if (columns > 32u) { compute_table_col_widths(measure, source, info, columns, width, font, style, view, out_widths); return; }
+float get_table_col_widths(InlayMeasure* measure, EtchStr source, const InlayRow& info, uint32_t columns,
+                           float width, float font, const InlayDocStyle& style, const InlayDocViewDesc& view,
+                           float* out_widths) noexcept {
+ if (!columns) return width;
+ if (columns > 32u) return compute_table_col_widths(measure, source, info, columns, width, font, style, view, out_widths);
  for (uint32_t i = 0; i < measure->table_cols_count; ++i) {
   if (measure->table_cols[i].header_row == info.table_header && measure->table_cols[i].columns == columns) {
    std::memcpy(out_widths, measure->table_cols[i].widths, size_t(columns) * sizeof(float));
-   return;
+   return measure->table_cols[i].total_width > 0.f ? measure->table_cols[i].total_width : width;
   }
  }
- compute_table_col_widths(measure, source, info, columns, width, font, style, view, out_widths);
+ const float total_w = compute_table_col_widths(measure, source, info, columns, width, font, style, view, out_widths);
  if (measure->table_cols_count == measure->table_cols_capacity) {
   const uint32_t cap = measure->table_cols_capacity ? measure->table_cols_capacity * 2u : 16u;
   auto* mem = static_cast<InlayTableCols*>(std::realloc(measure->table_cols, size_t(cap) * sizeof(InlayTableCols)));
-  if (!mem) return;
+  if (!mem) return total_w;
   measure->table_cols = mem;
   measure->table_cols_capacity = cap;
  }
  auto& entry = measure->table_cols[measure->table_cols_count++];
  entry.header_row = info.table_header;
  entry.columns = columns;
+ entry.total_width = total_w;
  std::memcpy(entry.widths, out_widths, size_t(columns) * sizeof(float));
+ return total_w;
 }
 
 float block_lines(InlayMeasure* measure, const InlayBlock& b, EtchStr source, uint32_t id, float font,
@@ -1887,8 +2066,14 @@ float block_lines(InlayMeasure* measure, const InlayBlock& b, EtchStr source, ui
    const EtchStr line = {code_src.chars + pos, ll, false};
    const uint32_t line_id = etch_id_index(id, ++line_index);
    if (wrap_code && code_gutter_w > 0.f) {
+    const uint16_t mono_f = effective_mono_font(style);
     const float code_font = effective_code_font_size(font, style);
     const float line_h = code_font * effective_line_scale(style);
+    const float ln_font = std::fmax(10.f, code_font * 0.92f);
+    const auto code_fm = etch_font_metrics(mono_f, code_font);
+    const auto ln_fm = etch_font_metrics(mono_f, ln_font);
+    const float code_lead = std::fmax(0.f, 0.5f * (line_h - (code_fm.ascent + code_fm.descent)));
+    const float ln_pad_top = std::fmax(0.f, code_lead + code_fm.ascent - ln_fm.ascent);
     auto wrow = etch_box_desc_default();
     wrow.axis = ETCH_AXIS_ROW;
     wrow.width = etch_sizing_fixed(std::fmax(1.f, code_row_w));
@@ -1899,7 +2084,7 @@ float block_lines(InlayMeasure* measure, const InlayBlock& b, EtchStr source, ui
     auto gbox = etch_box_desc_default();
     gbox.width = etch_sizing_fixed(code_gutter_w);
     gbox.height = etch_sizing_fit(0, 0);
-    gbox.padding = {0, 8, 0, 0};
+    gbox.padding = {0, 8, ln_pad_top, 0};
     gbox.align_x = ETCH_ALIGN_X_RIGHT;
     gbox.border_color = style.code_border.a != 0 ? style.code_border : theme.border_subtle;
     gbox.border_sides = {0, 1, 0, 0};
@@ -1911,9 +2096,8 @@ float block_lines(InlayMeasure* measure, const InlayBlock& b, EtchStr source, ui
      if (arena_s) {
       std::memcpy(arena_s, nb, size_t(n));
       auto lnd = etch_text_desc_default();
-      lnd.font_id = effective_mono_font(style);
-      lnd.font_size_px = std::fmax(10.f, code_font * 0.92f);
-      lnd.line_height_px = line_h;
+      lnd.font_id = mono_f;
+      lnd.font_size_px = ln_font;
       lnd.color = style.muted_color.a != 0 ? style.muted_color : theme.text_muted;
       lnd.wrap = false;
       etch_text({arena_s, uint32_t(n), false}, &lnd);
@@ -1936,31 +2120,51 @@ float block_lines(InlayMeasure* measure, const InlayBlock& b, EtchStr source, ui
   return 0.f;
  }
 
- uint32_t pos = b.content_offset, end = pos + b.content_length, line_index = 0;
+ const auto& full_blk = measure->doc->blocks[info.block];
+ const bool synth_blk = (full_blk.flags & INLAY_BLOCK_FLAG_SYNTHETIC) != 0;
+ const EtchStr blk_buf = synth_blk ? block_code_str(measure->doc, info.block) : source;
+ uint32_t pos = synth_blk ? info.offset : b.content_offset;
+ uint32_t end = synth_blk ? (info.offset + info.length) : (pos + b.content_length);
+ if (end > blk_buf.length) end = blk_buf.length;
+ uint32_t line_index = 0;
  bool emitted_plain_line = false;
  while (pos < end) {
   uint32_t next = pos;
-  while (next < end && source.chars[next] != '\n') ++next;
+  while (next < end && blk_buf.chars[next] != '\n') ++next;
   uint32_t logical = pos, logical_end = next;
-  if (logical_end > logical && source.chars[logical_end - 1u] == '\r') --logical_end;
-  const auto& full_blk = measure->doc->blocks[info.block];
-  uint32_t content_start = full_blk.offset;
-  if (full_blk.quote_depth > 0u) {
+  if (logical_end > logical && blk_buf.chars[logical_end - 1u] == '\r') --logical_end;
+  uint32_t content_start = synth_blk ? 0u : full_blk.offset;
+  if (!synth_blk && full_blk.quote_depth > 0u) {
    content_start += strip_quote_prefix(source.chars + content_start, source.length - content_start, full_blk.quote_depth);
   }
-  if (b.kind == INLAY_HEADING || b.kind == INLAY_FOOTNOTE) content_start = full_blk.content_offset;
-  const bool continuation = pos > content_start && pos > 0u && source.chars[pos - 1u] != '\n';
-  EtchStr line = slice(source, logical, logical_end - logical);
+  if (!synth_blk && (b.kind == INLAY_HEADING || b.kind == INLAY_FOOTNOTE)) content_start = full_blk.content_offset;
+  const bool continuation = !synth_blk && pos > content_start && pos > 0u && source.chars[pos - 1u] != '\n';
+  EtchStr line = slice(blk_buf, logical, logical_end - logical);
   const uint32_t line_id = etch_id_index(id, ++line_index);
   const auto render_rich = [&](EtchStr text, float avail_override = 0.f) {
    if (emitted_plain_line) ++doc_cursor;
    emitted_plain_line = true;
+   if (synth_blk) {
+    begin_inline_row(row_box);
+    auto td = etch_text_desc_default();
+    td.id = line_id;
+    td.font_id = b.kind == INLAY_HEADING ? (style.bold_font_id != ETCH_INVALID_FONT ? style.bold_font_id : static_cast<uint16_t>(ETCH_FONT_SEMIBOLD)) : effective_sans_font(style);
+    td.font_size_px = font;
+    td.line_height_px = font * effective_line_scale(style);
+    if (color_override.a != 0) td.color = color_override;
+    else if (style.text_color.a != 0) td.color = style.text_color;
+    td.wrap = true;
+    etch_text(text, &td);
+    doc_cursor += text.length;
+    if (estimate) height += (height > 0 ? 4.f : 0.f) + td.line_height_px;
+    return;
+   }
    const uint32_t offset = uint32_t(text.chars - source.chars);
    const float available = avail_override > 0.f ? avail_override : (b.kind == INLAY_LIST || b.kind == INLAY_TASK_LIST ? std::fmax(1.f, width - 8 - std::fmax(14.f, font)) : width);
    const float line_height = rich_line(measure, text, line_id, font, result, theme, style,
                                        pos > offset ? pos - offset : 0u, logical_end > offset ? logical_end - offset : 0u,
                                        available, estimate, row_box, row_index, info.block, &doc_cursor,
-                                       false, false, ETCH_ALIGN_X_LEFT, color_override);
+                                       false, b.kind == INLAY_HEADING, ETCH_ALIGN_X_LEFT, color_override);
    if (line_height > 0) height += (height > 0 ? 4.f : 0.f) + line_height;
   };
 
@@ -1979,27 +2183,52 @@ float block_lines(InlayMeasure* measure, const InlayBlock& b, EtchStr source, ui
     rule = table_line(source, measure->rows[info.table_header + 1u], full_blk.quote_depth);
     table_row_range(&rule, &rule_start);
    }
+   float col_widths_stack[32] = {};
+   float* col_widths = columns <= 32u ? col_widths_stack : nullptr;
+   const float total_table_w = col_widths
+    ? get_table_col_widths(measure, source, info, columns, width, font, style, view, col_widths)
+    : std::fmax(width, float(columns) * 88.f);
+   const bool table_hscroll = total_table_w > width + 0.5f;
+   if (table_hscroll) {
+    const uint32_t tscroll_id = etch_id_index(id, 2);
+    if (info.block < measure->open_capacity && measure->code_scroll_x) {
+     const float target_x = measure->code_scroll_x[info.block];
+     const float cur_x = etch_scroll_offset(tscroll_id).x;
+     if (std::fabs(cur_x - target_x) > 0.5f) {
+      etch_set_scroll_offset(tscroll_id, {target_x, 0.f}, true);
+     }
+     measure->rows[row_index].last_scroll_x = target_x;
+    }
+    auto tscroll = etch_box_desc_default();
+    tscroll.id = tscroll_id;
+    tscroll.width = etch_sizing_fixed(width);
+    tscroll.height = etch_sizing_fit(0, 4096);
+    tscroll.scroll_x = true;
+    tscroll.show_scrollbar = info.last_in_block;
+    tscroll.clip_children = true;
+    if (info.last_in_block) tscroll.padding = {0, 0, 0, 10.f};
+    etch_begin_box(&tscroll);
+   }
    auto row = etch_box_desc_default();
    row.id = line_id;
-   row.width = etch_sizing_fixed(width);
+   row.width = etch_sizing_fixed(table_hscroll ? total_table_w : width);
    row.height = etch_sizing_fit(0, 4096);
    row.scroll_y = true;
    row.clip_children = true;
    const EtchColor hdr_bg = style.table_header_bg.a != 0 ? style.table_header_bg : theme.bg_elevated;
-   row.background = info.first ? hdr_bg : info.zebra
-    ? etch_color_blend_over(theme.bg_table, theme.zebra_row) : theme.bg_table;
+   const EtchColor tbl_bg = style.table_bg.a != 0 ? style.table_bg : theme.bg_table;
+   const EtchColor zebra_bg = style.table_zebra_bg.a != 0 ? style.table_zebra_bg : etch_color_blend_over(tbl_bg, theme.zebra_row);
+   row.background = info.first ? hdr_bg : (info.zebra ? zebra_bg : tbl_bg);
    row.border_color = style.table_border.a != 0 ? style.table_border : theme.border_subtle;
-   row.border_sides = {1, 1, info.first ? 1.f : 0.f, 1};
+   const bool has_vlist_sep = (view.height_px > 0.f) && info.first && !info.last_in_block;
+   row.border_sides = {1, 1, info.first ? 1.f : 0.f, has_vlist_sep ? 0.f : 1.f};
    const float radius = view.table_radius_px;
    const float top = info.first ? radius : 0.f, bottom = info.last_in_block ? radius : 0.f;
    row.radius = {top, top, bottom, bottom};
    etch_begin_box(&row);
    uint32_t start = 0;
    table_row_range(&line, &start);
-   float col_widths_stack[32] = {};
-   float* col_widths = columns <= 32u ? col_widths_stack : nullptr;
-   if (col_widths) get_table_col_widths(measure, source, info, columns, width, font, style, view, col_widths);
-   const float eq_width = width / float(columns);
+   const float eq_width = (table_hscroll ? total_table_w : width) / float(columns);
    float tallest = 0;
    for (uint32_t column = 0; column < columns; ++column) {
     const float cell_width = col_widths ? col_widths[column] : eq_width;
@@ -2017,7 +2246,12 @@ float block_lines(InlayMeasure* measure, const InlayBlock& b, EtchStr source, ui
      if (column > 0u) ++doc_cursor; // '\t' separator between cells
      const uint32_t stop = table_cell_end(line, start);
      const float cell_font = info.first ? std::fmax(11.f, font * 0.88f) : font;
-     const EtchColor cell_col = (info.first && style.muted_color.a != 0) ? style.muted_color : color_override;
+     EtchColor cell_col = color_override;
+     if (info.first) {
+      if (style.table_header_color.a != 0) cell_col = style.table_header_color;
+      else if (style.heading_color.a != 0) cell_col = style.heading_color;
+      else if (style.text_color.a != 0) cell_col = style.text_color;
+     }
      const float cell_height = rich_line(measure, {line.chars + start, stop - start, false}, etch_id_index(line_id, column + 1u),
                                          cell_font, result, theme, style, 0, stop - start, std::fmax(1.f, cell_width - 2 * pad_x),
                                          estimate, row_box, row_index, info.block, &doc_cursor, true, info.first, align, cell_col);
@@ -2027,11 +2261,12 @@ float block_lines(InlayMeasure* measure, const InlayBlock& b, EtchStr source, ui
     etch_end_box();
    }
    etch_end_box();
+   if (table_hscroll) etch_end_box();
    if (estimate) return std::fmin(4096.f, tallest + 2 * view.table_cell_padding_y) +
-    (float(info.first) + float(info.last_in_block)) * padding;
+    (float(info.first) + float(info.last_in_block)) * padding + (table_hscroll && info.last_in_block ? 10.f : 0.f);
   } else {
    bool is_alert_tag = false;
-   if (!continuation && full_blk.quote_depth > 0u) {
+   if (!continuation && !synth_blk && full_blk.quote_depth > 0u) {
     const uint32_t qskip = strip_quote_prefix(line.chars, line.length, full_blk.quote_depth);
     line.chars += qskip;
     line.length -= qskip;
@@ -2048,7 +2283,7 @@ float block_lines(InlayMeasure* measure, const InlayBlock& b, EtchStr source, ui
     ad.font_id = effective_bold_font(style);
     ad.font_size_px = std::fmax(11.f, font * 0.86f);
     ad.line_height_px = ad.font_size_px * 1.3f;
-    ad.color = alert_accent_color(source, full_blk, theme);
+    ad.color = alert_accent_color(source, full_blk, style, theme);
     ad.wrap = false;
     etch_text(line, &ad);
     if (estimate) height += (height > 0 ? 4.f : 0.f) + ad.line_height_px;
@@ -2076,6 +2311,10 @@ float block_lines(InlayMeasure* measure, const InlayBlock& b, EtchStr source, ui
     uint32_t trim = 0;
     strip_list_marker(&line, meta, &ordered, &task, &marker, &trim);
     const float marker_w = ordered ? std::fmax(20.f, font * 1.4f) : std::fmax(14.f, font);
+    const uint16_t sans_f = effective_sans_font(style);
+    const float body_line_h = font * effective_line_scale(style);
+    const auto body_fm = etch_font_metrics(sans_f, font);
+    const float top_lead = std::fmax(0.f, 0.5f * (body_line_h - (body_fm.ascent + body_fm.descent)));
 
     if (pos == logical) {
      if (task) {
@@ -2090,8 +2329,15 @@ float block_lines(InlayMeasure* measure, const InlayBlock& b, EtchStr source, ui
       cb.checked = &checked;
       cb.box_size_px = std::fmax(14.f, font * 0.95f);
       cb.font_size_px = font;
-      cb.font_id = effective_sans_font(style);
+      cb.font_id = sans_f;
       if (style.link_color.a != 0) cb.accent = style.link_color;
+      const float cb_total_h = cb.box_size_px + 8.f;
+      const float cb_pad_top = std::fmax(0.f, (top_lead + body_fm.ascent * 0.625f) - cb_total_h * 0.5f);
+      if (cb_pad_top > 0.25f) {
+       auto cwrap = etch_box_desc_default();
+       cwrap.padding = {0, 0, cb_pad_top, 0};
+       etch_begin_box(&cwrap);
+      }
       if (etch_checkbox(&cb) && toggle_out) {
        uint32_t item_index = 0;
        const auto& bm = measure->doc->block_meta[info.block];
@@ -2102,21 +2348,22 @@ float block_lines(InlayMeasure* measure, const InlayBlock& b, EtchStr source, ui
        }
        *toggle_out = {check_offset, info.block, item_index, checked, true};
       }
+      if (cb_pad_top > 0.25f) etch_end_box();
      } else {
+      auto mbox = etch_box_desc_default();
       if (ordered) {
-       auto mbox = etch_box_desc_default();
        mbox.width = etch_sizing_fit(marker_w, 0);
        mbox.align_x = ETCH_ALIGN_X_RIGHT;
-       etch_begin_box(&mbox);
       }
+      mbox.padding = {0, 0, top_lead, 0};
+      etch_begin_box(&mbox);
       auto md = etch_text_desc_default();
       md.font_size_px = font;
-      md.font_id = effective_sans_font(style);
+      md.font_id = sans_f;
       md.wrap = false;
-      md.line_height_px = font * effective_line_scale(style);
       md.color = style.muted_color.a != 0 ? style.muted_color : (style.text_color.a != 0 ? style.text_color : theme.text_muted);
       etch_text(marker, &md);
-      if (ordered) etch_end_box();
+      etch_end_box();
      }
     }
     auto item_body = etch_box_desc_default();
@@ -2144,12 +2391,12 @@ float block_lines(InlayMeasure* measure, const InlayBlock& b, EtchStr source, ui
  return estimate ? height + 2 * padding : 0.f;
 }
 
-uint32_t row_end(const InlayMeasure* m, const InlayDocViewDesc& view, float row_width, const InlayBlock& b, uint32_t block, uint32_t pos, uint32_t limit, bool decorate) noexcept {
+uint32_t row_end(const InlayMeasure* m, const InlayBlock& b, uint32_t block, uint32_t pos, uint32_t limit, bool decorate, bool is_custom_fence) noexcept {
  const auto* doc = m->doc;
- if (b.kind == INLAY_CODE_BLOCK && (b.flags & INLAY_BLOCK_FLAG_SYNTHETIC)) {
+ if (b.flags & INLAY_BLOCK_FLAG_SYNTHETIC) {
   const auto& meta = doc->block_meta[block];
   const uint32_t end = meta.pool_length;
-  if (diagram_block(doc, b) || custom_fence_estimate(view, doc, block, std::fmax(1.f, row_width - 2 * view.block_padding_px)) > 0.f) return end;
+  if (b.kind != INLAY_CODE_BLOCK || diagram_block(doc, b) || is_custom_fence) return end;
   uint32_t stop = pos;
   for (uint32_t line = 0; line < 16u && stop < end; ++line) {
    while (stop < end && doc->ast_text[meta.pool_offset + stop] != '\n') ++stop;
@@ -2159,7 +2406,7 @@ uint32_t row_end(const InlayMeasure* m, const InlayDocViewDesc& view, float row_
  }
  const uint32_t end = b.content_offset + b.content_length;
  if ((b.kind == INLAY_DETAILS && !m->open[block]) || b.kind == INLAY_MATH_BLOCK || b.kind == INLAY_IMAGE || b.kind == INLAY_FOOTNOTE ||
-     diagram_block(doc, b) || custom_fence_estimate(view, doc, block, std::fmax(1.f, row_width - 2 * view.block_padding_px)) > 0.f) return end;
+     diagram_block(doc, b) || is_custom_fence) return end;
  uint32_t stop = pos;
  if (b.kind == INLAY_CODE_BLOCK) {
   for (uint32_t line = 0; line < 16u && stop < end; ++line) {
@@ -2199,12 +2446,23 @@ bool prepare_view(InlayDoc* doc, InlayMeasure* measure, const InlayDocViewDesc& 
   measure->code_wrap = wraps;
   auto* scx = static_cast<float*>(std::realloc(measure->code_scroll_x, size_t(cap) * sizeof(float)));
   if (!scx) return false;
-  for (uint32_t i = measure->open_capacity; i < cap; ++i) { data[i] = true; wraps[i] = false; scx[i] = 0.f; }
   measure->code_scroll_x = scx;
+  auto* dfull = static_cast<bool*>(std::realloc(measure->diagram_full_scale, cap * sizeof(bool)));
+  if (!dfull) return false;
+  measure->diagram_full_scale = dfull;
+  auto* cflash = static_cast<uint64_t*>(std::realloc(measure->copied_until_ms, size_t(cap) * sizeof(uint64_t)));
+  if (!cflash) return false;
+  measure->copied_until_ms = cflash;
+  for (uint32_t i = measure->open_capacity; i < cap; ++i) {
+   data[i] = true; wraps[i] = false; scx[i] = 0.f; dfull[i] = false; cflash[i] = 0u;
+  }
   measure->open_capacity = cap;
  }
  if (measure->width == 0) {
-  for (uint32_t i = 0; i < measure->open_capacity; ++i) { measure->open[i] = true; measure->code_wrap[i] = false; measure->code_scroll_x[i] = 0.f; }
+  for (uint32_t i = 0; i < measure->open_capacity; ++i) {
+   measure->open[i] = true; measure->code_wrap[i] = false; measure->code_scroll_x[i] = 0.f;
+   measure->diagram_full_scale[i] = false; measure->copied_until_ms[i] = 0u;
+  }
   measure->doc_sel_active = false;
   measure->doc_sel_dragging = false;
   measure->doc_sel_pending_span = false;
@@ -2221,14 +2479,25 @@ bool prepare_view(InlayDoc* doc, InlayMeasure* measure, const InlayDocViewDesc& 
  if (!cache_inline(measure, source)) return false;
  const uint32_t limit = uint32_t(std::fmin(2048.f, std::fmax(32.f, (row_width - 48) / (view.font_size_px + 12) * 24)));
  const bool decorate = view.inline_decorator_fn != nullptr;
+ const bool has_custom_fence_cb = view.custom_fence_estimate_fn && view.custom_fence_render_fn;
+ float* custom_est = (doc->block_count && has_custom_fence_cb)
+  ? static_cast<float*>(etch_frame_arena_alloc(doc->context, size_t(doc->block_count) * sizeof(float), alignof(float)))
+  : nullptr;
  uint32_t needed = 0;
  for (uint32_t block = 0; block < doc->block_count; ++block) {
   const auto& b = doc->blocks[block];
+  float ch = 0.f;
+  if (has_custom_fence_cb) {
+   const float eff_row_w = std::fmax(32.f, row_width - block_nest_indent(b, view.font_size_px));
+   ch = custom_fence_estimate(view, doc, block, std::fmax(1.f, eff_row_w - 2.f * view.block_padding_px));
+   if (custom_est) custom_est[block] = ch;
+  }
+  const bool is_custom = ch > 0.f;
   const bool synth = (b.flags & INLAY_BLOCK_FLAG_SYNTHETIC) != 0;
   uint32_t pos = synth ? 0u : b.content_offset;
   const uint32_t end = synth ? doc->block_meta[block].pool_length : (pos + b.content_length);
   do {
-   const uint32_t stop = row_end(measure, view, row_width, b, block, pos, limit, decorate);
+   const uint32_t stop = row_end(measure, b, block, pos, limit, decorate, is_custom);
    ++needed;
    pos = stop;
   } while (pos < end);
@@ -2252,20 +2521,26 @@ bool prepare_view(InlayDoc* doc, InlayMeasure* measure, const InlayDocViewDesc& 
  uint32_t row = 0;
  for (uint32_t block = 0; block < doc->block_count; ++block) {
   const auto& b = doc->blocks[block];
+  float ch = 0.f;
+  if (has_custom_fence_cb) {
+   ch = custom_est ? custom_est[block]
+    : custom_fence_estimate(view, doc, block, std::fmax(1.f, std::fmax(32.f, row_width - block_nest_indent(b, view.font_size_px)) - 2.f * view.block_padding_px));
+  }
+  const bool is_custom = ch > 0.f;
   const bool synth = (b.flags & INLAY_BLOCK_FLAG_SYNTHETIC) != 0;
   uint32_t pos = synth ? 0u : b.content_offset;
   const uint32_t end = synth ? doc->block_meta[block].pool_length : (pos + b.content_length);
   const uint32_t header = row;
   uint32_t last = row;
   bool zebra = false, need_separator = b.kind == INLAY_TABLE;
-  const bool is_code = b.kind == INLAY_CODE_BLOCK && !diagram_block(doc, b);
+  const bool is_code = b.kind == INLAY_CODE_BLOCK && !diagram_block(doc, b) && !is_custom;
   const EtchStr lang = is_code ? slice(source, b.language_offset, b.language_length) : EtchStr{};
   const EtchStr code_src = is_code ? block_code_str(doc, block) : EtchStr{};
   const uint32_t code_base = synth ? 0u : b.content_offset;
   uint32_t code_line_num = 1, max_line_off = 0, max_line_len = 0;
   uint8_t lex_st = 0;
   do {
-   const uint32_t stop = row_end(measure, view, row_width, b, block, pos, limit, decorate);
+   const uint32_t stop = row_end(measure, b, block, pos, limit, decorate, is_custom);
    const bool first = pos == (synth ? 0u : b.content_offset);
    bool separator = false;
    if (need_separator && !first) {
@@ -2273,7 +2548,8 @@ bool prepare_view(InlayDoc* doc, InlayMeasure* measure, const InlayDocViewDesc& 
     separator = inlay_table_rule(source.chars + pos + qskip, (stop - pos) - qskip);
    }
    const uint32_t li_idx = (b.kind == INLAY_LIST || b.kind == INLAY_TASK_LIST) ? find_list_item_for_offset(doc, block, pos) : UINT32_MAX;
-   InlayRow next = {block, pos, stop - pos, header, 0, code_line_num, 1, 0, 0, li_idx, 0.f, 0.f, 0.f, lex_st, first, zebra, separator, false, b.kind};
+   InlayRow next = {block, pos, stop - pos, header, 0, code_line_num, 1, 0, 0, li_idx, 0.f, 0.f, 0.f, lex_st, first, zebra, separator, false, is_custom, b.kind};
+   if (is_custom) next.estimate = ch + 2.f * view.block_padding_px;
    if (is_code) {
     uint32_t lp = pos >= code_base ? (pos - code_base) : 0u;
     const uint32_t le = stop >= code_base ? (stop - code_base) : 0u;
@@ -2294,7 +2570,8 @@ bool prepare_view(InlayDoc* doc, InlayMeasure* measure, const InlayDocViewDesc& 
    if (!separator) { last = row; if (!first) zebra = !zebra; }
    const bool same = !reflow && block < measure->frozen_count && row < measure->count &&
     measure->rows[row].block == block && measure->rows[row].offset == pos &&
-    measure->rows[row].length == stop - pos && measure->rows[row].kind == b.kind;
+    measure->rows[row].length == stop - pos && measure->rows[row].kind == b.kind &&
+    measure->rows[row].is_custom_fence == is_custom;
    if (same) { next.estimate = measure->rows[row].estimate; next.last_scroll_x = measure->rows[row].last_scroll_x; }
    else measure->heights[row] = 0;
    measure->rows[row++] = next;
@@ -2346,12 +2623,17 @@ bool valid_style(const InlayDocStyle* s) noexcept {
  if (!s) return true;
  if (!std::isfinite(s->line_height_scale) || s->line_height_scale < 0.f || s->line_height_scale > 10.f) return false;
  if (!std::isfinite(s->code_font_scale) || s->code_font_scale < 0.f || s->code_font_scale > 4.f) return false;
+ if (!std::isfinite(s->inline_code_padding_x) || s->inline_code_padding_x < 0.f || s->inline_code_padding_x > 64.f) return false;
+ if (!std::isfinite(s->inline_code_padding_y) || s->inline_code_padding_y < -1.f || s->inline_code_padding_y > 32.f) return false;
+ if (!std::isfinite(s->inline_code_radius_px) || s->inline_code_radius_px < 0.f || s->inline_code_radius_px > 64.f) return false;
+ if (!std::isfinite(s->alert_bg_alpha) || s->alert_bg_alpha < -1.f || s->alert_bg_alpha > 1.f) return false;
  for (float hs : s->heading_scale) if (!std::isfinite(hs) || hs < 0.f || hs > 10.f) return false;
  return true;
 }
 bool style_reflow_changed(const InlayDocStyle& a, const InlayDocStyle& b) noexcept {
  if (a.font_id != b.font_id || a.bold_font_id != b.bold_font_id || a.mono_font_id != b.mono_font_id ||
-     a.line_height_scale != b.line_height_scale || a.code_font_scale != b.code_font_scale) return true;
+     a.line_height_scale != b.line_height_scale || a.code_font_scale != b.code_font_scale ||
+     a.inline_code_padding_x != b.inline_code_padding_x || a.inline_code_padding_y != b.inline_code_padding_y) return true;
  for (int i = 0; i < 6; ++i) if (a.heading_scale[i] != b.heading_scale[i]) return true;
  return false;
 }
@@ -2604,14 +2886,15 @@ INLAY_API float inlay_doc_measure_height(InlayDoc* doc, uint32_t view_id, float 
   const auto& b = doc->blocks[i];
   if (i && view.height_px == 0) total += view.block_gap_px;
   if (b.kind != INLAY_TABLE) {
-   const float custom_h = custom_fence_estimate(view, doc, i, std::fmax(1.f, width - 2 * view.block_padding_px));
+   const float eff_w = std::fmax(32.f, width - block_nest_indent(b, view.font_size_px));
+   const float custom_h = custom_fence_estimate(view, doc, i, std::fmax(1.f, eff_w - 2 * view.block_padding_px));
    if (custom_h > 0.f) {
     total += custom_h + 2 * view.block_padding_px;
     continue;
    }
    const EtchStr img_src = b.kind == INLAY_IMAGE ? slice(source, b.language_offset, b.language_length) : EtchStr{};
    const EtchStr body = (b.flags & INLAY_BLOCK_FLAG_SYNTHETIC) ? block_code_str(doc, i) : slice(source, b.content_offset, b.content_length);
-   total += estimate_row(view, style, width, b, body, true, true, diagram_block(doc, b), 1, img_src);
+   total += estimate_row(view, style, width, b, body, true, true, diagram_block(doc, b), 1, img_src, i);
    continue;
   }
   uint32_t pos = b.content_offset, end = pos + b.content_length, columns = 1;
@@ -2811,7 +3094,7 @@ INLAY_API uint32_t inlay_doc_view_copy_markdown(const InlayDoc* doc, uint32_t vi
 
 INLAY_API InlayDocResult inlay_doc_view(InlayDoc* doc, const InlayDocViewDesc* input_in) {
  InlayDocResult result = {};
- InlayDocViewDesc view = {};
+ InlayDocViewDesc view = inlay_doc_view_desc_default();
  if (!doc || !inlay_read_abi_struct(input_in, &view) || !valid_dimensions(view.id, view.width_px, view.font_size_px) ||
      !std::isfinite(view.height_px) || view.height_px < 0 || (view.height_px > 0 && view.height_px < 1) ||
      !valid_spacing(view.block_padding_px) || !valid_spacing(view.block_gap_px) ||
@@ -2841,6 +3124,9 @@ INLAY_API InlayDocResult inlay_doc_view(InlayDoc* doc, const InlayDocViewDesc* i
   old.custom_fence_user_data != view.custom_fence_user_data ||
   old.code_header_fn != view.code_header_fn ||
   old.code_header_user_data != view.code_header_user_data ||
+  old.show_code_line_numbers != view.show_code_line_numbers ||
+  old.diagram_header_fn != view.diagram_header_fn ||
+  old.diagram_header_user_data != view.diagram_header_user_data ||
   (measure->width != 0 && style_reflow_changed(measure->style, style));
  const bool refresh = reflow || measure->revision != doc->revision;
  float previous_height = flow && !refresh ? etch_element_bounds(view.id).h : 0.f;
@@ -2898,8 +3184,9 @@ INLAY_API InlayDocResult inlay_doc_view(InlayDoc* doc, const InlayDocViewDesc* i
  if (measure->code_scroll_x) {
   for (uint32_t i = result.visible_first; i < result.visible_end; ++i) {
    const auto& rinfo = measure->rows[i];
-   if (rinfo.kind != INLAY_CODE_BLOCK || rinfo.block >= measure->open_capacity) continue;
-   if (measure->code_wrap && measure->code_wrap[rinfo.block]) continue;
+   if ((rinfo.kind != INLAY_CODE_BLOCK && rinfo.kind != INLAY_TABLE) || rinfo.block >= measure->open_capacity) continue;
+   if (rinfo.kind == INLAY_CODE_BLOCK && measure->code_wrap && measure->code_wrap[rinfo.block]) continue;
+   if (rinfo.separator) continue;
    const uint32_t base_off = (doc->blocks[rinfo.block].flags & INLAY_BLOCK_FLAG_SYNTHETIC) ? 0u : doc->blocks[rinfo.block].content_offset;
    const uint32_t rid = etch_id_index(etch_id_index(view.id, rinfo.block + 1u), (rinfo.offset - base_off) + 1u);
    const float cur_x = etch_scroll_offset(etch_id_index(rid, 2)).x;
@@ -2930,8 +3217,9 @@ INLAY_API InlayDocResult inlay_doc_view(InlayDoc* doc, const InlayDocViewDesc* i
     auto spacer = etch_box_desc_default();
     spacer.height = etch_sizing_fixed(1);
     if (info.separator && !measure->rows[info.table_header].last_in_block) {
+     const float sep_indent = block_nest_indent(doc->blocks[info.block], view.font_size_px);
      spacer.width = etch_sizing_fixed(row_width);
-     spacer.padding = etch_padding_xy(view.block_padding_px, 0);
+     spacer.padding = {sep_indent + view.block_padding_px, view.block_padding_px, 0.f, 0.f};
      etch_begin_box(&spacer);
      auto seam = etch_box_desc_default();
      seam.width = etch_sizing_grow(0, 0);
@@ -2943,8 +3231,7 @@ INLAY_API InlayDocResult inlay_doc_view(InlayDoc* doc, const InlayDocViewDesc* i
    }
    continue;
   }
-  const bool is_custom_fence = b.kind == INLAY_CODE_BLOCK && info.first &&
-   custom_fence_estimate(view, doc, info.block, std::fmax(1.f, row_width - 2 * view.block_padding_px)) > 0.f;
+  const bool is_custom_fence = info.is_custom_fence && info.first;
   if (!is_custom_fence) push_u32(&measure->vis_row_ids, &measure->vis_row_count, &measure->vis_row_cap, row_id);
 
   // Nested blockquote/alert/list indentation wrapper for nested AST nodes!
@@ -2973,13 +3260,15 @@ INLAY_API InlayDocResult inlay_doc_view(InlayDoc* doc, const InlayDocViewDesc* i
    qw.height = etch_sizing_fit(0, 0);
    qw.padding = {12.f, 0.f, 2.f, 2.f};
    qw.border_color = b.alert_kind != INLAY_ALERT_NONE
-    ? (style.quote_border.a != 0 ? style.quote_border : alert_accent_from_kind(b.alert_kind, theme))
+    ? alert_accent_from_kind(b.alert_kind, style, theme)
     : (style.quote_border.a != 0 ? style.quote_border : (theme.border_control.a != 0 ? theme.border_control : theme.border_subtle));
    qw.border_sides = {2.5f, 0.f, 0.f, 0.f};
    etch_begin_box(&qw);
    ++open_wrappers;
   }
 
+  const bool is_mermaid = diagram_block(doc, b);
+  const bool is_code_card = b.kind == INLAY_CODE_BLOCK && !is_custom_fence;
   const float padding = is_custom_fence ? view.block_padding_px : block_padding(view, b.kind);
   auto box = etch_box_desc_default();
   box.id = row_id;
@@ -2990,31 +3279,47 @@ INLAY_API InlayDocResult inlay_doc_view(InlayDoc* doc, const InlayDocViewDesc* i
   box.gap = 4;
   box.clip_children = true;
   box.shrink_width = true;
+  if (b.kind == INLAY_HEADING && info.first && info.block > 0u) {
+   box.padding.top += (b.level <= 2u ? 8.f : 5.f);
+  }
   if (b.kind == INLAY_TABLE) {
    box.padding = {padding, padding, info.first ? padding : 0.f, info.last_in_block ? padding : 0.f};
    box.gap = 0;
   }
-  if (b.kind == INLAY_CODE_BLOCK && !is_custom_fence) {
+  if (is_code_card) {
+   const float r = theme.radius_panel_px;
    box.background = style.code_bg.a != 0 ? style.code_bg : theme.bg_elevated;
    box.border_color = style.code_border.a != 0 ? style.code_border : theme.border_subtle;
-   box.border_width = 1;
-   box.radius = etch_corners_all(theme.radius_panel_px);
+   box.border_width = 0.f;
+   box.border_sides = {1.f, 1.f, info.first ? 1.f : 0.f, info.last_in_block ? 1.f : 0.f};
+   box.radius = {info.first ? r : 0.f, info.first ? r : 0.f, info.last_in_block ? r : 0.f, info.last_in_block ? r : 0.f};
+   box.padding = {0.f, 0.f, 0.f, 0.f};
+   box.gap = 0.f;
   } else if (b.kind == INLAY_ALERT) {
-   const EtchColor acol = style.quote_border.a != 0 ? style.quote_border : alert_accent_color(source, doc->blocks[info.block], theme);
-   box.background = style.quote_bg.a != 0 ? style.quote_bg : theme.bg_elevated;
+   const EtchColor acol = alert_accent_color(source, doc->blocks[info.block], style, theme);
+   const EtchColor base_bg = style.quote_bg.a != 0 ? style.quote_bg : theme.bg_elevated;
+   const float tint_a = style.alert_bg_alpha < 0.f ? 0.f : (style.alert_bg_alpha > 0.f ? style.alert_bg_alpha : 0.09f);
+   if (tint_a > 0.f) {
+    const uint8_t a8 = uint8_t(std::fmin(255.f, std::round(tint_a * 255.f)));
+    box.background = etch_color_blend_over(base_bg, {acol.r, acol.g, acol.b, a8});
+   } else {
+    box.background = base_bg;
+   }
    box.border_color = acol;
    box.border_sides = {3.f, 0.f, 0.f, 0.f};
-   box.radius = {2.f, 6.f, 6.f, 2.f};
-   box.padding = {padding + 4.f, padding, padding * 0.85f, padding * 0.85f};
+   box.radius = {info.first ? 2.f : 0.f, info.first ? 6.f : 0.f, info.last_in_block ? 6.f : 0.f, info.last_in_block ? 2.f : 0.f};
+   box.padding = {padding + 4.f, padding, info.first ? padding * 0.85f : 2.f, info.last_in_block ? padding * 0.85f : 2.f};
   } else if (b.kind == INLAY_BLOCKQUOTE) {
    box.background = style.quote_bg.a != 0 ? style.quote_bg : theme.bg_elevated;
    box.border_color = style.quote_border.a != 0 ? style.quote_border : (theme.border_control.a != 0 ? theme.border_control : theme.border_subtle);
    box.border_sides = {2.5f, 0.f, 0.f, 0.f};
-   box.radius = {2.f, 6.f, 6.f, 2.f};
-   box.padding = {padding + 4.f, padding, padding * 0.85f, padding * 0.85f};
+   box.radius = {info.first ? 2.f : 0.f, info.first ? 6.f : 0.f, info.last_in_block ? 6.f : 0.f, info.last_in_block ? 2.f : 0.f};
+   box.padding = {padding + 4.f, padding, info.first ? padding * 0.85f : 2.f, info.last_in_block ? padding * 0.85f : 2.f};
   }
 
-  const float inner_w = std::fmax(1.f, eff_row_width - box.padding.left - box.padding.right);
+  const float inner_w = is_code_card
+   ? std::fmax(1.f, eff_row_width - 2.f * padding)
+   : std::fmax(1.f, eff_row_width - box.padding.left - box.padding.right);
   const EtchBoxDesc* pending_box = !info.first && view.inline_decorator_fn && !(b.flags & INLAY_BLOCK_FLAG_SYNTHETIC) &&
    info.offset > 0u && source.chars[info.offset - 1u] != '\n' &&
    b.kind != INLAY_CODE_BLOCK && b.kind != INLAY_TABLE && b.kind != INLAY_THEMATIC_BREAK && b.kind != INLAY_IMAGE && b.kind != INLAY_FOOTNOTE ? &box : nullptr;
@@ -3027,9 +3332,163 @@ INLAY_API InlayDocResult inlay_doc_view(InlayDoc* doc, const InlayDocViewDesc* i
    rule.height = etch_sizing_fixed(1);
    rule.background = theme.border_line;
    etch_box(&rule);
-  } else if (b.kind == INLAY_MATH_BLOCK || diagram_block(doc, b)) {
-   const EtchStr body = (b.kind == INLAY_CODE_BLOCK) ? block_code_str(doc, info.block) : slice(source, b.content_offset, b.content_length);
-   native_box(body, view.font_size_px, b.kind != INLAY_MATH_BLOCK, etch_id_index(row_id, 7), inner_w, style.text_color);
+  } else if (b.kind == INLAY_MATH_BLOCK) {
+   const EtchStr body = slice(source, b.content_offset, b.content_length);
+   const float mh = native_math_box(body, view.font_size_px, etch_id_index(row_id, 7), inner_w, style.text_color, true);
+   if (mh > 0.f && measure->heights[i] == 0.f) {
+    styled_height = mh + box.padding.top + box.padding.bottom;
+   }
+  } else if (is_mermaid) {
+   const auto& full = doc->blocks[info.block];
+   const EtchStr body = block_code_str(doc, info.block);
+   const float r = theme.radius_panel_px;
+   const uint16_t mono_f = effective_mono_font(style);
+   const float code_font = effective_code_font_size(view.font_size_px, style);
+   const EtchColor muted_col = style.muted_color.a != 0 ? style.muted_color : theme.text_muted;
+   const bool full_scale = info.block < measure->open_capacity && measure->diagram_full_scale && measure->diagram_full_scale[info.block];
+
+   EtchStr copied = body;
+   InlayDiagramResult diagram_result = {};
+   InlayDiagramMeta diagram_meta = {};
+   InlayDiagramDesc ddesc = inlay_diagram_desc_default();
+   if (full.complete) {
+    auto* copy = body.length ? static_cast<char*>(etch_frame_arena_alloc(doc->context, body.length, 1)) : nullptr;
+    if (copy) { std::memcpy(copy, body.chars, body.length); copied = {copy, body.length, false}; }
+    if (!body.length || copy) {
+     ddesc.font_size_px = view.font_size_px;
+     ddesc.max_width_px = full_scale ? 0.f : inner_w;
+     if (style.font_id != ETCH_INVALID_FONT || style.bold_font_id != ETCH_INVALID_FONT) {
+      ddesc.has_custom_fonts = true;
+      ddesc.font_id = style.font_id;
+      ddesc.bold_font_id = style.bold_font_id;
+     }
+     diagram_result = inlay_diagram_layout_ex(copied, &ddesc, &diagram_meta);
+    }
+   }
+
+   // Compact Mermaid header strip
+   {
+    auto hdr = etch_box_desc_default();
+    hdr.width = etch_sizing_fixed(eff_row_width);
+    hdr.height = etch_sizing_fit(0, 0);
+    hdr.padding = {padding, padding, 6.f, 6.f};
+    hdr.align_y = ETCH_ALIGN_Y_CENTER;
+    hdr.gap = 6;
+    if (style.code_header_bg.a != 0) hdr.background = style.code_header_bg;
+    hdr.radius = {r, r, 0.f, 0.f};
+    hdr.border_color = style.code_border.a != 0 ? style.code_border : theme.border_subtle;
+    hdr.border_sides = {0, 0, 0, 1};
+    etch_begin_box(&hdr);
+    auto ld = etch_text_desc_default();
+    ld.font_id = mono_f;
+    ld.font_size_px = std::fmax(11.f, view.font_size_px * 0.82f);
+    ld.color = muted_col;
+    ld.wrap = false;
+    etch_text(full.complete ? ETCH_STR_LIT("Mermaid") : ETCH_STR_LIT("Mermaid..."), &ld);
+    auto sp = etch_box_desc_default();
+    sp.width = etch_sizing_grow(0, 0);
+    sp.height = etch_sizing_fixed(1);
+    sp.shrink_width = true;
+    etch_box(&sp);
+    if (full.complete && diagram_result.valid && diagram_result.natural_width > inner_w + 0.5f &&
+        info.block < measure->open_capacity && measure->diagram_full_scale) {
+     const uint32_t fit_id = etch_id_index(row_id, 4);
+     push_u32(&measure->vis_ctrl_ids, &measure->vis_ctrl_count, &measure->vis_ctrl_cap, fit_id);
+     auto fbtn = etch_button_desc_default();
+     fbtn.id = fit_id;
+     fbtn.variant = ETCH_BUTTON_GHOST;
+     fbtn.label = full_scale ? ETCH_STR_LIT("Fit") : ETCH_STR_LIT("100%");
+     fbtn.font_size_px = std::fmax(11.f, view.font_size_px * 0.78f);
+     fbtn.padding = etch_padding_xy(6, 2);
+     if (etch_button(&fbtn)) {
+      measure->diagram_full_scale[info.block] = !measure->diagram_full_scale[info.block];
+      measure->heights[i] = 0;
+      measure->rows[i].estimate = 0;
+      if (!flow) etch_virtual_list_invalidate_heights(view.id);
+      etch_request_redraw(doc->context);
+     }
+    }
+    if (view.diagram_header_fn) {
+     view.diagram_header_fn(info.block, row_id, ETCH_STR_LIT("mermaid"), body, view.diagram_header_user_data);
+    }
+    if (!view.hide_code_copy_button) {
+     const uint64_t now_ms = SDL_GetTicks();
+     const bool copied_active = info.block < measure->open_capacity && measure->copied_until_ms &&
+      measure->copied_until_ms[info.block] > now_ms;
+     if (copied_active) etch_request_redraw(doc->context);
+     auto cbtn = etch_button_desc_default();
+     cbtn.id = etch_id_index(row_id, 1);
+     push_u32(&measure->vis_ctrl_ids, &measure->vis_ctrl_count, &measure->vis_ctrl_cap, cbtn.id);
+     cbtn.variant = ETCH_BUTTON_GHOST;
+     cbtn.label = copied_active ? ETCH_STR_LIT("Copied") : ETCH_STR_LIT("Copy");
+     cbtn.font_size_px = std::fmax(11.f, view.font_size_px * 0.78f);
+     cbtn.padding = etch_padding_xy(6, 2);
+     if (etch_button(&cbtn)) {
+      char* copy = static_cast<char*>(etch_frame_arena_alloc(doc->context, size_t(body.length) + 1u, 1));
+      if (copy) { std::memcpy(copy, body.chars, body.length); copy[body.length] = 0; etch_set_clipboard_text(copy); }
+      if (info.block < measure->open_capacity && measure->copied_until_ms) {
+       measure->copied_until_ms[info.block] = now_ms + 1500u;
+       etch_request_redraw(doc->context);
+      }
+     }
+    }
+    etch_end_box();
+   }
+
+   const bool valid_diagram = full.complete && diagram_result.valid;
+   const bool needs_hscroll = valid_diagram && diagram_result.width > inner_w + 0.5f;
+   auto dbody = etch_box_desc_default();
+   dbody.axis = ETCH_AXIS_COL;
+   dbody.width = etch_sizing_fixed(eff_row_width);
+   dbody.height = etch_sizing_fit(0, 0);
+   dbody.padding = {padding, padding, 8.f, padding};
+   if (valid_diagram) dbody.align_x = needs_hscroll ? ETCH_ALIGN_X_LEFT : ETCH_ALIGN_X_CENTER;
+   etch_begin_box(&dbody);
+   if (!valid_diagram) {
+    auto ph = etch_text_desc_default();
+    ph.font_id = mono_f;
+    ph.font_size_px = code_font;
+    ph.line_height_px = code_font * effective_line_scale(style);
+    ph.color = !full.complete ? muted_col : (style.code_color.a != 0 ? style.code_color : theme.text_code);
+    ph.wrap = true;
+    etch_text(body.length ? body : ETCH_STR_LIT("..."), &ph);
+   } else {
+    const float dw = diagram_result.width;
+    const float dh = diagram_result.height;
+    const float scroll_pad_b = needs_hscroll ? 14.f : 0.f;
+    const float extra_h = 8.f + scroll_pad_b;
+    const bool needs_vscroll = (dh + extra_h) > 4096.f;
+    const float box_h = std::fmin(dh + extra_h, 4096.f);
+    auto dbox = etch_box_desc_default();
+    dbox.id = etch_id_index(row_id, 7);
+    dbox.width = etch_sizing_fixed(std::fmin(dw, inner_w));
+    dbox.height = etch_sizing_fixed(box_h);
+    dbox.scroll_y = needs_vscroll;
+    dbox.scroll_x = needs_hscroll;
+    dbox.clip_children = true;
+    etch_begin_box(&dbox);
+    if (needs_hscroll || needs_vscroll) {
+     auto dcontent = etch_box_desc_default();
+     dcontent.width = etch_sizing_fixed(dw);
+     dcontent.height = etch_sizing_fixed(dh + extra_h);
+     etch_begin_box(&dcontent);
+    }
+    auto* draw = static_cast<NativeDraw*>(etch_frame_arena_alloc(doc->context, sizeof(NativeDraw), alignof(NativeDraw)));
+    if (draw) {
+     *draw = {copied, diagram_result, diagram_meta, ddesc, {}, true, theme, style.text_color};
+     etch_draw_after_layout(draw_native, draw, false);
+    }
+    if (needs_hscroll || needs_vscroll) etch_end_box();
+    etch_end_box();
+    if (measure->heights[i] == 0.f) {
+     const float hdr_lbl_font = std::fmax(11.f, view.font_size_px * 0.82f);
+     const float hdr_btn_font = std::fmax(11.f, view.font_size_px * 0.78f);
+     const float hdr_h = std::fmax(etch_font_metrics(mono_f, hdr_lbl_font).line_height,
+                                   etch_font_metrics(effective_sans_font(style), hdr_btn_font).line_height + 4.f) + 13.f;
+     styled_height = hdr_h + 8.f + padding + box_h + 2.f;
+    }
+   }
+   etch_end_box();
   } else if (b.kind == INLAY_IMAGE) {
    const auto& full = doc->blocks[info.block];
    const EtchStr alt = slice(source, full.content_offset, full.content_length);
@@ -3046,6 +3505,9 @@ INLAY_API InlayDocResult inlay_doc_view(InlayDoc* doc, const InlayDocViewDesc* i
    } else draw_image_fallback(alt, etch_id_index(row_id, 1), view.font_size_px, style, theme);
   } else if (b.kind == INLAY_FOOTNOTE) {
    const float fn_font = std::fmax(10.f, view.font_size_px * 0.85f);
+   const uint16_t fn_fid = effective_sans_font(style);
+   const float fn_line_h = fn_font * effective_line_scale(style);
+   const float fn_top_lead = baseline_top_lead(fn_fid, fn_font, fn_line_h);
    const EtchColor muted = style.muted_color.a != 0 ? style.muted_color : theme.text_muted;
    if (info.first) {
     auto div = etch_box_desc_default();
@@ -3060,9 +3522,12 @@ INLAY_API InlayDocResult inlay_doc_view(InlayDoc* doc, const InlayDocViewDesc* i
    fn_row.align_y = ETCH_ALIGN_Y_TOP;
    etch_begin_box(&fn_row);
    if (info.first && b.language_length) {
+    auto lwrap = etch_box_desc_default();
+    lwrap.padding = {0, 0, fn_top_lead, 0};
+    etch_begin_box(&lwrap);
     auto lbl = etch_text_desc_default();
     lbl.font_size_px = fn_font;
-    lbl.font_id = effective_sans_font(style);
+    lbl.font_id = fn_fid;
     lbl.color = style.link_color.a != 0 ? style.link_color : muted;
     lbl.wrap = false;
     char* lbuf = static_cast<char*>(etch_frame_arena_alloc(doc->context, size_t(b.language_length) + 3, 1));
@@ -3073,6 +3538,7 @@ INLAY_API InlayDocResult inlay_doc_view(InlayDoc* doc, const InlayDocViewDesc* i
      lbuf[b.language_length + 2u] = ':';
      etch_text({lbuf, b.language_length + 3u, false}, &lbl);
     } else etch_text(slice(source, b.language_offset, b.language_length), &lbl);
+    etch_end_box();
    }
    auto fn_body = etch_box_desc_default();
    fn_body.axis = ETCH_AXIS_COL;
@@ -3119,16 +3585,20 @@ INLAY_API InlayDocResult inlay_doc_view(InlayDoc* doc, const InlayDocViewDesc* i
   } else if (b.kind == INLAY_CODE_BLOCK) {
    const auto& full = doc->blocks[info.block];
    const float code_inner_w = inner_w;
+   const float r = theme.radius_panel_px;
    const bool wrap_code = info.block < measure->open_capacity && measure->code_wrap && measure->code_wrap[info.block];
    const EtchStr full_code = block_code_str(doc, info.block);
-   if (info.first && (!view.hide_code_copy_button || b.language_length || view.code_header_fn)) {
+   const bool has_hdr = info.first && (!view.hide_code_copy_button || b.language_length || view.code_header_fn);
+   if (has_hdr) {
     const EtchStr lang = slice(source, full.language_offset, full.language_length);
     auto hdr = etch_box_desc_default();
-    hdr.width = etch_sizing_fixed(code_inner_w);
+    hdr.width = etch_sizing_fixed(eff_row_width);
     hdr.height = etch_sizing_fit(0, 0);
-    hdr.padding = {0, 0, 0, 6};
+    hdr.padding = {padding, padding, 6.f, 6.f};
     hdr.align_y = ETCH_ALIGN_Y_CENTER;
     hdr.gap = 6;
+    if (style.code_header_bg.a != 0) hdr.background = style.code_header_bg;
+    hdr.radius = {r, r, 0.f, 0.f};
     hdr.border_color = style.code_border.a != 0 ? style.code_border : theme.border_subtle;
     hdr.border_sides = {0, 0, 0, 1};
     etch_begin_box(&hdr);
@@ -3168,17 +3638,34 @@ INLAY_API InlayDocResult inlay_doc_view(InlayDoc* doc, const InlayDocViewDesc* i
      view.code_header_fn(info.block, row_id, lang, full_code, view.code_header_user_data);
     }
     if (!view.hide_code_copy_button) {
+     const uint64_t now_ms = SDL_GetTicks();
+     const bool copied_active = info.block < measure->open_capacity && measure->copied_until_ms &&
+      measure->copied_until_ms[info.block] > now_ms;
+     if (copied_active) etch_request_redraw(doc->context);
      auto button = etch_button_desc_default();
      button.id = etch_id_index(row_id, 1);
      push_u32(&measure->vis_ctrl_ids, &measure->vis_ctrl_count, &measure->vis_ctrl_cap, button.id);
-     button.label = ETCH_STR_LIT("Copy code");
+     button.variant = ETCH_BUTTON_GHOST;
+     button.label = copied_active ? ETCH_STR_LIT("Copied") : ETCH_STR_LIT("Copy");
+     button.font_size_px = std::fmax(11.f, view.font_size_px * 0.78f);
+     button.padding = etch_padding_xy(6, 2);
      if (etch_button(&button)) {
       char* copy = static_cast<char*>(etch_frame_arena_alloc(doc->context, size_t(full_code.length) + 1u, 1));
       if (copy) { std::memcpy(copy, full_code.chars, full_code.length); copy[full_code.length] = 0; etch_set_clipboard_text(copy); }
+      if (info.block < measure->open_capacity && measure->copied_until_ms) {
+       measure->copied_until_ms[info.block] = now_ms + 1500u;
+       etch_request_redraw(doc->context);
+      }
      }
     }
     etch_end_box();
    }
+   auto cbody = etch_box_desc_default();
+   cbody.axis = ETCH_AXIS_COL;
+   cbody.width = etch_sizing_fixed(eff_row_width);
+   cbody.height = etch_sizing_fit(0, 0);
+   cbody.padding = {padding, padding, info.first ? (has_hdr ? 8.f : padding) : 2.f, info.last_in_block ? padding : 2.f};
+   etch_begin_box(&cbody);
    const bool show_ln = view.show_code_line_numbers;
    const uint32_t start_line = info.code_start_line ? info.code_start_line : 1u;
    const uint32_t total_lines = info.code_total_lines ? info.code_total_lines : 1u;
@@ -3211,8 +3698,14 @@ INLAY_API InlayDocResult inlay_doc_view(InlayDoc* doc, const InlayDocViewDesc* i
    } else {
     float scroll_w = code_inner_w;
     if (show_ln) {
+     const uint16_t mono_f = effective_mono_font(style);
      const float code_font = effective_code_font_size(view.font_size_px, style);
      const float line_h = code_font * effective_line_scale(style);
+     const float ln_font = std::fmax(10.f, code_font * 0.92f);
+     const auto code_fm = etch_font_metrics(mono_f, code_font);
+     const auto ln_fm = etch_font_metrics(mono_f, ln_font);
+     const float code_lead = std::fmax(0.f, 0.5f * (line_h - (code_fm.ascent + code_fm.descent)));
+     const float ln_pad_top = std::fmax(0.f, code_lead + code_fm.ascent - ln_fm.ascent);
      scroll_w = std::fmax(1.f, code_inner_w - gutter_w - 10.f);
      auto row_wrap = etch_box_desc_default();
      row_wrap.axis = ETCH_AXIS_ROW;
@@ -3231,9 +3724,8 @@ INLAY_API InlayDocResult inlay_doc_view(InlayDoc* doc, const InlayDocViewDesc* i
      gutter.border_sides = {0, 1, 0, 0};
      etch_begin_box(&gutter);
      auto lnd = etch_text_desc_default();
-     lnd.font_id = effective_mono_font(style);
-     lnd.font_size_px = std::fmax(10.f, code_font * 0.92f);
-     lnd.line_height_px = line_h;
+     lnd.font_id = mono_f;
+     lnd.font_size_px = ln_font;
      lnd.color = style.muted_color.a != 0 ? style.muted_color : theme.text_muted;
      lnd.wrap = false;
      for (uint32_t li = 0; li < chunk_lines; ++li) {
@@ -3241,7 +3733,16 @@ INLAY_API InlayDocResult inlay_doc_view(InlayDoc* doc, const InlayDocViewDesc* i
       const int n = std::snprintf(nb, sizeof(nb), "%u", start_line + li);
       if (n > 0) {
        char* arena_s = static_cast<char*>(etch_frame_arena_alloc(doc->context, size_t(n), 1));
-       if (arena_s) { std::memcpy(arena_s, nb, size_t(n)); etch_text({arena_s, uint32_t(n), false}, &lnd); }
+       if (arena_s) {
+        std::memcpy(arena_s, nb, size_t(n));
+        auto ln_row = etch_box_desc_default();
+        ln_row.height = etch_sizing_fixed(line_h);
+        ln_row.padding = {0, 0, ln_pad_top, 0};
+        ln_row.align_x = ETCH_ALIGN_X_RIGHT;
+        etch_begin_box(&ln_row);
+        etch_text({arena_s, uint32_t(n), false}, &lnd);
+        etch_end_box();
+       }
       }
      }
      etch_end_box();
@@ -3273,6 +3774,7 @@ INLAY_API InlayDocResult inlay_doc_view(InlayDoc* doc, const InlayDocViewDesc* i
     etch_end_box();
     if (show_ln) etch_end_box();
    }
+   etch_end_box(); // cbody
   } else {
    const bool estimate = view.inline_decorator_fn && (measure->heights[i] == collapsed_height ||
                          (measure->heights[i] == 0 && (refresh || etch_element_bounds(row_id).h <= 0)));
@@ -3285,6 +3787,7 @@ INLAY_API InlayDocResult inlay_doc_view(InlayDoc* doc, const InlayDocViewDesc* i
   while (open_wrappers--) etch_end_box();
 
   const float cached = measure->heights[i];
+  bool height_updated = false;
   if (measure->revision == doc->revision && styled_height != cached &&
       (styled_height != 0 || cached == collapsed_height)) {
    const float before = block_height(i, measure);
@@ -3296,9 +3799,10 @@ INLAY_API InlayDocResult inlay_doc_view(InlayDoc* doc, const InlayDocViewDesc* i
     previous_height = 0;
     measure->layout_settled = false;
    }
+   height_updated = true;
   }
   if (styled_height == collapsed_height) continue;
-  if (!reflow && cached != collapsed_height && measure->revision == doc->revision) {
+  if (!height_updated && !reflow && cached != collapsed_height && measure->revision == doc->revision) {
    const EtchRect previous = etch_element_bounds(row_id);
    if (previous.h > 0 && std::fabs(previous.h - measure->heights[i]) > .01f) {
     measure->total_height += previous.h - block_height(i, measure);

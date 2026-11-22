@@ -304,7 +304,7 @@ INLAY_API bool inlay_portal_poll(InlayPortal *p) {
   return true;
 }
 INLAY_API void inlay_portal_view(InlayPortal *p, const InlayPortalViewDesc *view_in) {
-  InlayPortalViewDesc view = {};
+  InlayPortalViewDesc view = inlay_portal_view_desc_default();
   if (!p || etch_current_context() != p->context || !inlay_read_abi_struct(view_in, &view) || !view.id ||
       !std::isfinite(view.width) || !std::isfinite(view.height) ||
       view.width <= 0 || view.height <= 0 || !std::isfinite(view.radius) ||

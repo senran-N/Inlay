@@ -26,6 +26,10 @@ static void render_code_header(uint32_t block_index,uint32_t row_id,EtchStr lang
  (void)block_index;(void)row_id;(void)lang;(void)code;
  *(bool*)user=true;
 }
+static void render_diagram_header(uint32_t block_index,uint32_t row_id,EtchStr lang,EtchStr code,void* user) {
+ (void)block_index;(void)row_id;(void)code;
+ if(lang.length==7 && memcmp(lang.chars,"mermaid",7)==0)*(bool*)user=true;
+}
 int main(void) {
  if(inlay_abi_version()!=INLAY_ABI_VERSION)return 1;
  EtchContextDesc c=etch_context_desc_default();c.headless=true;
@@ -89,17 +93,24 @@ int main(void) {
  InlayDocStyle style=inlay_doc_style_default();
  if(style.struct_size!=(uint32_t)sizeof(InlayDocStyle) ||
     style.font_id!=ETCH_INVALID_FONT || style.bold_font_id!=ETCH_INVALID_FONT ||
-    style.mono_font_id!=ETCH_INVALID_FONT || style.has_background)return 1;
+    style.mono_font_id!=ETCH_INVALID_FONT || style.has_background ||
+    style.inline_code_no_border || style.inline_code_padding_x!=0.0f ||
+    style.inline_code_padding_y!=0.0f || style.inline_code_radius_px!=0.0f ||
+    style.alert_bg_alpha!=0.0f)return 1;
  style.has_background=true;
  style.highlight_bg=etch_rgba8(255,220,80,120);
+ style.inline_code_no_border=true;
+ style.inline_code_radius_px=4.0f;
+ style.alert_colors[0]=etch_rgba8(64,156,255,255);
  InlayDocViewDesc view=inlay_doc_view_desc_default();
  if(view.struct_size!=(uint32_t)sizeof(InlayDocViewDesc) ||
     view.block_padding_px!=12 || view.block_gap_px!=8 || view.table_cell_padding_x!=12 ||
     view.table_cell_padding_y!=8 || view.table_radius_px!=8 || view.inline_decorator_fn ||
     view.inline_decorator_user_data || view.hide_code_copy_button ||
     view.style || view.image_resolver_fn || view.task_toggle_fn ||
-    view.stick_to_bottom || view.custom_fence_estimate_fn || view.custom_fence_render_fn || view.code_header_fn)return 1;
- bool called=false,img_called=false,custom_called=false,hdr_called=false;
+    view.stick_to_bottom || view.custom_fence_estimate_fn || view.custom_fence_render_fn ||
+    view.code_header_fn || view.diagram_header_fn || view.diagram_header_user_data)return 1;
+ bool called=false,img_called=false,custom_called=false,hdr_called=false,diag_hdr_called=false;
  view.id=etch_id("consumer-flow");view.height_px=0;view.width_px=300;
  view.inline_decorator_fn=decorate;view.inline_decorator_user_data=&called;
  view.style=&style;
@@ -111,18 +122,39 @@ int main(void) {
  view.custom_fence_user_data=&custom_called;
  view.code_header_fn=render_code_header;
  view.code_header_user_data=&hdr_called;
- if(!inlay_doc_set_utf8(doc,ETCH_STR_LIT("# C99 consumer\n\n`Native` ==API== [^1].\n\n![pic](a.png)\n\n[^1]: Note.\n\n```custom\nhello\n```\n\n```rust\nlet x = 1;\n```\n")))return 1;
+ view.diagram_header_fn=render_diagram_header;
+ view.diagram_header_user_data=&diag_hdr_called;
+ if(!inlay_doc_set_utf8(doc,ETCH_STR_LIT("# C99 consumer\n\n`Native` ==API== [^1].\n\n![pic](a.png)\n\n[^1]: Note.\n\n```custom\nhello\n```\n\n```rust\nlet x = 1;\n```\n\n```mermaid\nflowchart LR\nA[In] --> B[Out]\n```\n")))return 1;
  const float estimate=inlay_doc_measure_height(doc,view.id,view.width_px,view.font_size_px);
  inlay_doc_view_scroll_to_bottom(view.id,true);
  etch_begin_frame(ctx,&frame);
  /* Invalid struct_size view descriptor must safely no-op */
  InlayDocViewDesc bad_view=view;bad_view.struct_size=2u;
  const InlayDocResult bad_res=inlay_doc_view(doc,&bad_view);
+ /* Partial legacy struct_size ABI backward compatibility for Style, ViewDesc, and DiagramDesc */
+ InlayDocStyle legacy_style=inlay_doc_style_default();
+ legacy_style.struct_size=(uint32_t)offsetof(InlayDocStyle,inline_code_bg);
+ InlayDocViewDesc legacy_view=inlay_doc_view_desc_default();
+ legacy_view.struct_size=(uint32_t)offsetof(InlayDocViewDesc,diagram_header_fn);
+ legacy_view.id=etch_id("consumer-legacy");legacy_view.width_px=260;legacy_view.height_px=0;
+ legacy_view.style=&legacy_style;
+ const InlayDocResult legacy_res=inlay_doc_view(doc,&legacy_view);
+ InlayDiagramDesc legacy_diag=inlay_diagram_desc_default();
+ legacy_diag.struct_size=(uint32_t)offsetof(InlayDiagramDesc,max_width_px);
+ const InlayDiagramResult legacy_graph=inlay_diagram_layout(ETCH_STR_LIT("flowchart LR\nA --> B"),&legacy_diag);
+ InlayDiagramDesc fit_diag=inlay_diagram_desc_default();
+ fit_diag.max_width_px=220.0f;
+ fit_diag.min_scale=0.5f;
+ const InlayDiagramResult fit_graph=inlay_diagram_layout(ETCH_STR_LIT("flowchart LR\nA[One] --> B[Two] --> C[Three] --> D[Four]"),&fit_diag);
  const InlayDocResult result=inlay_doc_view(doc,&view);
  const InlayDiagramResult graph=inlay_diagram_layout(ETCH_STR_LIT("flowchart TD\nA -. retry .-> B"),&diagram);
- const bool dashed=graph.valid && graph.edge_count==1 && graph.edges[0].dashed && graph.edges[0].label.length==5;
+ const bool dashed=graph.valid && graph.edge_count==1 && graph.edges[0].dashed && graph.edges[0].label.length==5 &&
+                   graph.scale==1.0f && graph.natural_width==graph.width;
  etch_end_frame(ctx);
- if(bad_res.total_rows!=0 || !dashed)return 1;
+ if(bad_res.total_rows!=0 || !dashed || legacy_res.total_rows!=7 ||
+    !legacy_graph.valid || legacy_graph.scale!=1.0f ||
+    !fit_graph.valid || fit_graph.scale>=1.0f || fit_graph.width>220.5f ||
+    fit_graph.natural_width<=220.0f)return 1;
  /* Selection + plain text / markdown copy API smoke */
  inlay_doc_view_select_all(doc,view.id);
  const InlayDocSelection sel=inlay_doc_view_selection(doc,view.id);
@@ -133,13 +165,14 @@ int main(void) {
  inlay_doc_view_clear_selection(doc,view.id);
  const InlayBlock* img_blk=inlay_doc_block(doc,2);
  const InlayBlock* fn_blk=inlay_doc_block(doc,3);
- const bool ok=estimate>0 && called && img_called && custom_called && hdr_called &&
+ const bool ok=estimate>0 && called && img_called && custom_called && hdr_called && diag_hdr_called &&
+               result.clicked_kind==INLAY_INLINE_TEXT && result.clicked_mods==0 &&
                sel.active && sel.focus==sel.total_bytes && plain_len>0 && md_len>0 &&
                strstr(plain_buf,"C99 consumer")!=NULL && strstr(md_buf,"# C99 consumer")!=NULL &&
                !inlay_doc_view_selection(doc,view.id).active &&
                result.at_bottom && inlay_doc_view_is_at_bottom(view.id) &&
                result.measured_height_px>0 &&
-               result.visible_end==6 && inlay_doc_block_count(doc)==6 &&
+               result.visible_end==7 && inlay_doc_block_count(doc)==7 &&
                img_blk && img_blk->kind==INLAY_IMAGE &&
                fn_blk && fn_blk->kind==INLAY_FOOTNOTE;
  inlay_doc_destroy(doc);etch_destroy_context(ctx);return ok ? 0 : 1;
