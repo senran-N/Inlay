@@ -19,6 +19,7 @@ using SurfaceStats=InlaySurfaceStats;
 using UiKind=InlayUiKind;
 using UiNode=InlayUiNode;
 using ActionFn=InlayActionFn;
+using SlotRenderFn=InlaySlotRenderFn;
 using DiagramDesc=InlayDiagramDesc;
 using DiagramNode=InlayDiagramNode;
 using DiagramEdge=InlayDiagramEdge;
@@ -105,5 +106,8 @@ inline uint32_t doc_view_copy_markdown(const Doc* doc,uint32_t view_id,char* out
 }
 inline int32_t surface_next_timer_ms(const Surface* s) noexcept {
  return inlay_surface_next_timer_ms(s);
+}
+inline bool surface_bind_slot(Surface* s, EtchStr name, SlotRenderFn fn, void* user_data=nullptr) noexcept {
+ return inlay_surface_bind_slot(s, name, fn, user_data);
 }
 }

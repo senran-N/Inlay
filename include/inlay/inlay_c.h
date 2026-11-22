@@ -5,7 +5,7 @@
 #include <stdint.h>
 #include <etch/etch_c.h>
 #define INLAY_VERSION_MAJOR 0
-#define INLAY_VERSION_MINOR 11
+#define INLAY_VERSION_MINOR 12
 #define INLAY_VERSION_PATCH 0
 #define INLAY_STRING_DETAIL(x) #x
 #define INLAY_STRING(x) INLAY_STRING_DETAIL(x)
@@ -248,7 +248,10 @@ typedef struct InlaySurfaceDesc {
 } InlaySurfaceDesc;
 typedef enum InlayUiKind {
  INLAY_UI_BOX, INLAY_UI_TEXT, INLAY_UI_BUTTON, INLAY_UI_INPUT, INLAY_UI_TOGGLE,
- INLAY_UI_SCROLL, INLAY_UI_PROGRESS, INLAY_UI_SLIDER, INLAY_UI_BADGE, INLAY_UI_DIVIDER, INLAY_UI_IMAGE
+ INLAY_UI_SCROLL, INLAY_UI_PROGRESS, INLAY_UI_SLIDER, INLAY_UI_BADGE, INLAY_UI_DIVIDER, INLAY_UI_IMAGE,
+ INLAY_UI_CARD, INLAY_UI_SPACER, INLAY_UI_CHECKBOX, INLAY_UI_TABS, INLAY_UI_COMBOBOX,
+ INLAY_UI_MODAL, INLAY_UI_POPOVER, INLAY_UI_TOOLTIP, INLAY_UI_SPLIT,
+ INLAY_UI_MATH, INLAY_UI_DIAGRAM, INLAY_UI_SLOT
 } InlayUiKind;
 typedef struct InlayUiNode {InlayUiKind kind;uint32_t id,first_child,next_sibling;EtchStr text;} InlayUiNode;
 typedef struct InlaySurfaceViewDesc {
@@ -261,6 +264,10 @@ typedef struct InlaySurfaceStats {uint64_t js_ticks,reloads;uint32_t node_count;
 /* Callbacks may set state, but must not destroy or recursively dispatch the surface.
    The host calls poll_hmr periodically while idle; timers advance when view is built. */
 typedef void (*InlayActionFn)(InlaySurface*,EtchStr payload_json,void* user_data);
+/* Host-bound native content bridge mounted inside declarative ui.slot() nodes.
+   Invoked during inlay_surface_view inside the slot's Etch layout box. Must not
+   destroy or recursively dispatch the surface. */
+typedef void (*InlaySlotRenderFn)(InlaySurface*,uint32_t element_id,float width_px,float height_px,EtchStr props_json,void* user_data);
 INLAY_API InlaySurfaceDesc inlay_surface_desc_default(void);
 INLAY_API InlaySurfaceViewDesc inlay_surface_view_desc_default(void);
 INLAY_API InlaySurface* inlay_surface_create(EtchContext*,const InlaySurfaceDesc*);
@@ -269,6 +276,7 @@ INLAY_API bool inlay_surface_set_script(InlaySurface*,EtchStr script);
 INLAY_API bool inlay_surface_set_state_json(InlaySurface*,EtchStr json);
 INLAY_API EtchStr inlay_surface_state_json(const InlaySurface*);
 INLAY_API bool inlay_surface_bind_action(InlaySurface*,EtchStr name,InlayActionFn,void* user_data);
+INLAY_API bool inlay_surface_bind_slot(InlaySurface*,EtchStr name,InlaySlotRenderFn,void* user_data);
 INLAY_API bool inlay_surface_dispatch(InlaySurface*,EtchStr name,EtchStr payload_json);
 INLAY_API bool inlay_surface_enable_hmr(InlaySurface*,const char* script_path);
 INLAY_API bool inlay_surface_poll_hmr(InlaySurface*);

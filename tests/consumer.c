@@ -30,6 +30,10 @@ static void render_diagram_header(uint32_t block_index,uint32_t row_id,EtchStr l
  (void)block_index;(void)row_id;(void)code;
  if(lang.length==7 && memcmp(lang.chars,"mermaid",7)==0)*(bool*)user=true;
 }
+static void render_c99_slot(InlaySurface* surface,uint32_t element_id,float width_px,float height_px,EtchStr props_json,void* user) {
+ (void)surface;(void)element_id;
+ if(width_px>0.0f && height_px>0.0f && props_json.chars && props_json.length>0u)*(bool*)user=true;
+}
 int main(void) {
  if(inlay_abi_version()!=INLAY_ABI_VERSION)return 1;
  EtchContextDesc c=etch_context_desc_default();c.headless=true;
@@ -57,7 +61,8 @@ int main(void) {
  InlayDoc* doc=inlay_doc_create(ctx,NULL);if(!doc)return 1;
  const InlaySurfaceDesc surface=inlay_surface_desc_default();
  if(surface.struct_size!=(uint32_t)sizeof(InlaySurfaceDesc) ||
-    surface.max_tick_ms<=0 || inlay_surface_stats(NULL).js_ticks || inlay_surface_next_timer_ms(NULL)!=-1 || inlay_surface_set_script(NULL,ETCH_STR_LIT("")))return 1;
+    surface.max_tick_ms<=0 || inlay_surface_stats(NULL).js_ticks || inlay_surface_next_timer_ms(NULL)!=-1 ||
+    inlay_surface_set_script(NULL,ETCH_STR_LIT("")) || inlay_surface_bind_slot(NULL,ETCH_STR_LIT("slot"),render_c99_slot,NULL))return 1;
  InlaySurfaceDesc bad_surface=surface;bad_surface.struct_size=1u;
  if(inlay_surface_create(ctx,&bad_surface)!=NULL)return 1;
  InlaySurface* scripted=inlay_surface_create(ctx,NULL);
@@ -69,6 +74,31 @@ int main(void) {
      nodes[2].kind!=INLAY_UI_TOGGLE || nodes[3].kind!=INLAY_UI_PROGRESS ||
      nodes[4].kind!=INLAY_UI_SLIDER || nodes[5].kind!=INLAY_UI_BADGE ||
      nodes[6].kind!=INLAY_UI_DIVIDER || nodes[7].kind!=INLAY_UI_IMAGE)return 1;
+  if(inlay_surface_bind_slot(scripted,ETCH_STR_LIT(""),render_c99_slot,NULL) ||
+     inlay_surface_bind_slot(scripted,ETCH_STR_LIT("c99"),NULL,NULL))return 1;
+  bool slot_called=false;
+  if(!inlay_surface_bind_slot(scripted,ETCH_STR_LIT("c99_slot"),render_c99_slot,&slot_called))return 1;
+  if(!inlay_surface_set_script(scripted,ETCH_STR_LIT("function render(){return ui.card({elevation:'sm'},ui.tabs({items:['A','B'],active:0}),ui.math({tex:'x^2'}),ui.slot({name:'c99_slot',width:120,height:32,props:{ok:1}}));}")))return 1;
+  nodes=inlay_surface_nodes(scripted,&count);
+  if(!nodes || !count || nodes[0].kind!=INLAY_UI_CARD)return 1;
+  bool has_card=false,has_tabs=false,has_math=false,has_slot=false;
+  for(uint32_t i=0;i<count;++i){
+   if(nodes[i].kind==INLAY_UI_CARD)has_card=true;
+   else if(nodes[i].kind==INLAY_UI_TABS)has_tabs=true;
+   else if(nodes[i].kind==INLAY_UI_MATH)has_math=true;
+   else if(nodes[i].kind==INLAY_UI_SLOT)has_slot=true;
+  }
+  if(!has_card || !has_tabs || !has_math || !has_slot)return 1;
+  {
+   EtchFrameDesc sf=etch_frame_desc_default();
+   sf.viewport_w=320;sf.viewport_h=240;
+   InlaySurfaceViewDesc sv=inlay_surface_view_desc_default();
+   sv.id=etch_id("c99-slot-view");sv.width_px=240.0f;sv.height_px=160.0f;
+   etch_begin_frame(ctx,&sf);
+   inlay_surface_view(scripted,&sv);
+   etch_end_frame(ctx);
+  }
+  if(!slot_called)return 1;
   inlay_surface_destroy(scripted);
  }
  InlayPortalDesc portal_desc=inlay_portal_desc_default();

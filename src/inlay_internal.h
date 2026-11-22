@@ -2,6 +2,10 @@
 #include <inlay/inlay_c.h>
 #include <cstring>
 
+inline bool inlay_is_dark_theme(const EtchTheme& theme) noexcept {
+ return (uint32_t(theme.bg_canvas.r) * 299u + uint32_t(theme.bg_canvas.g) * 587u + uint32_t(theme.bg_canvas.b) * 114u) < 128000u;
+}
+
 template <typename T>
 inline bool inlay_read_abi_struct(const T* input, T* out) noexcept {
  if(!input || !out)return false;

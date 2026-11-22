@@ -501,21 +501,31 @@ void draw_dashed(const EtchBezierDesc& b, float scale) noexcept {
     }
 }
 
+EtchColor shift_color(EtchColor c, int delta) noexcept {
+    const auto ch = [delta](uint8_t v) noexcept -> uint8_t {
+        const int s = int(v) + delta;
+        return uint8_t(s < 0 ? 0 : (s > 255 ? 255 : s));
+    };
+    return { ch(c.r), ch(c.g), ch(c.b), c.a };
+}
+
 void draw_arrowhead(EtchVec2 tip, EtchVec2 tangent, EtchColor color, float scale) noexcept {
     const float len = std::sqrt(tangent.x * tangent.x + tangent.y * tangent.y);
     if (len <= 0.001f) return;
     tangent.x /= len;
     tangent.y /= len;
-    const float alen = std::fmax(5.5f, 8.0f * scale);
-    const float ahalf = std::fmax(2.75f, 4.0f * scale);
+    const float alen = std::fmax(6.0f, 8.5f * scale);
+    const float ahalf = std::fmax(3.0f, 4.2f * scale);
+    const float notch = alen * 0.78f;
     EtchVec2 points[] = {
         tip,
         { tip.x - tangent.x * alen - tangent.y * ahalf, tip.y - tangent.y * alen + tangent.x * ahalf },
+        { tip.x - tangent.x * notch, tip.y - tangent.y * notch },
         { tip.x - tangent.x * alen + tangent.y * ahalf, tip.y - tangent.y * alen - tangent.x * ahalf },
     };
     EtchFilledPolygonDesc arrow = {};
     arrow.points = points;
-    arrow.point_count = 3;
+    arrow.point_count = 4;
     arrow.fill = color;
     etch_draw_filled_polygon(&arrow);
 }
@@ -860,8 +870,8 @@ InlayDiagramResult inlay_diagram_layout_ex(EtchStr source, const InlayDiagramDes
         const float caption_font = std::fmax(7.0f, std::fmax(10.0f * s, eff_font * 0.82f));
         const float eff_node_gap = input->node_gap_px * s;
         const float eff_rank_gap = input->rank_gap_px * s;
-        const float label_pad_x = 6.0f * s;
-        const float label_pad_y = 2.0f * s;
+        const float label_pad_x = 7.0f * s;
+        const float label_pad_y = 2.5f * s;
 
         for (uint32_t r = 0; r < max_rank; ++r) rank_gaps[r] = eff_rank_gap;
         float label_width = 0.0f;
@@ -990,7 +1000,7 @@ InlayDiagramResult inlay_diagram_layout_ex(EtchStr source, const InlayDiagramDes
             for (int32_t si = int32_t(g.subgraph_count) - 1; si >= 0; --si) {
                 auto& sg = subgraphs[si];
                 if (!sg.has_nodes) continue;
-                const float title_w = etch_measure_text(sg.title, bold_font, title_font, 0).x + 20.0f * s;
+                const float title_w = etch_measure_text(sg.title, bold_font, title_font, 0).x + 30.0f * s;
                 sg.bounds.x -= pad_x;
                 sg.bounds.y -= pad_top;
                 sg.bounds.w = std::fmax(sg.bounds.w + pad_x * 2.0f, title_w);
@@ -1064,15 +1074,16 @@ InlayDiagramResult inlay_diagram_layout_ex(EtchStr source, const InlayDiagramDes
 
 void inlay_diagram_draw_ex(const InlayDiagramResult& result, const InlayDiagramDesc& input, const InlayDiagramMeta* meta) noexcept {
     const auto theme = etch_get_theme(etch_current_context());
+    const bool dark = inlay_is_dark_theme(theme);
     const float scale = (result.scale > 0.0f && std::isfinite(result.scale)) ? std::fmin(1.0f, result.scale) : 1.0f;
     const float eff_font = std::fmax(7.0f, input.font_size_px * scale);
     const float caption_font = std::fmax(7.0f, std::fmax(10.0f * scale, eff_font * 0.82f));
     const float eff_rank_gap = input.rank_gap_px * scale;
     const uint16_t body_font = resolve_body_font(input);
     const uint16_t bold_font = resolve_bold_font(input);
-    const float stroke_normal = std::fmax(1.25f, 2.0f * scale);
-    const float stroke_thick = std::fmax(2.0f, 3.0f * scale);
-    const float border_w = std::fmax(0.75f, 1.0f * scale);
+    const float stroke_normal = std::fmax(1.5f, 1.85f * scale);
+    const float stroke_thick = std::fmax(2.25f, 2.85f * scale);
+    const float border_w = std::fmax(0.85f, 1.0f * scale);
 
     if (input.canvas_id) {
         auto canvas = etch_canvas_desc_default();
@@ -1085,22 +1096,42 @@ void inlay_diagram_draw_ex(const InlayDiagramResult& result, const InlayDiagramD
     // 1. Subgraph cluster frames (outer before inner).
     if (meta && meta->subgraphs && meta->subgraph_count > 0) {
         const float title_font = std::fmax(7.5f, std::fmax(11.0f * scale, eff_font * 0.85f));
+        const uint8_t sg_alpha = uint8_t(dark ? 128u : 168u);
         for (uint32_t si = 0; si < meta->subgraph_count; ++si) {
             const auto& sg = meta->subgraphs[si];
             if (!sg.has_nodes) continue;
             auto frame = etch_rect_draw_desc_default();
             frame.rect = sg.bounds;
-            frame.fill = { theme.surface_subtle.r, theme.surface_subtle.g, theme.surface_subtle.b, 88 };
+            frame.fill = { theme.surface_subtle.r, theme.surface_subtle.g, theme.surface_subtle.b, sg_alpha };
             frame.border_color = theme.border_control.a != 0 ? theme.border_control : theme.border_subtle;
             frame.border_width = border_w;
             frame.radius = etch_corners_all(theme.radius_panel_px * scale);
             frame.continuous_corners = true;
             etch_draw_rect(&frame);
             if (sg.title.length) {
+                const EtchVec2 tsz = etch_measure_text(sg.title, bold_font, title_font, 0);
+                const float pill_px = 6.5f * scale;
+                const float pill_py = 2.0f * scale;
+                const float max_pw = std::fmax(1.0f, sg.bounds.w - 16.0f * scale);
+                auto pill = etch_rect_draw_desc_default();
+                pill.rect = {
+                    sg.bounds.x + 8.0f * scale,
+                    sg.bounds.y + 4.5f * scale,
+                    std::fmin(max_pw, tsz.x + 2.0f * pill_px),
+                    tsz.y + 2.0f * pill_py
+                };
+                pill.fill = dark
+                    ? etch_color_blend_over(theme.bg_elevated, { theme.surface_subtle.r, theme.surface_subtle.g, theme.surface_subtle.b, 180 })
+                    : theme.bg_elevated;
+                pill.border_color = theme.border_subtle;
+                pill.border_width = std::fmax(0.5f, 0.75f * scale);
+                pill.radius = etch_corners_all(theme.radius_small_px * 0.75f * scale);
+                pill.continuous_corners = true;
+                etch_draw_rect(&pill);
                 auto td = etch_text_draw_desc_default();
                 td.text = sg.title;
                 td.font_id = bold_font;
-                td.pos = { sg.bounds.x + 10.0f * scale, sg.bounds.y + 6.0f * scale };
+                td.pos = { pill.rect.x + pill_px, pill.rect.y + pill_py };
                 td.size = title_font;
                 td.color = theme.text_secondary;
                 etch_draw_text(&td);
@@ -1110,12 +1141,13 @@ void inlay_diagram_draw_ex(const InlayDiagramResult& result, const InlayDiagramD
 
     // 2. Sequence diagram lifelines.
     if (result.sequence) {
+        const EtchColor life_col = theme.border_control.a != 0 ? theme.border_control : theme.border_line;
         for (uint32_t i = 0; i < result.node_count; ++i) {
             const auto b = result.nodes[i].bounds;
             EtchLineDesc line = {};
             line.from = { b.x + b.w * 0.5f, b.y + b.h };
             line.to = { line.from.x, input.pos.y + result.height };
-            line.color = theme.border_line;
+            line.color = life_col;
             line.thickness = border_w;
             etch_draw_line(&line);
         }
@@ -1240,8 +1272,8 @@ void inlay_diagram_draw_ex(const InlayDiagramResult& result, const InlayDiagramD
 
         if (edge.label.length) {
             const EtchVec2 sz = measure_label(edge.label, body_font, caption_font);
-            const float pad_x = 6.0f * scale;
-            const float pad_y = 2.0f * scale;
+            const float pad_x = 7.0f * scale;
+            const float pad_y = 2.5f * scale;
             const float plate_w = sz.x + 2.0f * pad_x;
             const float plate_h = sz.y + 2.0f * pad_y;
             const float half = plate_w * 0.5f;
@@ -1254,14 +1286,19 @@ void inlay_diagram_draw_ex(const InlayDiagramResult& result, const InlayDiagramD
             plate.rect = { x - half, y, plate_w, plate_h };
             plate.fill = theme.bg_elevated;
             plate.border_color = theme.border_subtle;
-            plate.border_width = std::fmax(0.5f, 0.75f * scale);
+            plate.border_width = std::fmax(0.65f, 0.85f * scale);
             plate.radius = etch_corners_all(theme.radius_small_px * scale);
+            plate.continuous_corners = true;
             etch_draw_rect(&plate);
             draw_label(edge.label, { x, y + pad_y }, body_font, caption_font, theme.text_secondary, ETCH_ALIGN_X_CENTER);
         }
     }
 
-    // 4. Nodes (shape-aware rendering).
+    // 4. Nodes (shape-aware elevated surface rendering).
+    const EtchColor node_top = dark ? shift_color(theme.bg_elevated, 4) : theme.bg_elevated;
+    const EtchColor node_bot = dark ? shift_color(theme.bg_elevated, -2) : shift_color(theme.bg_elevated, -4);
+    const EtchColor sh_ambient = dark ? etch_rgba8(0, 0, 0, 34) : etch_rgba8(15, 23, 42, 13);
+    const EtchColor sh_contact = dark ? etch_rgba8(0, 0, 0, 44) : etch_rgba8(15, 23, 42, 17);
     for (uint32_t i = 0; i < result.node_count; ++i) {
         const auto& n = result.nodes[i];
         const InlayDiagramShape shape = (meta && meta->shapes) ? meta->shapes[i] : InlayShapeRect;
@@ -1269,6 +1306,18 @@ void inlay_diagram_draw_ex(const InlayDiagramResult& result, const InlayDiagramD
         if (shape == InlayShapeDiamond) {
             const float cx = n.bounds.x + n.bounds.w * 0.5f;
             const float cy = n.bounds.y + n.bounds.h * 0.5f;
+            const float sy_off = 2.0f * scale;
+            EtchVec2 sh_pts[4] = {
+                { cx, n.bounds.y + sy_off },
+                { n.bounds.x + n.bounds.w + 0.5f * scale, cy + sy_off },
+                { cx, n.bounds.y + n.bounds.h + sy_off + 0.5f * scale },
+                { n.bounds.x - 0.5f * scale, cy + sy_off },
+            };
+            EtchFilledPolygonDesc sh_poly = {};
+            sh_poly.points = sh_pts;
+            sh_poly.point_count = 4;
+            sh_poly.fill = sh_contact;
+            etch_draw_filled_polygon(&sh_poly);
             EtchVec2 pts[4] = {
                 { cx, n.bounds.y },
                 { n.bounds.x + n.bounds.w, cy },
@@ -1278,11 +1327,13 @@ void inlay_diagram_draw_ex(const InlayDiagramResult& result, const InlayDiagramD
             EtchFilledPolygonDesc poly = {};
             poly.points = pts;
             poly.point_count = 4;
-            poly.fill = theme.bg_elevated;
+            poly.fill = node_top;
+            poly.fill_end = node_bot;
+            poly.gradient_dir = { 0.0f, 1.0f };
             etch_draw_filled_polygon(&poly);
             EtchLineDesc edge_l = {};
             edge_l.color = theme.border_node;
-            edge_l.thickness = std::fmax(0.85f, 1.25f * scale);
+            edge_l.thickness = std::fmax(0.9f, 1.15f * scale);
             for (int k = 0; k < 4; ++k) {
                 edge_l.from = pts[k];
                 edge_l.to = pts[(k + 1) & 3];
@@ -1290,21 +1341,42 @@ void inlay_diagram_draw_ex(const InlayDiagramResult& result, const InlayDiagramD
             }
             draw_label(n.label, { cx, cy - tsz.y * 0.5f }, body_font, eff_font, theme.text_primary, ETCH_ALIGN_X_CENTER);
         } else {
+            const bool is_circle = (shape == InlayShapeCircle);
+            const bool is_round = (shape == InlayShapeRound);
+            const bool cont = !is_circle && !is_round;
+            const float base_r = is_circle ? (n.bounds.w * 0.5f)
+                : (is_round ? (n.bounds.h * 0.5f) : (theme.radius_control_px * scale));
+
+            // Dual-layer subtle elevation shadow backdrop (ambient + tight contact)
+            const float amb_pad = 1.5f * scale;
+            auto sh1 = etch_rect_draw_desc_default();
+            sh1.rect = { n.bounds.x - amb_pad, n.bounds.y + 2.0f * scale - amb_pad,
+                         n.bounds.w + 2.0f * amb_pad, n.bounds.h + 2.0f * amb_pad };
+            sh1.fill = sh_ambient;
+            sh1.radius = etch_corners_all(base_r + amb_pad);
+            sh1.softness = std::fmax(1.5f, 3.5f * scale);
+            sh1.continuous_corners = cont;
+            etch_draw_rect(&sh1);
+
+            const float con_pad = 0.5f * scale;
+            auto sh2 = etch_rect_draw_desc_default();
+            sh2.rect = { n.bounds.x - con_pad, n.bounds.y + 1.0f * scale - con_pad,
+                         n.bounds.w + 2.0f * con_pad, n.bounds.h + 2.0f * con_pad };
+            sh2.fill = sh_contact;
+            sh2.radius = etch_corners_all(base_r + con_pad);
+            sh2.softness = std::fmax(1.0f, 1.8f * scale);
+            sh2.continuous_corners = cont;
+            etch_draw_rect(&sh2);
+
             auto rect = etch_rect_draw_desc_default();
             rect.rect = n.bounds;
-            rect.fill = theme.bg_elevated;
+            rect.fill = node_top;
+            rect.fill_end = node_bot;
+            rect.gradient_dir = { 0.0f, 1.0f };
             rect.border_color = theme.border_node;
             rect.border_width = border_w;
-            if (shape == InlayShapeCircle) {
-                rect.radius = etch_corners_all(n.bounds.w * 0.5f);
-                rect.continuous_corners = false;
-            } else if (shape == InlayShapeRound) {
-                rect.radius = etch_corners_all(n.bounds.h * 0.5f);
-                rect.continuous_corners = false;
-            } else {
-                rect.radius = etch_corners_all(theme.radius_control_px * scale);
-                rect.continuous_corners = true;
-            }
+            rect.radius = etch_corners_all(base_r);
+            rect.continuous_corners = cont;
             etch_draw_rect(&rect);
             draw_label(n.label, { n.bounds.x + n.bounds.w * 0.5f, n.bounds.y + (n.bounds.h - tsz.y) * 0.5f },
                        body_font, eff_font, theme.text_primary, ETCH_ALIGN_X_CENTER);

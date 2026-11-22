@@ -78,6 +78,10 @@ float math_axis(float size) noexcept {
     return m.ascent * 0.36f;
 }
 
+float rule_thickness(float size) noexcept {
+    return std::fmax(1.0f, size * 0.062f);
+}
+
 Box* make(Parser* p, Kind kind, float size, MathClass cls = ClOrd) noexcept {
     auto* box = static_cast<Box*>(etch_frame_arena_alloc(etch_current_context(), sizeof(Box), alignof(Box)));
     if (!box) { p->valid = false; return nullptr; }
@@ -211,13 +215,15 @@ Box* make_fraction_box(Parser* p, StyleState st, bool no_rule) noexcept {
     box->b = atom(p, den_st);
     if (!box->a || !box->b) return nullptr;
     const float axis = math_axis(size);
-    const float rule_gap = (st.style == StyleDisplay) ? std::fmax(2.5f, size * 0.16f) : std::fmax(1.8f, size * 0.11f);
-    const float pad = no_rule ? size * 0.12f : size * 0.24f;
+    const float rule_t = no_rule ? 0.0f : rule_thickness(size);
+    const float rule_gap = (st.style == StyleDisplay) ? std::fmax(2.6f, size * 0.16f) : std::fmax(2.0f, size * 0.12f);
+    const float half_sep = rule_gap + rule_t * 0.5f;
+    const float pad = no_rule ? size * 0.14f : size * 0.28f;
     box->width = std::fmax(box->a->width, box->b->width) + pad;
     box->ax = (box->width - box->a->width) * 0.5f;
     box->bx = (box->width - box->b->width) * 0.5f;
-    box->ay = -(axis + rule_gap + box->a->descent);
-    box->by = -(axis - rule_gap) + box->b->ascent;
+    box->ay = -(axis + half_sep + box->a->descent);
+    box->by = -(axis - half_sep) + box->b->ascent;
     box->ascent = box->a->ascent - box->ay;
     box->descent = box->by + box->b->descent;
     return box;
@@ -459,17 +465,21 @@ Box* atom_impl(Parser* p, StyleState st) noexcept {
         rad_st.cramped = true;
         box->a = atom(p, rad_st);
         if (!box->a) return nullptr;
+        const float rule_t = rule_thickness(size);
+        const float bar_clear = std::fmax(2.5f, size * 0.16f);
+        const float top_margin = std::fmax(1.0f, size * 0.04f);
         const float hook_w = size * 0.62f;
-        const float idx_extra = box->b ? std::fmax(0.0f, box->b->width - size * 0.25f) : 0.0f;
+        const float idx_extra = box->b ? std::fmax(0.0f, box->b->width - size * 0.24f) : 0.0f;
         box->ax = idx_extra + hook_w;
-        box->width = box->ax + box->a->width + size * 0.12f;
-        box->ascent = box->a->ascent + std::fmax(2.5f, size * 0.18f);
-        box->descent = box->a->descent;
+        box->width = box->ax + box->a->width + size * 0.14f;
+        box->ascent = box->a->ascent + bar_clear + rule_t + top_margin;
+        box->descent = box->a->descent + std::fmax(0.75f, rule_t * 0.6f);
         if (box->b) {
-            box->bx = std::fmax(0.0f, box->ax - hook_w * 0.68f - box->b->width);
-            const float idx_base_y = -(box->ascent - box->a->ascent * 0.55f);
-            box->by = idx_base_y;
-            box->ascent = std::fmax(box->ascent, box->b->ascent - box->by + 1.0f);
+            box->bx = std::fmax(0.0f, box->ax - hook_w * 0.70f - box->b->width);
+            const float rad_h = (box->a->ascent + bar_clear + rule_t * 0.5f) + box->descent;
+            const float sh_y_rel = box->descent - std::fmin(rad_h * 0.45f, size * 0.55f);
+            box->by = sh_y_rel - box->b->descent - std::fmax(1.5f, size * 0.08f);
+            box->ascent = std::fmax(box->ascent, box->b->ascent - box->by + top_margin);
         }
         return box;
     }
@@ -692,8 +702,9 @@ Box* expression(Parser* p, StyleState st, bool grouped, bool cell, bool delimite
                     lim->ascent = std::fmax(lim->ascent, sup->ascent - lim->by);
                 }
                 if (sub) {
+                    const float sub_lead_trim = (sub->ascent <= style_font_size(p, sub_style(st)) * 1.05f) ? size * 0.08f : 0.0f;
                     lim->cx = (w - sub->width) * 0.5f;
-                    lim->cy = std::fmax(0.0f, base->descent - op_trim * 0.5f) + gap + sub->ascent;
+                    lim->cy = std::fmax(0.0f, base->descent - op_trim * 0.5f) + gap + std::fmax(0.0f, sub->ascent - sub_lead_trim);
                     lim->descent = std::fmax(lim->descent, lim->cy + sub->descent);
                 }
                 base = lim;
@@ -723,7 +734,7 @@ Box* expression(Parser* p, StyleState st, bool grouped, bool cell, bool delimite
                 if (sup && sub) {
                     const float sup_bottom = scripts->by + sup->descent;
                     const float sub_top = scripts->cy - sub->ascent;
-                    const float min_gap = std::fmax(1.5f, size * 0.06f);
+                    const float min_gap = std::fmax(2.0f, size * 0.08f);
                     const float gap = sub_top - sup_bottom;
                     if (gap < min_gap) {
                         const float push = (min_gap - gap) * 0.5f;
@@ -773,21 +784,21 @@ void draw_rule(float x, float y, float w, float size, EtchColor color) noexcept 
     EtchLineDesc desc = {};
     desc.from = { x, y };
     desc.to = { x + w, y };
-    desc.thickness = std::fmax(1.0f, size * 0.055f);
+    desc.thickness = rule_thickness(size);
     desc.color = color;
     etch_draw_line(&desc);
 }
 
 void draw_delimiter(char mark, float sx, float top, float bottom, float size, bool right_side, EtchColor color) noexcept {
     if (mark == '.') return;
-    const float thick = std::fmax(1.0f, size * 0.055f);
-    const float w = size * 0.34f;
+    const float thick = rule_thickness(size);
+    const float w = size * 0.36f;
     if (mark == '[' || mark == ']') {
         EtchLineDesc d = {};
         d.color = color;
         d.thickness = thick;
-        const float edge = sx + (right_side ? 0.0f : w * 0.65f);
-        const float stem = sx + (right_side ? w * 0.65f : 0.0f);
+        const float stem = sx + (right_side ? w * 0.78f : w * 0.22f);
+        const float edge = sx + (right_side ? w * 0.20f : w * 0.80f);
         d.from = { edge, top }; d.to = { stem, top }; etch_draw_line(&d);
         d.from = d.to; d.to.y = bottom; etch_draw_line(&d);
         d.from = d.to; d.to.x = edge; etch_draw_line(&d);
@@ -806,14 +817,14 @@ void draw_delimiter(char mark, float sx, float top, float bottom, float size, bo
         EtchLineDesc d = {};
         d.color = color; d.thickness = thick;
         const float mid = (top + bottom) * 0.5f;
-        const float tip = sx + (right_side ? w * 0.85f : w * 0.15f);
-        const float edge = sx + (right_side ? w * 0.15f : w * 0.85f);
+        const float tip = sx + (right_side ? w * 0.82f : w * 0.18f);
+        const float edge = sx + (right_side ? w * 0.18f : w * 0.82f);
         d.from = { edge, top }; d.to = { tip, mid }; etch_draw_line(&d);
         d.from = { tip, mid }; d.to = { edge, bottom }; etch_draw_line(&d);
     } else if (mark == '{' || mark == '}') {
-        const float edge = sx + (right_side ? 0.0f : w);
-        const float stem = sx + w * 0.5f;
-        const float tip = sx + (right_side ? w : 0.0f);
+        const float edge = sx + (right_side ? w * 0.15f : w * 0.85f);
+        const float stem = sx + (right_side ? w * 0.52f : w * 0.48f);
+        const float tip = sx + (right_side ? w * 0.88f : w * 0.12f);
         const float mid = (top + bottom) * 0.5f;
         auto d = etch_bezier_desc_default();
         d.cubic = false; d.thickness = thick; d.color_start = color; d.color_end = color;
@@ -822,11 +833,15 @@ void draw_delimiter(char mark, float sx, float top, float bottom, float size, bo
         d.p0 = d.p2; d.p1 = { stem, mid }; d.p2 = { stem, (bottom + mid) * 0.5f }; etch_draw_bezier(&d);
         d.p0 = d.p2; d.p1 = { stem, bottom }; d.p2 = { edge, bottom }; etch_draw_bezier(&d);
     } else {
+        const float h = bottom - top;
+        const float tip_x = sx + (right_side ? w * 0.22f : w * 0.78f);
+        const float arch_x = sx + (right_side ? w * 0.90f : w * 0.10f);
         auto d = etch_bezier_desc_default();
-        d.p0 = { sx + w * 0.5f, top };
-        d.p2 = { sx + w * 0.5f, bottom };
-        d.p1 = { sx + (right_side ? w * 1.15f : -w * 0.15f), (top + bottom) * 0.5f };
-        d.cubic = false; d.thickness = thick; d.color_start = color; d.color_end = color;
+        d.p0 = { tip_x, top };
+        d.p1 = { arch_x, top + h * 0.24f };
+        d.p2 = { arch_x, bottom - h * 0.24f };
+        d.p3 = { tip_x, bottom };
+        d.cubic = true; d.thickness = thick; d.color_start = color; d.color_end = color;
         etch_draw_bezier(&d);
     }
 }
@@ -847,10 +862,12 @@ void draw(const Box* box, float x, float y, EtchColor color) noexcept {
         if (box->kind == Delimited) draw(box->a, x + box->ax, y, color);
         for (auto* child = box->first; child; child = child->next) draw(child, x + child->ax, y + child->ay, color);
         if (box->text.length >= 2) {
-            const float top = y - box->ascent;
-            const float bottom = y + box->descent;
+            const float half_t = rule_thickness(box->size) * 0.5f;
+            const float top = y - box->ascent + half_t;
+            const float bottom = y + box->descent - half_t;
+            const float delim_w = box->size * 0.36f;
             draw_delimiter(box->text.chars[0], x, top, bottom, box->size, false, color);
-            draw_delimiter(box->text.chars[1], x + box->width - box->size * 0.34f, top, bottom, box->size, true, color);
+            draw_delimiter(box->text.chars[1], x + box->width - delim_w, top, bottom, box->size, true, color);
         }
         return;
     }
@@ -865,44 +882,58 @@ void draw(const Box* box, float x, float y, EtchColor color) noexcept {
     if (box->b) draw(box->b, x + box->bx, y + box->by, color);
     if (box->c) draw(box->c, x + box->cx, y + box->cy, color);
     if (box->kind == Fraction && !(box->flags & 2u)) {
-        draw_rule(x, y - math_axis(box->size), box->width, box->size, color);
+        const float inset = std::fmin(box->width * 0.1f, box->size * 0.04f);
+        draw_rule(x + inset, y - math_axis(box->size), box->width - 2.0f * inset, box->size, color);
     }
     if (box->kind == Root) {
         const float hook_w = box->size * 0.62f;
         const float left = x + box->ax - hook_w;
-        const float top = y - box->a->ascent - std::fmax(2.5f, box->size * 0.18f);
-        const float bottom = y + box->descent;
-        const float thickness = std::fmax(1.0f, box->size * 0.055f);
-        draw_rule(x + box->ax, top, box->width - box->ax, box->size, color);
+        const float rule_t = rule_thickness(box->size);
+        const float bar_clear = std::fmax(2.5f, box->size * 0.16f);
+        const float bar_y = y - box->a->ascent - bar_clear - rule_t * 0.5f;
+        const float valley_y = y + box->descent - rule_t * 0.25f;
+        const float rad_h = std::fmax(rule_t * 4.0f, valley_y - bar_y);
+        const float shoulder_y = valley_y - std::fmin(rad_h * 0.45f, box->size * 0.55f);
+        const float tick_drop = std::fmin(rad_h * 0.16f, box->size * 0.11f);
+        const float x_join = x + box->ax;
+        const float x_tip = left + hook_w * 0.02f;
+        const float x_sh_out = left + hook_w * 0.21f;
+        const float x_sh_in = left + hook_w * 0.29f;
+        const float x_val = left + hook_w * 0.50f;
+        draw_rule(x_join, bar_y, box->width - box->ax, box->size, color);
         EtchVec2 points[] = {
-            { left, y - box->size * 0.10f },
-            { left + hook_w * 0.28f, y - box->size * 0.22f },
-            { left + hook_w * 0.48f, bottom - thickness },
-            { x + box->ax, top - thickness },
-            { x + box->ax + thickness, top },
-            { left + hook_w * 0.48f, bottom + thickness },
-            { left + hook_w * 0.21f, y - box->size * 0.15f },
+            { x_tip, shoulder_y + tick_drop },
+            { x_sh_in, shoulder_y },
+            { x_val, valley_y - rule_t * 1.45f },
+            { x_join, bar_y - rule_t * 0.5f },
+            { x_join + rule_t * 0.70f, bar_y + rule_t * 0.5f },
+            { x_val + rule_t * 0.15f, valley_y },
+            { x_sh_out, shoulder_y + rule_t * 0.90f },
+            { x_tip + rule_t * 0.35f, shoulder_y + tick_drop + rule_t * 0.75f },
         };
         EtchFilledPolygonDesc radical = {};
         radical.points = points;
-        radical.point_count = 7;
+        radical.point_count = 8;
         radical.fill = color;
         etch_draw_filled_polygon(&radical);
     }
     if (box->kind == Accent) {
         const auto ak = static_cast<AccentKind>(box->sub_kind);
-        const float thick = std::fmax(1.0f, box->size * 0.055f);
+        const float thick = rule_thickness(box->size);
+        const float italic_shift = (box->a && box->a->kind == Glyph && box->a->font_id == ETCH_FONT_ITALIC)
+            ? std::fmin(box->size * 0.06f, box->width * 0.12f)
+            : 0.0f;
         if (ak == AccOverline) {
             draw_rule(x, y - box->ascent + box->size * 0.08f, box->width, box->size, color);
         } else if (ak == AccUnderline) {
             draw_rule(x, y + box->descent - box->size * 0.06f, box->width, box->size, color);
         } else if (ak == AccBar) {
             const float bw = std::fmax(box->width * 0.8f, box->size * 0.36f);
-            draw_rule(x + (box->width - bw) * 0.5f, y - box->ascent + box->size * 0.09f, bw, box->size, color);
+            draw_rule(x + (box->width - bw) * 0.5f + italic_shift * 0.5f, y - box->ascent + box->size * 0.09f, bw, box->size, color);
         } else if (ak == AccHat) {
             const float top = y - box->ascent + box->size * 0.05f;
             const float aw = (box->flags & 4u) ? box->width : std::fmin(box->width, box->size * 0.52f);
-            const float ax0 = x + (box->width - aw) * 0.5f;
+            const float ax0 = x + (box->width - aw) * 0.5f + ((box->flags & 4u) ? 0.0f : italic_shift);
             EtchLineDesc d = {}; d.thickness = thick; d.color = color;
             d.from = { ax0, top + box->size * 0.18f }; d.to = { ax0 + aw * 0.5f, top }; etch_draw_line(&d);
             d.from = d.to; d.to = { ax0 + aw, top + box->size * 0.18f }; etch_draw_line(&d);
@@ -917,7 +948,7 @@ void draw(const Box* box, float x, float y, EtchColor color) noexcept {
         } else if (ak == AccTilde) {
             const float top = y - box->ascent + box->size * 0.14f;
             const float aw = (box->flags & 4u) ? box->width : std::fmin(box->width, box->size * 0.55f);
-            const float ax0 = x + (box->width - aw) * 0.5f;
+            const float ax0 = x + (box->width - aw) * 0.5f + ((box->flags & 4u) ? 0.0f : italic_shift);
             const float amp = box->size * 0.10f;
             auto bz = etch_bezier_desc_default();
             bz.cubic = true; bz.thickness = thick; bz.color_start = color; bz.color_end = color;
@@ -929,7 +960,7 @@ void draw(const Box* box, float x, float y, EtchColor color) noexcept {
         } else if (ak == AccDot || ak == AccDDot) {
             const float r = std::fmax(1.2f, box->size * 0.06f);
             const float cy = y - box->ascent + box->size * 0.12f;
-            const float cx = x + box->width * 0.5f;
+            const float cx = x + box->width * 0.5f + italic_shift;
             auto dot = etch_rect_draw_desc_default();
             dot.fill = color;
             dot.radius = etch_corners_all(r);

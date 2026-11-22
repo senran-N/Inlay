@@ -223,6 +223,7 @@ void draw_image_fallback(EtchStr alt, uint32_t id, float font, const InlayDocSty
  pill.border_color = theme.border_subtle;
  pill.border_width = 1;
  pill.radius = etch_corners_all(theme.radius_small_px);
+ pill.continuous_corners = true;
  pill.align_y = ETCH_ALIGN_Y_CENTER;
  etch_begin_box(&pill);
  auto td = etch_text_desc_default();
@@ -624,7 +625,7 @@ float estimate_row(const InlayDocViewDesc& view, const InlayDocStyle& style, flo
  const float eff_w = std::fmax(1.f, width - block_nest_indent(b, view.font_size_px));
  if (diagram) return 200;
  if (b.kind == INLAY_MATH_BLOCK) return view.font_size_px * 4 + 32;
- if (b.kind == INLAY_THEMATIC_BREAK) return 1 + 2 * padding;
+ if (b.kind == INLAY_THEMATIC_BREAK) return 9.5f + 2 * padding;
  if (b.kind == INLAY_IMAGE) {
   const float avail = std::fmax(1.f, eff_w - 2 * padding);
   const auto img = resolve_doc_image(view, text, img_src, avail);
@@ -1008,6 +1009,36 @@ uint32_t extract_inline_range_plain(const InlayMeasure* m, EtchStr source, uint3
  return wp;
 }
 
+EtchColor code_header_bg_color(const InlayDocStyle& style, const EtchTheme& theme) noexcept {
+ if (style.code_header_bg.a != 0) return style.code_header_bg;
+ const uint32_t alpha = inlay_is_dark_theme(theme) ? 185u : 220u;
+ return {theme.surface_subtle.r, theme.surface_subtle.g, theme.surface_subtle.b,
+         uint8_t((uint32_t(theme.surface_subtle.a) * alpha + 127u) / 255u)};
+}
+
+void render_copy_button(InlayDoc* doc, InlayMeasure* measure, uint32_t block_idx, uint32_t row_id,
+                        float font_size_px, EtchStr payload) noexcept {
+ const uint64_t now_ms = SDL_GetTicks();
+ const bool copied_active = block_idx < measure->open_capacity && measure->copied_until_ms &&
+  measure->copied_until_ms[block_idx] > now_ms;
+ if (copied_active) etch_request_redraw(doc->context);
+ auto btn = etch_button_desc_default();
+ btn.id = etch_id_index(row_id, 1);
+ push_u32(&measure->vis_ctrl_ids, &measure->vis_ctrl_count, &measure->vis_ctrl_cap, btn.id);
+ btn.variant = ETCH_BUTTON_GHOST;
+ btn.label = copied_active ? ETCH_STR_LIT("Copied") : ETCH_STR_LIT("Copy");
+ btn.font_size_px = std::fmax(11.f, font_size_px * 0.78f);
+ btn.padding = etch_padding_xy(6, 2);
+ if (etch_button(&btn)) {
+  char* copy = static_cast<char*>(etch_frame_arena_alloc(doc->context, size_t(payload.length) + 1u, 1));
+  if (copy) { std::memcpy(copy, payload.chars, payload.length); copy[payload.length] = 0; etch_set_clipboard_text(copy); }
+  if (block_idx < measure->open_capacity && measure->copied_until_ms) {
+   measure->copied_until_ms[block_idx] = now_ms + 1500u;
+   etch_request_redraw(doc->context);
+  }
+ }
+}
+
 bool ascii_ieq(EtchStr a, const char* lit) noexcept {
  const size_t n = std::strlen(lit);
  if (a.length != n) return false;
@@ -1305,7 +1336,9 @@ float rich_line(InlayMeasure* m, EtchStr line, uint32_t base_id, float font, Inl
  const uint16_t sans_font = effective_sans_font(style);
  const uint16_t bold_font = effective_bold_font(style);
  const uint16_t mono_font = effective_mono_font(style);
- const uint16_t base_font = header ? (style.bold_font_id != ETCH_INVALID_FONT ? style.bold_font_id : static_cast<uint16_t>(ETCH_FONT_SEMIBOLD)) : sans_font;
+ const uint16_t base_font = header
+  ? (table ? bold_font : (style.bold_font_id != ETCH_INVALID_FONT ? style.bold_font_id : static_cast<uint16_t>(ETCH_FONT_SEMIBOLD)))
+  : sans_font;
  float line_height = font * effective_line_scale(style);
  auto* spans = static_cast<EtchTextSpan*>(etch_frame_arena_alloc(ctx, size_t(count) * sizeof(EtchTextSpan), alignof(EtchTextSpan)));
  if (!spans) return 0;
@@ -1503,6 +1536,7 @@ float rich_line(InlayMeasure* m, EtchStr line, uint32_t base_id, float font, Inl
      idesc.width = etch_sizing_fixed(img.width);
      idesc.height = etch_sizing_fixed(img.height);
      idesc.radius = etch_corners_all(img.radius);
+     idesc.continuous_corners = true;
      etch_image(&idesc);
     } else draw_image_fallback(alt, desc.id, font, style, theme);
     if (top_pad > 0.5f || pad_l > 0.f || pad_r > 0.f) etch_end_box();
@@ -1722,6 +1756,7 @@ void code_line(InlayMeasure* m, EtchStr line, EtchStr language, uint32_t id, flo
    row_box.border_sides = {2.0f, 0.0f, 0.0f, 0.0f};
   }
   row_box.radius = etch_corners_all(3.0f);
+  row_box.continuous_corners = true;
   etch_begin_box(&row_box);
   auto desc = etch_rich_text_desc_default();
   desc.id = id;
@@ -2213,6 +2248,7 @@ float block_lines(InlayMeasure* measure, const InlayBlock& b, EtchStr source, ui
    row.id = line_id;
    row.width = etch_sizing_fixed(table_hscroll ? total_table_w : width);
    row.height = etch_sizing_fit(0, 4096);
+   row.align_y = ETCH_ALIGN_Y_CENTER;
    row.scroll_y = true;
    row.clip_children = true;
    const EtchColor hdr_bg = style.table_header_bg.a != 0 ? style.table_header_bg : theme.bg_elevated;
@@ -2225,6 +2261,7 @@ float block_lines(InlayMeasure* measure, const InlayBlock& b, EtchStr source, ui
    const float radius = view.table_radius_px;
    const float top = info.first ? radius : 0.f, bottom = info.last_in_block ? radius : 0.f;
    row.radius = {top, top, bottom, bottom};
+   row.continuous_corners = true;
    etch_begin_box(&row);
    uint32_t start = 0;
    table_row_range(&line, &start);
@@ -2279,14 +2316,29 @@ float block_lines(InlayMeasure* measure, const InlayBlock& b, EtchStr source, ui
    }
    if (is_alert_tag) {
     begin_inline_row(row_box);
+    const EtchColor acol = alert_accent_color(source, full_blk, style, theme);
+    auto hdr_wrap = etch_box_desc_default();
+    hdr_wrap.axis = ETCH_AXIS_ROW;
+    hdr_wrap.align_y = ETCH_ALIGN_Y_CENTER;
+    hdr_wrap.gap = 6.f;
+    hdr_wrap.padding = {0.f, 0.f, 0.f, 2.f};
+    etch_begin_box(&hdr_wrap);
+    auto dot = etch_box_desc_default();
+    dot.width = etch_sizing_fixed(6.f);
+    dot.height = etch_sizing_fixed(6.f);
+    dot.background = acol;
+    dot.radius = etch_corners_all(3.f);
+    etch_box(&dot);
     auto ad = etch_text_desc_default();
     ad.font_id = effective_bold_font(style);
-    ad.font_size_px = std::fmax(11.f, font * 0.86f);
+    ad.font_size_px = std::fmax(11.f, font * 0.84f);
     ad.line_height_px = ad.font_size_px * 1.3f;
-    ad.color = alert_accent_color(source, full_blk, style, theme);
+    ad.letter_spacing = 0.45f;
+    ad.color = acol;
     ad.wrap = false;
     etch_text(line, &ad);
-    if (estimate) height += (height > 0 ? 4.f : 0.f) + ad.line_height_px;
+    etch_end_box();
+    if (estimate) height += (height > 0 ? 4.f : 0.f) + ad.line_height_px + 2.f;
    } else if ((b.kind == INLAY_LIST || b.kind == INLAY_TASK_LIST) && !continuation) {
     begin_inline_row(row_box);
     const InlayListItemMeta* meta = (info.list_item_index != UINT32_MAX && info.list_item_index < measure->doc->list_item_count)
@@ -2314,7 +2366,7 @@ float block_lines(InlayMeasure* measure, const InlayBlock& b, EtchStr source, ui
     const uint16_t sans_f = effective_sans_font(style);
     const float body_line_h = font * effective_line_scale(style);
     const auto body_fm = etch_font_metrics(sans_f, font);
-    const float top_lead = std::fmax(0.f, 0.5f * (body_line_h - (body_fm.ascent + body_fm.descent)));
+    const float top_lead = baseline_top_lead(sans_f, font, body_line_h);
 
     if (pos == logical) {
      if (task) {
@@ -2322,23 +2374,68 @@ float block_lines(InlayMeasure* measure, const InlayBlock& b, EtchStr source, ui
        ? meta->task_mark_offset
        : uint32_t((line.chars + (trim >= 3u ? trim - 3u : 3u)) - source.chars);
       bool checked = check_offset < source.length ? (source.chars[check_offset] != ' ') : (meta && meta->checked != 0);
-      auto cb = etch_checkbox_desc_default();
-      cb.id = etch_id_index(line_id, 0x5441u);
-      push_u32(&measure->vis_ctrl_ids, &measure->vis_ctrl_count, &measure->vis_ctrl_cap, cb.id);
-      cb.label = {};
-      cb.checked = &checked;
-      cb.box_size_px = std::fmax(14.f, font * 0.95f);
-      cb.font_size_px = font;
-      cb.font_id = sans_f;
-      if (style.link_color.a != 0) cb.accent = style.link_color;
-      const float cb_total_h = cb.box_size_px + 8.f;
-      const float cb_pad_top = std::fmax(0.f, (top_lead + body_fm.ascent * 0.625f) - cb_total_h * 0.5f);
+      const uint32_t cb_id = etch_id_index(line_id, 0x5441u);
+      push_u32(&measure->vis_ctrl_ids, &measure->vis_ctrl_count, &measure->vis_ctrl_cap, cb_id);
+      const bool dark = inlay_is_dark_theme(theme);
+      const EtchColor accent = style.link_color.a != 0 ? style.link_color : theme.accent;
+      const float cb_sz = std::fmax(14.f, std::round(font * 0.96f));
+      const float cb_pad_top = std::fmax(0.f, std::round((top_lead + body_fm.ascent * 0.58f) - cb_sz * 0.5f));
+      if (etch_hovered(cb_id)) etch_set_cursor(ETCH_CURSOR_HAND);
+      const bool toggled = etch_clicked(cb_id) ||
+       (etch_focused(cb_id) && (etch_key_pressed(13u, false) || etch_key_pressed(32u, false)));
+      if (toggled) checked = !checked;
       if (cb_pad_top > 0.25f) {
        auto cwrap = etch_box_desc_default();
-       cwrap.padding = {0, 0, cb_pad_top, 0};
+       cwrap.padding = {0.f, 0.f, cb_pad_top, 0.f};
        etch_begin_box(&cwrap);
       }
-      if (etch_checkbox(&cb) && toggle_out) {
+      auto cbox = etch_box_desc_default();
+      cbox.id = cb_id;
+      cbox.width = etch_sizing_fixed(cb_sz);
+      cbox.height = etch_sizing_fixed(cb_sz);
+      cbox.focusable = true;
+      cbox.radius = etch_corners_all(std::fmax(3.5f, cb_sz * 0.27f));
+      cbox.continuous_corners = true;
+      if (checked) {
+       cbox.background = accent;
+       cbox.border_color = accent;
+       cbox.border_width = 1.f;
+       if (dark) cbox.top_rim_alpha = 0.14f;
+      } else {
+       cbox.background = dark ? etch_rgba8(255, 255, 255, 10) : theme.bg_elevated;
+       cbox.hover_background = theme.surface_hover;
+       cbox.border_color = dark ? etch_rgba8(255, 255, 255, 76) : etch_rgba8(17, 19, 24, 72);
+       cbox.hover_border_color = accent;
+       cbox.border_width = 1.25f;
+      }
+      etch_begin_box(&cbox);
+      EtchA11yOverrideDesc a11y_ov = {};
+      a11y_ov.element_id = cb_id;
+      a11y_ov.has_role = true;
+      a11y_ov.role = ETCH_A11Y_CHECKBOX;
+      a11y_ov.add_states = checked ? ETCH_A11Y_STATE_CHECKED : 0u;
+      a11y_ov.clear_states = checked ? 0u : ETCH_A11Y_STATE_CHECKED;
+      a11y_ov.has_actions_mask = true;
+      a11y_ov.actions_mask = etch_a11y_action_bit(ETCH_A11Y_ACT_FOCUS) | etch_a11y_action_bit(ETCH_A11Y_ACT_PRESS);
+      etch_set_a11y_override(&a11y_ov);
+      if (checked) {
+       const float ck_w = std::fmax(1.6f, cb_sz * 0.125f);
+       EtchLineDesc l1 = etch_line_draw_desc_default();
+       l1.from = {cb_sz * 0.23f, cb_sz * 0.52f};
+       l1.to = {cb_sz * 0.43f, cb_sz * 0.72f};
+       l1.color = theme.on_primary;
+       l1.thickness = ck_w;
+       etch_draw_line(&l1);
+       EtchLineDesc l2 = etch_line_draw_desc_default();
+       l2.from = {cb_sz * 0.43f, cb_sz * 0.72f};
+       l2.to = {cb_sz * 0.78f, cb_sz * 0.29f};
+       l2.color = theme.on_primary;
+       l2.thickness = ck_w;
+       etch_draw_line(&l2);
+      }
+      etch_end_box();
+      if (cb_pad_top > 0.25f) etch_end_box();
+      if (toggled && toggle_out) {
        uint32_t item_index = 0;
        const auto& bm = measure->doc->block_meta[info.block];
        if (meta && bm.list_item_count > 0u) {
@@ -2348,7 +2445,6 @@ float block_lines(InlayMeasure* measure, const InlayBlock& b, EtchStr source, ui
        }
        *toggle_out = {check_offset, info.block, item_index, checked, true};
       }
-      if (cb_pad_top > 0.25f) etch_end_box();
      } else {
       auto mbox = etch_box_desc_default();
       if (ordered) {
@@ -3286,6 +3382,10 @@ INLAY_API InlayDocResult inlay_doc_view(InlayDoc* doc, const InlayDocViewDesc* i
    box.padding = {padding, padding, info.first ? padding : 0.f, info.last_in_block ? padding : 0.f};
    box.gap = 0;
   }
+  if (b.kind == INLAY_THEMATIC_BREAK) {
+   box.padding.top += 4.f;
+   box.padding.bottom += 4.f;
+  }
   if (is_code_card) {
    const float r = theme.radius_panel_px;
    box.background = style.code_bg.a != 0 ? style.code_bg : theme.bg_elevated;
@@ -3293,6 +3393,8 @@ INLAY_API InlayDocResult inlay_doc_view(InlayDoc* doc, const InlayDocViewDesc* i
    box.border_width = 0.f;
    box.border_sides = {1.f, 1.f, info.first ? 1.f : 0.f, info.last_in_block ? 1.f : 0.f};
    box.radius = {info.first ? r : 0.f, info.first ? r : 0.f, info.last_in_block ? r : 0.f, info.last_in_block ? r : 0.f};
+   box.continuous_corners = true;
+   if (info.first && inlay_is_dark_theme(theme)) box.top_rim_alpha = 0.06f;
    box.padding = {0.f, 0.f, 0.f, 0.f};
    box.gap = 0.f;
   } else if (b.kind == INLAY_ALERT) {
@@ -3307,13 +3409,15 @@ INLAY_API InlayDocResult inlay_doc_view(InlayDoc* doc, const InlayDocViewDesc* i
    }
    box.border_color = acol;
    box.border_sides = {3.f, 0.f, 0.f, 0.f};
-   box.radius = {info.first ? 2.f : 0.f, info.first ? 6.f : 0.f, info.last_in_block ? 6.f : 0.f, info.last_in_block ? 2.f : 0.f};
+   box.radius = {info.first ? 3.f : 0.f, info.first ? 8.f : 0.f, info.last_in_block ? 8.f : 0.f, info.last_in_block ? 3.f : 0.f};
+   box.continuous_corners = true;
    box.padding = {padding + 4.f, padding, info.first ? padding * 0.85f : 2.f, info.last_in_block ? padding * 0.85f : 2.f};
   } else if (b.kind == INLAY_BLOCKQUOTE) {
    box.background = style.quote_bg.a != 0 ? style.quote_bg : theme.bg_elevated;
    box.border_color = style.quote_border.a != 0 ? style.quote_border : (theme.border_control.a != 0 ? theme.border_control : theme.border_subtle);
    box.border_sides = {2.5f, 0.f, 0.f, 0.f};
-   box.radius = {info.first ? 2.f : 0.f, info.first ? 6.f : 0.f, info.last_in_block ? 6.f : 0.f, info.last_in_block ? 2.f : 0.f};
+   box.radius = {info.first ? 3.f : 0.f, info.first ? 8.f : 0.f, info.last_in_block ? 8.f : 0.f, info.last_in_block ? 3.f : 0.f};
+   box.continuous_corners = true;
    box.padding = {padding + 4.f, padding, info.first ? padding * 0.85f : 2.f, info.last_in_block ? padding * 0.85f : 2.f};
   }
 
@@ -3329,8 +3433,9 @@ INLAY_API InlayDocResult inlay_doc_view(InlayDoc* doc, const InlayDocViewDesc* i
   if (b.kind == INLAY_THEMATIC_BREAK) {
    auto rule = etch_box_desc_default();
    rule.width = etch_sizing_grow(0, 0);
-   rule.height = etch_sizing_fixed(1);
-   rule.background = theme.border_line;
+   rule.height = etch_sizing_fixed(1.5f);
+   rule.radius = etch_corners_all(0.75f);
+   rule.background = theme.border_subtle.a != 0 ? theme.border_subtle : theme.border_line;
    etch_box(&rule);
   } else if (b.kind == INLAY_MATH_BLOCK) {
    const EtchStr body = slice(source, b.content_offset, b.content_length);
@@ -3374,8 +3479,9 @@ INLAY_API InlayDocResult inlay_doc_view(InlayDoc* doc, const InlayDocViewDesc* i
     hdr.padding = {padding, padding, 6.f, 6.f};
     hdr.align_y = ETCH_ALIGN_Y_CENTER;
     hdr.gap = 6;
-    if (style.code_header_bg.a != 0) hdr.background = style.code_header_bg;
+    hdr.background = code_header_bg_color(style, theme);
     hdr.radius = {r, r, 0.f, 0.f};
+    hdr.continuous_corners = true;
     hdr.border_color = style.code_border.a != 0 ? style.code_border : theme.border_subtle;
     hdr.border_sides = {0, 0, 0, 1};
     etch_begin_box(&hdr);
@@ -3412,25 +3518,7 @@ INLAY_API InlayDocResult inlay_doc_view(InlayDoc* doc, const InlayDocViewDesc* i
      view.diagram_header_fn(info.block, row_id, ETCH_STR_LIT("mermaid"), body, view.diagram_header_user_data);
     }
     if (!view.hide_code_copy_button) {
-     const uint64_t now_ms = SDL_GetTicks();
-     const bool copied_active = info.block < measure->open_capacity && measure->copied_until_ms &&
-      measure->copied_until_ms[info.block] > now_ms;
-     if (copied_active) etch_request_redraw(doc->context);
-     auto cbtn = etch_button_desc_default();
-     cbtn.id = etch_id_index(row_id, 1);
-     push_u32(&measure->vis_ctrl_ids, &measure->vis_ctrl_count, &measure->vis_ctrl_cap, cbtn.id);
-     cbtn.variant = ETCH_BUTTON_GHOST;
-     cbtn.label = copied_active ? ETCH_STR_LIT("Copied") : ETCH_STR_LIT("Copy");
-     cbtn.font_size_px = std::fmax(11.f, view.font_size_px * 0.78f);
-     cbtn.padding = etch_padding_xy(6, 2);
-     if (etch_button(&cbtn)) {
-      char* copy = static_cast<char*>(etch_frame_arena_alloc(doc->context, size_t(body.length) + 1u, 1));
-      if (copy) { std::memcpy(copy, body.chars, body.length); copy[body.length] = 0; etch_set_clipboard_text(copy); }
-      if (info.block < measure->open_capacity && measure->copied_until_ms) {
-       measure->copied_until_ms[info.block] = now_ms + 1500u;
-       etch_request_redraw(doc->context);
-      }
-     }
+     render_copy_button(doc, measure, info.block, row_id, view.font_size_px, body);
     }
     etch_end_box();
    }
@@ -3501,6 +3589,7 @@ INLAY_API InlayDocResult inlay_doc_view(InlayDoc* doc, const InlayDocViewDesc* i
     idesc.width = etch_sizing_fixed(img.width);
     idesc.height = etch_sizing_fixed(img.height);
     idesc.radius = etch_corners_all(img.radius);
+    idesc.continuous_corners = true;
     etch_image(&idesc);
    } else draw_image_fallback(alt, etch_id_index(row_id, 1), view.font_size_px, style, theme);
   } else if (b.kind == INLAY_FOOTNOTE) {
@@ -3597,8 +3686,9 @@ INLAY_API InlayDocResult inlay_doc_view(InlayDoc* doc, const InlayDocViewDesc* i
     hdr.padding = {padding, padding, 6.f, 6.f};
     hdr.align_y = ETCH_ALIGN_Y_CENTER;
     hdr.gap = 6;
-    if (style.code_header_bg.a != 0) hdr.background = style.code_header_bg;
+    hdr.background = code_header_bg_color(style, theme);
     hdr.radius = {r, r, 0.f, 0.f};
+    hdr.continuous_corners = true;
     hdr.border_color = style.code_border.a != 0 ? style.code_border : theme.border_subtle;
     hdr.border_sides = {0, 0, 0, 1};
     etch_begin_box(&hdr);
@@ -3638,25 +3728,7 @@ INLAY_API InlayDocResult inlay_doc_view(InlayDoc* doc, const InlayDocViewDesc* i
      view.code_header_fn(info.block, row_id, lang, full_code, view.code_header_user_data);
     }
     if (!view.hide_code_copy_button) {
-     const uint64_t now_ms = SDL_GetTicks();
-     const bool copied_active = info.block < measure->open_capacity && measure->copied_until_ms &&
-      measure->copied_until_ms[info.block] > now_ms;
-     if (copied_active) etch_request_redraw(doc->context);
-     auto button = etch_button_desc_default();
-     button.id = etch_id_index(row_id, 1);
-     push_u32(&measure->vis_ctrl_ids, &measure->vis_ctrl_count, &measure->vis_ctrl_cap, button.id);
-     button.variant = ETCH_BUTTON_GHOST;
-     button.label = copied_active ? ETCH_STR_LIT("Copied") : ETCH_STR_LIT("Copy");
-     button.font_size_px = std::fmax(11.f, view.font_size_px * 0.78f);
-     button.padding = etch_padding_xy(6, 2);
-     if (etch_button(&button)) {
-      char* copy = static_cast<char*>(etch_frame_arena_alloc(doc->context, size_t(full_code.length) + 1u, 1));
-      if (copy) { std::memcpy(copy, full_code.chars, full_code.length); copy[full_code.length] = 0; etch_set_clipboard_text(copy); }
-      if (info.block < measure->open_capacity && measure->copied_until_ms) {
-       measure->copied_until_ms[info.block] = now_ms + 1500u;
-       etch_request_redraw(doc->context);
-      }
-     }
+     render_copy_button(doc, measure, info.block, row_id, view.font_size_px, full_code);
     }
     etch_end_box();
    }
@@ -3665,6 +3737,14 @@ INLAY_API InlayDocResult inlay_doc_view(InlayDoc* doc, const InlayDocViewDesc* i
    cbody.width = etch_sizing_fixed(eff_row_width);
    cbody.height = etch_sizing_fit(0, 0);
    cbody.padding = {padding, padding, info.first ? (has_hdr ? 8.f : padding) : 2.f, info.last_in_block ? padding : 2.f};
+   if (info.first && info.last_in_block) {
+    cbody.shadow_inset = true;
+    cbody.shadow_blur = 6.f;
+    cbody.shadow_offset = {0.f, 1.f};
+    cbody.shadow_color = inlay_is_dark_theme(theme) ? etch_rgba8(0, 0, 0, 52) : etch_rgba8(15, 23, 42, 16);
+    cbody.radius = {has_hdr ? 0.f : r, has_hdr ? 0.f : r, r, r};
+    cbody.continuous_corners = true;
+   }
    etch_begin_box(&cbody);
    const bool show_ln = view.show_code_line_numbers;
    const uint32_t start_line = info.code_start_line ? info.code_start_line : 1u;

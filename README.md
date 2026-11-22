@@ -1,6 +1,6 @@
 # Inlay
-Native streamed documents on Etch, through its public C99 API. Build with CMake
-and Ninja in `build/`; a sibling `../Etch` is used when Etch 0.25 is not installed. Inlay 0.11.0 requires Etch 0.25.
+Native streamed documents, publication-grade math/diagrams, and high-velocity declarative QuickJS-NG UI surfaces on Etch, through its public C99 API. Build with CMake
+and Ninja in `build/`; a sibling `../Etch` is used when Etch 0.27 is not installed. Inlay 0.12.0 requires Etch 0.27.
 C99 includes `<inlay/inlay_c.h>`; C++20 may include `<inlay/inlay.h>`.
 
 Create a document with an Etch context, append UTF-8 chunks, and call
@@ -55,9 +55,18 @@ canvas or call inside an existing Etch canvas.
 
 Reactive surfaces use optional QuickJS-NG (`INLAY_ENABLE_SCRIPT=ON`). Create an
 `InlaySurface`, set JSON state, and install a script defining `render(state)`.
-`h("box", {axis:"column", gap:8, bg:"var(--etch-bg-elevated)", radius:"panel"},
-h("text", {text:"Hello"}))` builds cached native nodes. Buttons dispatch
-`onClick` to `onEvent`. Text inputs and toggles are controlled by script state.
+Both `h(tag, props, ...children)` and ergonomic `ui.*` builders (`box`, `row`, `col`,
+`card`, `spacer`, `text`, `button`, `input`, `toggle`, `checkbox`, `tabs`, `combobox`,
+`scroll`, `progress`, `slider`, `badge`, `divider`, `image`, `modal`, `popover`,
+`tooltip`, `split`, `math`, `diagram`, `slot`) compile into cached native Etch nodes
+with full Etch 0.27 styling (`elevation`, `shadow`/`shadows`, `insetShadow`, multi-stop
+Oklab `gradient`, `backdropBlur` vibrancy, `continuousCorners`, per-corner `radius`,
+`topRimAlpha`, `hoverBg`/`hoverBorderColor`/`hoverScale`/`pressScale`, `rotate`/`scale`/`translate`/`opacity`,
+Flexbox + 2D Grid + floating anchor/zIndex). Host code can bind native panels (`InlayDoc`,
+`InlayPortal`, `etch_terminal_grid`, custom GPU shaders) directly into declarative
+`ui.slot({name})` nodes via `inlay_surface_bind_slot`. Buttons dispatch `onClick` to
+`onEvent` or inline JS callbacks; inputs, toggles, checkboxes, sliders, tabs, and
+comboboxes are controlled by script state.
 
 ```js
 h("input", {value: s.query, placeholder: "Filter...", onChange: "setQuery", width: -1})
@@ -132,7 +141,7 @@ can implement the same public vtable; the built-in web accessor returns NULL whe
 disabled or unsupported. No unimplemented native feature is silently mocked.
 Set `INLAY_WEBVIEW2_LOADER` to enable the real-runtime async/destruction smoke test.
 
-Release candidate scope: Inlay 0.11.0 requires Etch 0.25 and remains pre-1.0.
+Release candidate scope: Inlay 0.12.0 requires Etch 0.27 and remains pre-1.0.
 Local release checks cover Windows Vulkan/D3D12, installed/subproject C99 and
 C++20 consumers, script/browser enabled and disabled configurations, bounded
 portal scratch memory and idle uploads. Metal and Linux browser/compositor

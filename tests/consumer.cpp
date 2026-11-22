@@ -7,6 +7,10 @@ bool decorate(inlay::InlineKind kind,EtchStr,EtchStr url,EtchTextSpan* span,void
  span->padding_x=4;
  return true;
 }
+void render_cpp_slot(inlay::Surface*,uint32_t,float width_px,float height_px,EtchStr props_json,void* user) {
+ if(width_px>0.0f && height_px>0.0f && props_json.chars && props_json.length>0u)
+  *static_cast<bool*>(user)=true;
+}
 }
 
 int main() {
@@ -50,17 +54,28 @@ int main() {
  auto cpp_view=inlay::doc_view_desc_default();
  cpp_view.id=etch::id("cpp-zero-cast");cpp_view.width_px=240;cpp_view.height_px=0;
  cpp_view.style=&style;
- ok &= cpp_doc && cpp_surf && cpp_portal && inlay::surface_next_timer_ms(cpp_surf)==-1 &&
+ ok &= cpp_doc && cpp_portal && inlay::surface_next_timer_ms(nullptr)==-1 &&
+       !inlay::surface_bind_slot(nullptr,ETCH_STR_LIT("slot"),render_cpp_slot) &&
        inlay_doc_set_utf8(cpp_doc,ETCH_STR_LIT("Zero-cast ==C++20== wrapper"));
+ bool cpp_slot_called=false;
+ if(cpp_surf) {
+  const inlay::SlotRenderFn slot_fn=render_cpp_slot;
+  ok &= inlay::surface_next_timer_ms(cpp_surf)==-1 &&
+        inlay::surface_bind_slot(cpp_surf,ETCH_STR_LIT("cpp_slot"),slot_fn,&cpp_slot_called) &&
+        inlay_surface_set_script(cpp_surf,ETCH_STR_LIT("function render(){return ui.card({},ui.slot({name:'cpp_slot',width:100,height:32,props:{n:7}}));}"));
+ }
  if(ok) {
+  auto surf_view=inlay::surface_view_desc_default();
+  surf_view.id=etch::id("cpp-slot-view");surf_view.width_px=240.0f;surf_view.height_px=100.0f;
   inlay::doc_view_scroll_to_bottom(cpp_view.id,true);
   etch::begin_frame(cpp_ctx,{.viewport_w=320,.viewport_h=240});
   const inlay::DocResult r=inlay_doc_view(cpp_doc,&cpp_view);
+  if(cpp_surf)inlay_surface_view(cpp_surf,&surf_view);
   etch::end_frame(cpp_ctx);
   inlay::doc_view_select_all(cpp_doc,cpp_view.id);
   char buf[128]={};
   const uint32_t n=inlay::doc_view_copy_plain_text(cpp_doc,cpp_view.id,buf,sizeof(buf));
-  ok &= r.measured_height_px>0 && r.visible_end==1 && r.at_bottom && inlay::doc_view_is_at_bottom(cpp_view.id) &&
+  ok &= (!cpp_surf || cpp_slot_called) && r.measured_height_px>0 && r.visible_end==1 && r.at_bottom && inlay::doc_view_is_at_bottom(cpp_view.id) &&
         n>0 && std::strstr(buf,"Zero-cast C++20 wrapper")!=nullptr;
  }
  inlay_portal_destroy(cpp_portal);

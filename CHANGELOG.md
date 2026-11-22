@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.12.0] - 2026-11-23
+
+- Require Etch 0.27 (`Etch 0.27.0`) across `CMakeLists.txt`, installed `InlayConfig.cmake`, and downstream checks.
+- Upgrade `InlaySurface` (`src/inlay_ui.cpp`) into a high-aesthetic declarative QuickJS-NG UI layer over Etch 0.27 while keeping `< 2 ms` HMR, 0 idle JS ticks, 8 MiB VM cap, and 4 ms tick watchdog:
+  - Expose Etch 0.27 visual craft: `elevation` (`"sm"`/`"md"`/`"lg"`/`"xl"`), `shadow`/`shadows[]`, `insetShadow`, multi-stop `gradient` (`linear`/`radial`/`conic`, `oklab`, up to 8 stops), `backdropBlur` + vibrancy (`backdropSaturation`/`backdropBrightness`/`backdropNoise`), `continuousCorners`, per-corner `radius`, `topRimAlpha`, `hoverBg`/`hoverBorderColor`/`hoverScale`/`pressScale`, and 2D layer transforms (`rotate`/`scale`/`translate`/`opacity`).
+  - Expose full Flexbox (`flexGrow`/`flexShrink`/`wrap`/`justify`/`alignSelf`/`margin`/per-side `padding`/`minW`/`maxW`/`minH`/`maxH`/`aspectRatio`/`rowGap`), 2D Grid (`gridCols`/`colSpan`/`rowSpan`), and floating overlays (`attachTo`/`anchor`/`anchorParent`/`offsetX`/`offsetY`/`zIndex`).
+  - Add ergonomic composite primitives (`ui.card`, `ui.row`, `ui.col`, `ui.spacer`, `ui.checkbox`, `ui.tabs`, `ui.combobox`, `ui.modal`, `ui.popover`, `ui.tooltip`, `ui.split`) and native content bridges (`ui.math`, `ui.diagram`, `ui.slot` + C99 `inlay_surface_bind_slot`).
+- Polish publication-grade rich content rendering across `inlay_view.cpp`, `inlay_diagram.cpp`, and `inlay_math.cpp` using Etch 0.27 continuous corners, recessed inset code wells, distinct code/diagram header strips, elevated Mermaid nodes & callouts, and cleaner typography contrast in both Dark and Light themes.
+- Redesign `cromma_workbench_demo` as a flagship native desktop workbench supporting both Dark (default) and `--light` themes with elevated cards, vibrancy overlays, framed recessed terminal card, live QuickJS-NG inspector showcasing `ui.card`/`ui.tabs`/`ui.slider`/`ui.progress`/`ui.badge`/`ui.math`/`ui.slot`, and dual-backend headless verification.
+
 ## [0.11.0] - 2026-11-22
 
 - Require Etch 0.25 and upgrade the public C99 ABI (`include/inlay/inlay_c.h`) with

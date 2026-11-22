@@ -60,6 +60,7 @@ int main(int argc, char **argv) {
   auto stats = inlay_portal_stats(p);
   ok &= stats.uploaded_bytes == 320 * 180 * 4;
   size_t idle_arena_bytes = 0;
+  const bool init_ok = ok;
   for (int f = 0; f < 32; ++f) {
     auto fd = etch_frame_desc_default();
     fd.viewport_w = 700;
@@ -98,6 +99,7 @@ int main(int argc, char **argv) {
     ok &= inlay_portal_poll(p) &&
           inlay_portal_stats(p).uploaded_bytes == stats.uploaded_bytes;
   }
+  const bool loop_ok = ok;
   EtchElementGeometry g = {};
   ok &= etch_element_geometry(etch_id("portal"), &g);
   ok &= std::fabs(g.local_scale.x - .65f) < .001f;
@@ -144,6 +146,7 @@ int main(int argc, char **argv) {
   ok &= inlay_portal_resize(p, 200, 100) && inlay_portal_poll(p);
   ok &= !inlay_portal_resize(p, 0, 100);
   ok &= inlay_portal_destroy(p);
+  const bool tex_ok = ok;
   d.mode = INLAY_PORTAL_MODE_UNDERLAY;
   p = inlay_portal_create(ctx, &d);
   ok &= p != nullptr;
@@ -192,6 +195,7 @@ int main(int argc, char **argv) {
                                  etch_color_black(255));
   inlay_portal_frame_submitted(p);
   ok &= inlay_portal_destroy(p);
+  const bool underlay_ok = ok;
   auto visibility_api = *backend;
   visibility_api.set_underlay_bounds = record_bounds;
   d.backend = &visibility_api;
@@ -240,6 +244,10 @@ int main(int argc, char **argv) {
   ok &= inlay_portal_destroy(p);
   inlay_doc_destroy(doc);
   etch_destroy_context(ctx);
+  if (!ok) {
+    std::fprintf(stderr, "Portal diag: init=%d loop=%d tex=%d underlay=%d final=%d scale=(%.3f,%.3f)\n",
+                 init_ok, loop_ok, tex_ok, underlay_ok, ok, g.local_scale.x, g.local_scale.y);
+  }
   std::printf("Portal tiles/zoom/IME: %s\n", ok ? "PASS" : "FAIL");
   return ok ? 0 : 1;
 }

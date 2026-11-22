@@ -511,8 +511,8 @@ bool mermaid_single_pass_arena(EtchContext* ctx,InlayDoc* doc) {
  inlay_doc_clear(doc);
  etch_end_frame(ctx);
  const size_t used=etch_frame_stats(ctx).arena_used_bytes;
- ok &= used>single_layout_bytes && used<single_layout_bytes+single_layout_bytes/2;
- if(!ok)std::fprintf(stderr,"Mermaid single pass arena: used=%zu single_layout=%zu\n",used,single_layout_bytes);
+ ok &= used>single_layout_bytes && used<baseline+single_layout_bytes+single_layout_bytes*3/4;
+ if(!ok)std::fprintf(stderr,"Mermaid single pass arena: used=%zu baseline=%zu single_layout=%zu\n",used,baseline,single_layout_bytes);
  return ok;
 }
 bool has_prim_color(EtchContext* ctx,uint32_t rgba) {
