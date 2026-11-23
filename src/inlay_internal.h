@@ -212,6 +212,9 @@ struct InlayMeasure {
  double total_height;
  uint32_t revision;
  bool layout_settled;
+ bool reveal_pending;
+ uint32_t reveal_revision,reveal_offset;
+ EtchAlignY reveal_align;
  InlayRow* rows;
  float* heights;
  uint32_t count,capacity,frozen_count;
@@ -256,13 +259,18 @@ struct InlayDoc {
  InlayRefDef* ref_defs;
  uint32_t ref_def_count,ref_def_capacity;
  bool has_ref_defs;
+ bool parse_pending;
+ uint32_t parse_from;
  uint32_t revision;
+ InlayDocAnchor* anchors;
+ uint32_t anchor_count,anchor_capacity;
  InlayMeasure* views;
  uint32_t view_count,view_capacity;
  char utf8_carry[4];uint8_t utf8_carry_len;
 };
 
 const InlayRefDef* inlay_doc_find_ref_def(const InlayDoc* doc,const char* label,uint32_t len) noexcept;
+void inlay_doc_parse_pending(InlayDoc* doc) noexcept;
 
 enum InlayDiagramShape : uint8_t {
  InlayShapeRect=0, InlayShapeRound=1, InlayShapeDiamond=2, InlayShapeCircle=3

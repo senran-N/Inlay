@@ -176,13 +176,13 @@ float effective_heading_font(const InlayDocViewDesc& view, const InlayDocStyle& 
  return view.font_size_px + float(7u - level) * 2.f;
 }
 uint16_t effective_sans_font(const InlayDocStyle& style) noexcept {
- return style.font_id != ETCH_INVALID_FONT ? style.font_id : ETCH_FONT_SANS;
+ return style.font_id != ETCH_INVALID_FONT ? style.font_id : uint16_t(ETCH_FONT_SANS);
 }
 uint16_t effective_bold_font(const InlayDocStyle& style) noexcept {
- return style.bold_font_id != ETCH_INVALID_FONT ? style.bold_font_id : ETCH_FONT_BOLD;
+ return style.bold_font_id != ETCH_INVALID_FONT ? style.bold_font_id : uint16_t(ETCH_FONT_BOLD);
 }
 uint16_t effective_mono_font(const InlayDocStyle& style) noexcept {
- return style.mono_font_id != ETCH_INVALID_FONT ? style.mono_font_id : ETCH_FONT_MONO;
+ return style.mono_font_id != ETCH_INVALID_FONT ? style.mono_font_id : uint16_t(ETCH_FONT_MONO);
 }
 float effective_code_font_size(float font, const InlayDocStyle& style) noexcept {
  return (style.code_font_scale > 0.f) ? std::fmax(8.f, font * style.code_font_scale) : font;
@@ -1512,6 +1512,14 @@ float rich_line(InlayMeasure* m, EtchStr line, uint32_t base_id, float font, Inl
      idesc.radius = etch_corners_all(img.radius);
      idesc.continuous_corners = true;
      etch_image(&idesc);
+     if (etch_hovered(idesc.id)) etch_set_cursor(ETCH_CURSOR_HAND);
+     if (result && etch_clicked(idesc.id)) {
+      result->clicked_link = src;
+      result->clicked_kind = INLAY_INLINE_IMAGE;
+      result->clicked_bounds = etch_element_bounds(idesc.id);
+      result->clicked_block_index = block_index;
+      result->clicked_mods = etch_key_mods();
+     }
     } else draw_image_fallback(alt, desc.id, font, style, theme);
     if (top_pad > 0.5f || pad_l > 0.f || pad_r > 0.f) etch_end_box();
     if (io_doc_cursor) *io_doc_cursor += tok_len;
@@ -2381,8 +2389,8 @@ float block_lines(InlayMeasure* measure, const InlayBlock& b, EtchStr source, ui
       a11y_ov.element_id = cb_id;
       a11y_ov.has_role = true;
       a11y_ov.role = ETCH_A11Y_CHECKBOX;
-      a11y_ov.add_states = checked ? ETCH_A11Y_STATE_CHECKED : 0u;
-      a11y_ov.clear_states = checked ? 0u : ETCH_A11Y_STATE_CHECKED;
+      a11y_ov.add_states = checked ? uint32_t(ETCH_A11Y_STATE_CHECKED) : 0u;
+      a11y_ov.clear_states = checked ? 0u : uint32_t(ETCH_A11Y_STATE_CHECKED);
       a11y_ov.has_actions_mask = true;
       a11y_ov.actions_mask = etch_a11y_action_bit(ETCH_A11Y_ACT_FOCUS) | etch_a11y_action_bit(ETCH_A11Y_ACT_PRESS);
       etch_set_a11y_override(&a11y_ov);
@@ -2900,6 +2908,7 @@ void emit_inline_markdown_slice(const InlayMeasure* m, EtchStr source, uint32_t 
 extern "C" {
 INLAY_API float inlay_doc_measure_height(InlayDoc* doc, uint32_t view_id, float width_px, float font_size_px) {
  if (!doc || !valid_dimensions(view_id, width_px, font_size_px)) return 0;
+ inlay_doc_parse_pending(doc);
  const InlayMeasure* matched = nullptr;
  for (uint32_t vi = 0; vi < doc->view_count; ++vi) {
   auto& slot = doc->views[vi];
@@ -2986,6 +2995,42 @@ INLAY_API InlayDocSelection inlay_doc_view_selection(const InlayDoc* doc, uint32
  s.total_bytes = m->plain_len;
  s.active = m->doc_sel_active && m->doc_sel_anchor != m->doc_sel_focus;
  return s;
+}
+
+INLAY_API InlayDocSelection inlay_doc_view_find_text(
+ const InlayDoc* doc, uint32_t view_id, EtchStr query, uint32_t from_byte) {
+ const InlayMeasure* m = find_view(doc, view_id);
+ if (!m || m->revision != doc->revision || !query.chars || !query.length || from_byte > m->plain_len ||
+     query.length > m->plain_len - from_byte) return {};
+ const uint32_t last_start = m->plain_len - query.length;
+ uint32_t pos = from_byte;
+ while (pos <= last_start) {
+  const auto* found = static_cast<const char*>(
+   std::memchr(m->plain_text + pos, static_cast<unsigned char>(query.chars[0]), last_start - pos + 1u));
+  if (!found) break;
+  pos = static_cast<uint32_t>(found - m->plain_text);
+  const uint32_t end = pos + query.length;
+  if (utf8_clamp(m->plain_text, m->plain_len, pos) == pos &&
+      utf8_clamp(m->plain_text, m->plain_len, end) == end &&
+      std::memcmp(found, query.chars, query.length) == 0) {
+   return {pos, end, m->plain_len, true};
+  }
+  ++pos;
+ }
+ return {0u, 0u, m->plain_len, false};
+}
+
+INLAY_API bool inlay_doc_view_reveal_text(
+ InlayDoc* doc, uint32_t view_id, uint32_t byte_offset, EtchAlignY align) {
+ InlayMeasure* m = find_view(doc, view_id);
+ if (!m || m->revision != doc->revision || m->view.height_px <= 0.f || byte_offset >= m->plain_len ||
+     (align != ETCH_ALIGN_Y_TOP && align != ETCH_ALIGN_Y_CENTER && align != ETCH_ALIGN_Y_BOTTOM)) return false;
+ m->reveal_pending = true;
+ m->reveal_revision = doc->revision;
+ m->reveal_offset = utf8_clamp(m->plain_text, m->plain_len, byte_offset);
+ m->reveal_align = align;
+ etch_request_redraw(doc->context);
+ return true;
 }
 
 INLAY_API void inlay_doc_view_set_selection(InlayDoc* doc, uint32_t view_id, uint32_t anchor, uint32_t focus) {
@@ -3151,6 +3196,7 @@ INLAY_API InlayDocResult inlay_doc_view(InlayDoc* doc, const InlayDocViewDesc* i
   view.style = &style;
  }
 
+ inlay_doc_parse_pending(doc);
  InlayMeasure* measure = find_or_add_view(doc, view.id);
  if (!measure) return result;
  const bool flow = view.height_px == 0;
@@ -3162,6 +3208,7 @@ INLAY_API InlayDocResult inlay_doc_view(InlayDoc* doc, const InlayDocViewDesc* i
   old.hide_code_copy_button != view.hide_code_copy_button || old.inline_decorator_fn != view.inline_decorator_fn ||
   old.inline_decorator_user_data != view.inline_decorator_user_data ||
   old.image_resolver_fn != view.image_resolver_fn || old.image_resolver_user_data != view.image_resolver_user_data ||
+  old.image_epoch != view.image_epoch ||
   old.custom_fence_estimate_fn != view.custom_fence_estimate_fn ||
   old.custom_fence_render_fn != view.custom_fence_render_fn ||
   old.custom_fence_user_data != view.custom_fence_user_data ||
@@ -3182,6 +3229,21 @@ INLAY_API InlayDocResult inlay_doc_view(InlayDoc* doc, const InlayDocViewDesc* i
  measure->style = style;
  measure->view = view;
  measure->view.style = &measure->style;
+ if (measure->reveal_pending) {
+  measure->reveal_pending = false;
+  if (!flow && measure->reveal_revision == doc->revision && measure->count) {
+   uint32_t lo = 0u, hi = measure->count;
+   while (lo < hi) {
+    const uint32_t mid = lo + (hi - lo) / 2u;
+    const auto& row = measure->rows[mid];
+    if (row.doc_text_offset + row.doc_text_length <= measure->reveal_offset) lo = mid + 1u;
+    else hi = mid;
+   }
+   if (lo < measure->count) {
+    etch_virtual_list_scroll_to_row(view.id, lo, block_height(lo, measure), measure->reveal_align);
+   }
+  }
+ }
 
  // Update unified document character-level cross-block selection BEFORE rendering so highlights appear on this frame!
  update_doc_selection(doc, measure, view);
@@ -3538,6 +3600,14 @@ INLAY_API InlayDocResult inlay_doc_view(InlayDoc* doc, const InlayDocViewDesc* i
     idesc.radius = etch_corners_all(img.radius);
     idesc.continuous_corners = true;
     etch_image(&idesc);
+    if (etch_hovered(idesc.id)) etch_set_cursor(ETCH_CURSOR_HAND);
+    if (etch_clicked(idesc.id)) {
+     result.clicked_link = src;
+     result.clicked_kind = INLAY_INLINE_IMAGE;
+     result.clicked_bounds = etch_element_bounds(idesc.id);
+     result.clicked_block_index = info.block;
+     result.clicked_mods = etch_key_mods();
+    }
    } else draw_image_fallback(alt, etch_id_index(row_id, 1), view.font_size_px, style, theme);
   } else if (b.kind == INLAY_FOOTNOTE) {
    const float fn_font = std::fmax(10.f, view.font_size_px * 0.85f);

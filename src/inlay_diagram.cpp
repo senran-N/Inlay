@@ -12,7 +12,7 @@ struct Graph {
     InlayDiagramEdge* edges;
     uint8_t* edge_styles;
     InlayDiagramSubgraph* subgraphs;
-    uint32_t node_count, edge_count, subgraph_count;
+    uint32_t node_count, node_capacity, edge_count, subgraph_count;
     int32_t active_subgraph;
     bool valid, lr, reverse_dir;
 };
@@ -176,7 +176,7 @@ uint32_t node(Graph* g) noexcept {
     uint32_t index = 0;
     while (index < g->node_count && !equal(g->nodes[index].id, id)) ++index;
     if (index == g->node_count) {
-        if (index == 256) { g->valid = false; return 0; }
+        if (index == g->node_capacity) { g->valid = false; return 0; }
         g->nodes[index] = {};
         g->nodes[index].id = id;
         g->nodes[index].label = id;
@@ -422,20 +422,16 @@ bool match_directive_keyword(const Graph& g, EtchStr kw) noexcept {
     return next == ' ' || next == '\t' || next == '\r' || next == '\n' || next == ';';
 }
 
-bool skip_flowchart_directive(Graph* g) noexcept {
-    if (match_directive_keyword(*g, ETCH_STR_LIT("classDef")) ||
-        match_directive_keyword(*g, ETCH_STR_LIT("linkStyle")))
-    {
-        while (!statement_end(*g)) ++g->pos;
-        return true;
-    }
-    static constexpr EtchStr kSoftDirectives[] = {
+EtchStr skip_flowchart_directive(Graph* g) noexcept {
+    static constexpr EtchStr directives[] = {
+        ETCH_STR_LIT("classDef"),
+        ETCH_STR_LIT("linkStyle"),
         ETCH_STR_LIT("class"),
         ETCH_STR_LIT("style"),
         ETCH_STR_LIT("direction"),
         ETCH_STR_LIT("click"),
     };
-    for (const EtchStr kw : kSoftDirectives) {
+    for (const EtchStr kw : directives) {
         if (!match_directive_keyword(*g, kw)) continue;
         const uint32_t saved = g->pos;
         g->pos += kw.length;
@@ -445,13 +441,13 @@ bool skip_flowchart_directive(Graph* g) noexcept {
             const char c = g->source.chars[g->pos];
             if (c == '[' || c == '(' || c == '{' || starts_arrow_hint(*g)) {
                 g->pos = saved;
-                return false;
+                return {};
             }
         }
         while (!statement_end(*g)) ++g->pos;
-        return true;
+        return kw;
     }
-    return false;
+    return {};
 }
 
 EtchVec2 curve_point(const EtchBezierDesc& b, float t) noexcept {
@@ -550,18 +546,20 @@ InlayDiagramResult inlay_diagram_layout_ex(EtchStr source, const InlayDiagramDes
     const uint16_t body_font = resolve_body_font(*input);
     const uint16_t bold_font = resolve_bold_font(*input);
 
-    constexpr uint32_t kNodeCap = 256;
-    constexpr uint32_t kEdgeCap = 1024;
-    constexpr uint32_t kSubgraphCap = 32;
-    auto* nodes = static_cast<InlayDiagramNode*>(etch_frame_arena_alloc(ctx, size_t(kNodeCap) * sizeof(InlayDiagramNode), alignof(InlayDiagramNode)));
-    auto* edges = static_cast<InlayDiagramEdge*>(etch_frame_arena_alloc(ctx, size_t(kEdgeCap) * sizeof(InlayDiagramEdge), alignof(InlayDiagramEdge)));
-    auto* edge_styles = static_cast<uint8_t*>(etch_frame_arena_alloc(ctx, size_t(kEdgeCap), 1));
-    auto* shapes = static_cast<InlayDiagramShape*>(etch_frame_arena_alloc(ctx, size_t(kNodeCap) * sizeof(InlayDiagramShape), alignof(InlayDiagramShape)));
-    auto* node_sub = static_cast<int32_t*>(etch_frame_arena_alloc(ctx, size_t(kNodeCap) * sizeof(int32_t), alignof(int32_t)));
-    auto* subgraphs = static_cast<InlayDiagramSubgraph*>(etch_frame_arena_alloc(ctx, size_t(kSubgraphCap) * sizeof(InlayDiagramSubgraph), alignof(InlayDiagramSubgraph)));
-    if (!nodes || !edges || !edge_styles || !shapes || !node_sub || !subgraphs) return {};
-
-    Graph g = { source, 0, nodes, shapes, node_sub, edges, edge_styles, subgraphs, 0, 0, 0, -1, true, false, false };
+    Graph g = {};
+    g.source = source;
+    g.active_subgraph = -1;
+    g.valid = true;
+    uint32_t warnings = 0u;
+    const auto diagnostic = [&](InlayDiagramDiagnosticKind kind, uint32_t offset, uint32_t length) noexcept {
+        if (input->diagnostic) input->diagnostic(kind, offset, length, input->diagnostic_user_data);
+    };
+    const auto syntax_failure = [&](uint32_t offset) noexcept {
+        diagnostic(INLAY_DIAGRAM_INVALID_SYNTAX, offset, 0u);
+        InlayDiagramResult result = {};
+        result.warning_count = warnings;
+        return result;
+    };
     // Skip leading whitespace, blank lines, and Mermaid %% comment/init lines.
     while (g.pos < source.length) {
         spaces(&g);
@@ -575,8 +573,54 @@ InlayDiagramResult inlay_diagram_layout_ex(EtchStr source, const InlayDiagramDes
     const uint32_t header = g.pos;
     while (g.pos < source.length && word(source.chars[g.pos])) ++g.pos;
     const EtchStr kind = { source.chars + header, g.pos - header, false };
+    const bool sequence = equal(kind, ETCH_STR_LIT("sequenceDiagram"));
 
-    if (equal(kind, ETCH_STR_LIT("sequenceDiagram"))) {
+    if (!sequence) {
+        if (!equal(kind, ETCH_STR_LIT("flowchart")) && !equal(kind, ETCH_STR_LIT("graph"))) {
+            diagnostic(INLAY_DIAGRAM_UNSUPPORTED_KIND, header, kind.length);
+            return {};
+        }
+        spaces(&g);
+        const uint32_t direction = g.pos;
+        while (g.pos < source.length && word(source.chars[g.pos])) ++g.pos;
+        const EtchStr dir = { source.chars + direction, g.pos - direction, false };
+        const bool is_lr = equal(dir, ETCH_STR_LIT("LR"));
+        const bool is_rl = equal(dir, ETCH_STR_LIT("RL"));
+        const bool is_td = equal(dir, ETCH_STR_LIT("TD")) || equal(dir, ETCH_STR_LIT("TB"));
+        const bool is_bt = equal(dir, ETCH_STR_LIT("BT"));
+        if (!is_lr && !is_rl && !is_td && !is_bt) {
+            diagnostic(INLAY_DIAGRAM_INVALID_DIRECTION, direction, dir.length);
+            return {};
+        }
+        g.lr = is_lr || is_rl;
+        g.reverse_dir = is_rl || is_bt;
+    }
+
+    constexpr uint32_t kNodeCap = 256;
+    constexpr uint32_t kEdgeCap = 1024;
+    constexpr uint32_t kSubgraphCap = 32;
+    // Each parsed entry consumes at least one byte. Small diagrams need only
+    // reserve enough space for their remaining input.
+    const uint32_t body = source.length - g.pos;
+    if (!body) return syntax_failure(g.pos);
+    g.node_capacity = body < kNodeCap ? body : kNodeCap;
+    const uint32_t edge_cap = body < kEdgeCap ? body : kEdgeCap;
+    const uint32_t subgraph_cap = body < kSubgraphCap ? body : kSubgraphCap;
+    auto* nodes = static_cast<InlayDiagramNode*>(etch_frame_arena_alloc(ctx, size_t(g.node_capacity) * sizeof(InlayDiagramNode), alignof(InlayDiagramNode)));
+    auto* edges = static_cast<InlayDiagramEdge*>(etch_frame_arena_alloc(ctx, size_t(edge_cap) * sizeof(InlayDiagramEdge), alignof(InlayDiagramEdge)));
+    auto* edge_styles = static_cast<uint8_t*>(etch_frame_arena_alloc(ctx, size_t(edge_cap), 1));
+    auto* shapes = static_cast<InlayDiagramShape*>(etch_frame_arena_alloc(ctx, size_t(g.node_capacity) * sizeof(InlayDiagramShape), alignof(InlayDiagramShape)));
+    auto* node_sub = static_cast<int32_t*>(etch_frame_arena_alloc(ctx, size_t(g.node_capacity) * sizeof(int32_t), alignof(int32_t)));
+    auto* subgraphs = static_cast<InlayDiagramSubgraph*>(etch_frame_arena_alloc(ctx, size_t(subgraph_cap) * sizeof(InlayDiagramSubgraph), alignof(InlayDiagramSubgraph)));
+    if (!nodes || !edges || !edge_styles || !shapes || !node_sub || !subgraphs) return {};
+    g.nodes = nodes;
+    g.shapes = shapes;
+    g.node_subgraph = node_sub;
+    g.edges = edges;
+    g.edge_styles = edge_styles;
+    g.subgraphs = subgraphs;
+
+    if (sequence) {
         while (g.valid && g.pos < source.length) {
             spaces(&g);
             if (g.pos == source.length) break;
@@ -585,6 +629,7 @@ InlayDiagramResult inlay_diagram_layout_ex(EtchStr source, const InlayDiagramDes
             if (g.pos + 12 <= source.length && !std::memcmp(source.chars + g.pos, "participant ", 12)) {
                 g.pos += 12;
                 const uint32_t who = node(&g);
+                if (!g.valid) break;
                 spaces(&g);
                 if (g.pos + 3 <= source.length && !std::memcmp(source.chars + g.pos, "as ", 3)) {
                     g.pos += 3;
@@ -601,14 +646,14 @@ InlayDiagramResult inlay_diagram_layout_ex(EtchStr source, const InlayDiagramDes
             g.pos += dashed ? 4 : 3;
             const uint32_t to = node(&g);
             spaces(&g);
-            if (!g.valid || g.pos == source.length || source.chars[g.pos++] != ':' || g.edge_count == kEdgeCap) { g.valid = false; break; }
+            if (!g.valid || g.pos == source.length || source.chars[g.pos++] != ':' || g.edge_count == edge_cap) { g.valid = false; break; }
             spaces(&g);
             const uint32_t label = g.pos;
             while (g.pos < source.length && source.chars[g.pos] != '\n') ++g.pos;
             edge_styles[g.edge_count] = InlayEdgeStyleNone;
             edges[g.edge_count++] = { from, to, false, dashed, trim_slice(source, label, g.pos) };
         }
-        if (!g.valid || !g.node_count) return {};
+        if (!g.valid || !g.node_count) return syntax_failure(g.pos);
 
         const auto place_sequence = [&](float s) noexcept -> EtchVec2 {
             const float eff_font = std::fmax(7.0f, input->font_size_px * s);
@@ -650,21 +695,8 @@ InlayDiagramResult inlay_diagram_layout_ex(EtchStr source, const InlayDiagramDes
             out_meta->shapes = shapes;
             out_meta->edge_styles = edge_styles;
         }
-        return { nodes, edges, g.node_count, g.edge_count, final_sz.x, final_sz.y, true, false, true, final_scale, nat.x, nat.y };
+        return { nodes, edges, g.node_count, g.edge_count, final_sz.x, final_sz.y, true, false, true, final_scale, nat.x, nat.y, warnings };
     }
-
-    if (!equal(kind, ETCH_STR_LIT("flowchart")) && !equal(kind, ETCH_STR_LIT("graph"))) return {};
-    spaces(&g);
-    const uint32_t direction = g.pos;
-    while (g.pos < source.length && word(source.chars[g.pos])) ++g.pos;
-    const EtchStr dir = { source.chars + direction, g.pos - direction, false };
-    const bool is_lr = equal(dir, ETCH_STR_LIT("LR"));
-    const bool is_rl = equal(dir, ETCH_STR_LIT("RL"));
-    const bool is_td = equal(dir, ETCH_STR_LIT("TD")) || equal(dir, ETCH_STR_LIT("TB"));
-    const bool is_bt = equal(dir, ETCH_STR_LIT("BT"));
-    if (!is_lr && !is_rl && !is_td && !is_bt) return {};
-    g.lr = is_lr || is_rl;
-    g.reverse_dir = is_rl || is_bt;
 
     int32_t sub_stack[kSubgraphCap] = {};
     uint32_t sub_depth = 0;
@@ -673,13 +705,19 @@ InlayDiagramResult inlay_diagram_layout_ex(EtchStr source, const InlayDiagramDes
         if (g.pos == source.length) break;
         if (statement_end(g)) { ++g.pos; continue; }
         if (starts(g, ETCH_STR_LIT("%%"))) { while (g.pos < source.length && source.chars[g.pos] != '\n') ++g.pos; continue; }
-        if (skip_flowchart_directive(&g)) continue;
+        const uint32_t statement = g.pos;
+        const EtchStr directive = skip_flowchart_directive(&g);
+        if (directive.length) {
+            ++warnings;
+            diagnostic(INLAY_DIAGRAM_UNSUPPORTED_DIRECTIVE, statement, directive.length);
+            continue;
+        }
         if (starts(g, ETCH_STR_LIT("subgraph")) && g.pos + 8 < source.length &&
             (source.chars[g.pos + 8] == ' ' || source.chars[g.pos + 8] == '\t'))
         {
             g.pos += 8;
             spaces(&g);
-            if (statement_end(g)) return {};
+            if (statement_end(g)) return syntax_failure(g.pos);
             const uint32_t title_start = g.pos;
             while (!statement_end(g)) ++g.pos;
             EtchStr title = trim_slice(source, title_start, g.pos);
@@ -691,13 +729,10 @@ InlayDiagramResult inlay_diagram_layout_ex(EtchStr source, const InlayDiagramDes
                 }
             }
             title = strip_outer_quotes(title);
-            int32_t idx = -1;
-            if (g.subgraph_count < kSubgraphCap) {
-                idx = int32_t(g.subgraph_count++);
-                subgraphs[idx] = { title, {}, g.active_subgraph, false };
-            }
-            if (sub_depth < kSubgraphCap) sub_stack[sub_depth++] = g.active_subgraph;
-            else return {};
+            if (g.subgraph_count == subgraph_cap) return syntax_failure(statement);
+            const int32_t idx = int32_t(g.subgraph_count++);
+            subgraphs[idx] = { title, {}, g.active_subgraph, false };
+            sub_stack[sub_depth++] = g.active_subgraph;
             g.active_subgraph = idx;
             continue;
         }
@@ -706,7 +741,7 @@ InlayDiagramResult inlay_diagram_layout_ex(EtchStr source, const InlayDiagramDes
             g.pos += 3;
             spaces(&g);
             if (statement_end(g)) {
-                if (!sub_depth) return {};
+                if (!sub_depth) return syntax_failure(start);
                 g.active_subgraph = sub_stack[--sub_depth];
                 continue;
             }
@@ -719,7 +754,7 @@ InlayDiagramResult inlay_diagram_layout_ex(EtchStr source, const InlayDiagramDes
             InlayDiagramEdge edge = {};
             edge.from = from;
             uint8_t estyle = InlayEdgeStyleNone;
-            if (g.edge_count == kEdgeCap || !flow_arrow(&g, &edge, &estyle)) { g.valid = false; break; }
+            if (g.edge_count == edge_cap || !flow_arrow(&g, &edge, &estyle)) { g.valid = false; break; }
             edge.to = node(&g);
             if (!g.valid) break;
             edge_styles[g.edge_count] = estyle;
@@ -727,7 +762,7 @@ InlayDiagramResult inlay_diagram_layout_ex(EtchStr source, const InlayDiagramDes
             from = edge.to;
         }
     }
-    if (!g.valid || !g.node_count || sub_depth) return {};
+    if (!g.valid || !g.node_count || sub_depth) return syntax_failure(g.pos);
 
     // 1. Iterative DFS reverses feedback edges so remaining orientation is acyclic.
     auto* colors = static_cast<uint8_t*>(etch_frame_arena_alloc(ctx, g.node_count, 1));
@@ -1069,7 +1104,7 @@ InlayDiagramResult inlay_diagram_layout_ex(EtchStr source, const InlayDiagramDes
         out_meta->waypoint_count = wp_used;
         out_meta->reversed_dir = g.reverse_dir;
     }
-    return { nodes, edges, g.node_count, g.edge_count, final_sz.x, final_sz.y, true, g.lr, false, final_scale, nat.x, nat.y };
+    return { nodes, edges, g.node_count, g.edge_count, final_sz.x, final_sz.y, true, g.lr, false, final_scale, nat.x, nat.y, warnings };
 }
 
 void inlay_diagram_draw_ex(const InlayDiagramResult& result, const InlayDiagramDesc& input, const InlayDiagramMeta* meta) noexcept {
@@ -1159,7 +1194,7 @@ void inlay_diagram_draw_ex(const InlayDiagramResult& result, const InlayDiagramD
         const auto a = result.nodes[edge.from].bounds, b = result.nodes[edge.to].bounds;
         const EtchColor col = edge.reversed ? theme.accent_secondary : theme.accent;
         const InlayDiagramEdgePath path = (meta && meta->edge_paths) ? meta->edge_paths[i] : InlayDiagramEdgePath{ 0, 0, edge.reversed ? 0 : -1 };
-        const uint8_t estyle = (meta && meta->edge_styles) ? meta->edge_styles[i] : InlayEdgeStyleNone;
+        const uint8_t estyle = (meta && meta->edge_styles) ? meta->edge_styles[i] : uint8_t(InlayEdgeStyleNone);
         const bool no_arrow = (estyle & InlayEdgeStyleNoArrow) != 0;
         const bool bidir = (estyle & InlayEdgeStyleBidir) != 0;
         const float thickness = (estyle & InlayEdgeStyleThick) ? stroke_thick : stroke_normal;

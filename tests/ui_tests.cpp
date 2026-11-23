@@ -883,6 +883,118 @@ function onEvent(name, payload, s) {
     return ok;
 }
 
+bool async_action_lifecycle(EtchContext* ctx, const InlaySurfaceDesc& desc, const char* hmr_path) {
+    auto* surface = inlay_surface_create(ctx, &desc);
+    if (!surface) return false;
+    constexpr EtchStr name = ETCH_STR_LIT("fetch");
+    constexpr EtchStr start = ETCH_STR_LIT("start");
+    constexpr EtchStr null_json = ETCH_STR_LIT("null");
+    constexpr EtchStr script = ETCH_STR_LIT(
+        "let pending;"
+        "function render(s){return h('text',{text:s.value||s.error||'Waiting'});}"
+        "function start(v){pending=request('fetch',v);"
+        "pending.then(v=>state.value=v,e=>state.error=e.name||e);}"
+        "function onEvent(n,v){if(n==='start')start(v);"
+        "if(n==='nested')start({toJSON(){start({nested:1});return {outer:2};}});"
+        "if(n==='cancel')pending.cancel();"
+        "if(n==='deny'){try{request('different',null);}catch(e){state.error=e.name;}}}");
+    bool ok = check(inlay_surface_allow_async_action(surface, name) &&
+                    inlay_surface_set_script(surface, script), "allow explicit async action");
+    ok &= check(inlay_surface_dispatch(surface, ETCH_STR_LIT("deny"), null_json) &&
+                inlay_surface_poll_async_action(surface).kind == INLAY_ASYNC_ACTION_NONE,
+                "unregistered async action stays in script");
+    ok &= check(inlay_surface_dispatch(surface, start, ETCH_STR_LIT("{\"x\":1}")), "async start event");
+    const auto started = inlay_surface_poll_async_action(surface);
+    ok &= check(started.struct_size == sizeof(InlayAsyncActionEvent) &&
+                started.kind == INLAY_ASYNC_ACTION_START && started.request_id != 0u &&
+                str_eq(started.name, "fetch") && str_eq(started.payload_json, "{\"x\":1}"),
+                "host receives owned request before completing");
+    ok &= check(!inlay_surface_complete_async_action(surface, started.request_id, true, ETCH_STR_LIT("{")) &&
+                inlay_surface_complete_async_action(surface, started.request_id, true, ETCH_STR_LIT("\"Ready\"")) &&
+                !inlay_surface_complete_async_action(surface, started.request_id, true, null_json),
+                "bad JSON preserves request; valid completion settles once");
+    uint32_t node_count = 0u;
+    const auto* nodes = inlay_surface_nodes(surface, &node_count);
+    ok &= check(node_count == 1u && str_eq(nodes[0].text, "Ready"), "completion updates UI");
+
+    constexpr EtchStr cancel = ETCH_STR_LIT("cancel");
+    ok &= check(inlay_surface_dispatch(surface, start, null_json) &&
+                inlay_surface_dispatch(surface, cancel, null_json) &&
+                inlay_surface_poll_async_action(surface).kind == INLAY_ASYNC_ACTION_NONE,
+                "cancellation before poll discards request");
+    ok &= check(inlay_surface_dispatch(surface, start, null_json), "start cancellable request");
+    const auto running = inlay_surface_poll_async_action(surface);
+    ok &= check(running.kind == INLAY_ASYNC_ACTION_START &&
+                inlay_surface_dispatch(surface, cancel, null_json), "script cancels started request");
+    const auto cancelled = inlay_surface_poll_async_action(surface);
+    ok &= check(cancelled.kind == INLAY_ASYNC_ACTION_CANCEL && cancelled.request_id == running.request_id &&
+                !inlay_surface_complete_async_action(surface, running.request_id, true, null_json) &&
+                inlay_surface_poll_async_action(surface).kind == INLAY_ASYNC_ACTION_NONE,
+                "host sees exactly one cancellation; stale completion rejected");
+    const EtchStr state = inlay_surface_state_json(surface);
+    ok &= check(state.chars && std::strstr(state.chars, "AbortError") != nullptr,
+                "cancel rejects promise with AbortError");
+
+    ok &= check(inlay_surface_dispatch(surface, ETCH_STR_LIT("nested"), null_json), "nested request in toJSON");
+    const auto nested = inlay_surface_poll_async_action(surface);
+    ok &= check(nested.kind == INLAY_ASYNC_ACTION_START && str_eq(nested.payload_json, "{\"nested\":1}"),
+                "nested request payload preserved");
+    const auto outer = inlay_surface_poll_async_action(surface);
+    ok &= check(outer.kind == INLAY_ASYNC_ACTION_START && outer.request_id > nested.request_id &&
+                str_eq(outer.payload_json, "{\"outer\":2}"), "outer request gets a distinct ID and payload");
+    ok &= check(inlay_surface_complete_async_action(surface, nested.request_id, false, ETCH_STR_LIT("\"Host error\"")),
+                "host error rejects promise");
+    ok &= check(inlay_surface_set_script(surface, script), "replacing script with requests in flight");
+    const auto replaced = inlay_surface_poll_async_action(surface);
+    ok &= check(replaced.kind == INLAY_ASYNC_ACTION_CANCEL && replaced.request_id == outer.request_id,
+                "script replacement cancels work on the host");
+
+    if (hmr_path) {
+        ok &= check(write_file(hmr_path, script.chars) && inlay_surface_enable_hmr(surface, hmr_path) &&
+                    inlay_surface_dispatch(surface, start, null_json), "create request under HMR");
+        const auto before_bad_hmr = inlay_surface_poll_async_action(surface);
+        ok &= check(before_bad_hmr.kind == INLAY_ASYNC_ACTION_START &&
+                    write_file(hmr_path, "function render( {") && !inlay_surface_poll_hmr(surface) &&
+                    inlay_surface_stats(surface).has_error && inlay_surface_error(surface).length > 0u,
+                    "invalid JavaScript in HMR produces a reload error");
+        ok &= check(!inlay_surface_poll_hmr(surface) &&
+                    inlay_surface_complete_async_action(surface, before_bad_hmr.request_id, true,
+                                                       ETCH_STR_LIT("\"Still working\"")),
+                    "unchanged invalid file leaves old requests and handlers active");
+        nodes = inlay_surface_nodes(surface, &node_count);
+        ok &= check(node_count == 1u && str_eq(nodes[0].text, "Still working"),
+                    "last good view still updates under reload error");
+        ok &= check(inlay_surface_dispatch(surface, start, null_json), "start again while reload error is visible");
+        const auto before_hmr = inlay_surface_poll_async_action(surface);
+        ok &= check(before_hmr.kind == INLAY_ASYNC_ACTION_START &&
+                    write_file(hmr_path, "function render(){return h('text',{text:'Reloaded'});}") &&
+                    inlay_surface_poll_hmr(surface) && !inlay_surface_stats(surface).has_error,
+                    "hot reload with work running clears the diagnostic");
+        const auto after_hmr = inlay_surface_poll_async_action(surface);
+        ok &= check(after_hmr.kind == INLAY_ASYNC_ACTION_CANCEL && after_hmr.request_id == before_hmr.request_id,
+                    "hot reload cancels work from old script");
+        ok &= check(inlay_surface_set_script(surface, script), "restore async lifecycle fixture");
+    }
+
+    ok &= check(inlay_surface_dispatch(surface, start, null_json), "start before failed replacement");
+    const auto before_failure = inlay_surface_poll_async_action(surface);
+    ok &= check(before_failure.kind == INLAY_ASYNC_ACTION_START &&
+                !inlay_surface_set_script(surface, ETCH_STR_LIT("function render(){return <Text></Box>;}")),
+                "direct invalid script replacement reports error");
+    const auto after_failure = inlay_surface_poll_async_action(surface);
+    ok &= check(after_failure.kind == INLAY_ASYNC_ACTION_CANCEL && after_failure.request_id == before_failure.request_id &&
+                inlay_surface_set_script(surface, script), "failed replacement retires work and valid script recovers");
+
+    ok &= check(inlay_surface_dispatch(surface, start, null_json), "start before closing");
+    const auto before_close = inlay_surface_poll_async_action(surface);
+    inlay_surface_close_async_actions(surface);
+    const auto after_close = inlay_surface_poll_async_action(surface);
+    ok &= check(after_close.kind == INLAY_ASYNC_ACTION_CANCEL && after_close.request_id == before_close.request_id &&
+                !inlay_surface_allow_async_action(surface, name), "close cancels work and prevents new requests");
+    inlay_surface_destroy(surface);
+    return ok;
+}
+
 uint32_t find_rect_fill_rgba(EtchContext *ctx, EtchRect bounds) {
     for (uint32_t i = 0; i < etch_frame_prim_count(ctx); ++i) {
         EtchPrim prim = {};
@@ -1779,6 +1891,113 @@ function render(s) {
     ok &= check(inlay_surface_stats(s).js_ticks == vwin_ticks,
                 "ui.virtualList renderItem mode runs 0 idle JS ticks");
 
+    ok &= check(inlay_surface_set_script(s, ETCH_STR_LIT(
+        "function render(){return h('virtualList',{count:1000,itemHeight:8,width:320,height:2560,"
+        "renderItem:i=>h('text',{text:'Row '+i})});}")),
+        "dense virtual list loads");
+    const auto old_height = frame.viewport_h;
+    frame.viewport_h = 2600;
+    for (int i = 0; i < 5; ++i) step();
+    nodes = inlay_surface_nodes(s, &cnt);
+    uint32_t rows = 0u;
+    for (uint32_t i = 0u; i < cnt; ++i) if (nodes[i].kind == INLAY_UI_TEXT) ++rows;
+    ok &= check(rows >= 320u && !inlay_surface_stats(s).has_error, "dense list covers its visible area");
+    frame.viewport_h = old_height;
+
+    ok &= check(inlay_surface_set_script(s, ETCH_STR_LIT(
+        "function render(){return h('input',{id:'private',type:'password',value:'example-secret'});}")),
+        "password input loads");
+    step();
+    nodes = inlay_surface_nodes(s, &cnt);
+    const uint32_t private_id = find_surface_eid(nodes, cnt, view.id, "private");
+    EtchA11yNode password_node = {};
+    constexpr EtchStr private_value = ETCH_STR_LIT("example-secret");
+    ok &= check(etch_find_a11y_node(private_id, &password_node, ctx, nullptr) &&
+                (password_node.state_flags & ETCH_A11Y_STATE_PASSWORD) != 0u &&
+                (password_node.value_text.length != private_value.length ||
+                 std::memcmp(password_node.value_text.chars, private_value.chars, private_value.length) != 0),
+                "password value is masked in accessibility");
+    for (uint32_t i = 0u; i < cnt; ++i) {
+        if (nodes[i].kind == INLAY_UI_INPUT) {
+            ok &= check(nodes[i].text.length == 0u, "password excluded from public node text");
+        }
+    }
+
+    if (InlayDoc* document = inlay_doc_create(ctx, nullptr)) {
+        constexpr EtchStr binding = ETCH_STR_LIT("host");
+        ok &= check(inlay_doc_append_utf8(document, ETCH_STR_LIT("First paragraph.\n\n")) &&
+                    inlay_surface_bind_document(s, binding, document) &&
+                    inlay_surface_set_script(s, ETCH_STR_LIT(
+                        "function render(){return h('doc',{id:'bound',document:'host',width:320,height:180});}")),
+                    "host document bound");
+        step();
+        nodes = inlay_surface_nodes(s, &cnt);
+        const uint32_t view_id = etch_id_index(find_surface_eid(nodes, cnt, view.id, "bound"), 0xD0C0u);
+        const uint32_t before = inlay_doc_view_selection(document, view_id).total_bytes;
+        const uint64_t ticks = inlay_surface_stats(s).js_ticks;
+        ok &= check(inlay_doc_append_utf8(document, ETCH_STR_LIT("Second paragraph.")), "append to bound doc");
+        step();
+        ok &= check(before > 0u && inlay_doc_view_selection(document, view_id).total_bytes > before &&
+                    inlay_surface_stats(s).js_ticks == ticks, "bound doc updates without running JS");
+        ok &= check(inlay_surface_bind_document(s, binding, nullptr), "host document unbound");
+        inlay_doc_destroy(document);
+        step();
+    } else {
+        ok &= check(false, "create host document");
+    }
+
+    EtchTextBuffer* buffer = etch_create_text_buffer(ETCH_STR_LIT("abc"), 0u);
+    constexpr EtchStr source_name = ETCH_STR_LIT("source");
+    ok &= check(buffer && inlay_surface_bind_text_buffer(s, source_name, buffer) &&
+                inlay_surface_set_script(s, ETCH_STR_LIT(
+                    "function render(s){return <CodeEditor id='edit' buffer='source' width={320} height={160} "
+                    "wordWrap onChange={e=>{s.edited=e.byteLength}}/>;}")), "bind JSX editor buffer");
+    step();
+    nodes = inlay_surface_nodes(s, &cnt);
+    const uint32_t editor_id = find_surface_eid(nodes, cnt, view.id, "edit");
+    ok &= check(has_node_kind(nodes, cnt, INLAY_UI_CODE_EDITOR) &&
+                etch_perform_a11y_action(editor_id, ETCH_A11Y_ACT_FOCUS, 0, {}, ctx, nullptr), "focus bound editor");
+    step();
+    SDL_Event input = {};
+    input.type = SDL_EVENT_TEXT_INPUT;
+    input.text.text = "字";
+    etch_process_event(ctx, &input);
+    step();
+    const EtchStr state = inlay_surface_state_json(s);
+    ok &= check(buffer && etch_text_buffer_byte_length(buffer) == 6u && state.chars &&
+                std::strstr(state.chars, "\"edited\":6"), "editor commits to native buffer and sends byte count");
+    const uint64_t edit_ticks = inlay_surface_stats(s).js_ticks;
+    step();
+    ok &= check(inlay_surface_stats(s).js_ticks == edit_ticks, "idle editor has zero script ticks");
+    ok &= check(inlay_surface_set_script(s, ETCH_STR_LIT(
+        "function render(){return ui.codeEditor({id:'edit',buffer:'source',readOnly:true});}")), "read-only editor");
+    step();
+    EtchA11yNode editor_node = {};
+    ok &= check(etch_find_a11y_node(editor_id, &editor_node, ctx, nullptr) &&
+                (editor_node.state_flags & ETCH_A11Y_STATE_READ_ONLY), "read-only editor semantics");
+    etch_process_event(ctx, &input);
+    step();
+    ok &= check(buffer && etch_text_buffer_byte_length(buffer) == 6u, "read-only editor preserves buffer");
+    ok &= check(inlay_surface_bind_text_buffer(s, source_name, nullptr), "unbind native editor buffer");
+    step();
+    ok &= check(!etch_find_a11y_node(editor_id, &editor_node, ctx, nullptr), "unmounted editor releases reference");
+    etch_destroy_text_buffer(buffer);
+    ok &= check(inlay_surface_set_script(s, ETCH_STR_LIT(
+        "function render(){return ui.col({},...Array.from({length:20},(_,i)=>"
+        "ui.doc({key:'file'+i,markdown:'File '+i,height:24})));}")), "twenty native documents");
+    step();
+    const auto warmed = inlay_surface_stats(s);
+    step();
+    const auto original_view = view.id;
+    view.id = etch_id("second-document-pane");
+    step();
+    view.id = original_view;
+    const auto second_pane = inlay_surface_stats(s);
+    ok &= check(warmed.cached_documents == 20u && second_pane.document_cache_misses == warmed.document_cache_misses &&
+                second_pane.js_ticks == warmed.js_ticks, "warm documents reused across idle draws and separate views");
+    ok &= check(inlay_surface_set_script(s, ETCH_STR_LIT("function render(){return ui.text('closed');}")), "close document panes");
+    step();
+    ok &= check(inlay_surface_stats(s).cached_documents <= 16u, "surplus inactive document caches released");
     inlay_surface_destroy(s);
     return ok;
 }
@@ -2169,9 +2388,9 @@ function onEvent(n, v, s) {
     inlay_surface_destroy(s);
     return ok;
 }
-bool test_scoped_hooks_cls_cache_and_dark(EtchContext *ctx) {
+bool test_scoped_hooks_cls_cache_and_dark(EtchContext *ctx, const InlaySurfaceDesc& functional_desc) {
     bool ok = true;
-    auto *s = inlay_surface_create(ctx, nullptr);
+    auto *s = inlay_surface_create(ctx, &functional_desc);
     if (!check(s != nullptr, "scoped hooks surface created")) return false;
     auto view = inlay_surface_view_desc_default();
     view.id = etch_id("scoped_hooks_cls_view");
@@ -2300,6 +2519,92 @@ bool test_scoped_hooks_cls_cache_and_dark(EtchContext *ctx) {
     ok &= check(str_is(find_text("M="), "M=5,E=5,C=3,S=7"),
                 "useEffect cleanup ran before re-run on dep change");
 
+    ok &= check(inlay_surface_set_script(s, ETCH_STR_LIT(R"JS(
+        let broken=false, attempts=0, effects=0, cleanups=0, clicks=0, reset=0, retry;
+        function Panel(){
+            ++attempts;
+            useEffect(()=>{ ++effects; return ()=>{ ++cleanups; }; },[broken]);
+            if (broken) throw Error('chart offline');
+            return ui.text('healthy');
+        }
+        function render(){
+            return <Col>
+                <ErrorBoundary key="chart" resetKey={reset} render={()=>h(Panel,{})}
+                    fallback={(e,r)=>{ retry=r; return ui.text(e.message); }} />
+                <Text>{'sibling '+clicks+' '+attempts+' '+effects+' '+cleanups}</Text>
+            </Col>;
+        }
+        function onEvent(name){
+            if(name==='break') broken=true;
+            if(name==='click') ++clicks;
+            if(name==='retry'){ broken=false; retry(); }
+            if(name==='reset'){ broken=false; ++reset; }
+        }
+    )JS")), "mount scoped error boundary");
+    ok &= check(str_is(find_text("healthy"), "healthy") &&
+                inlay_surface_dispatch(s, ETCH_STR_LIT("break"), ETCH_STR_LIT("null")) &&
+                str_is(find_text("chart offline"), "chart offline") && !inlay_surface_stats(s).has_error,
+                "failed panel displays its fallback");
+    ok &= check(inlay_surface_dispatch(s, ETCH_STR_LIT("click"), ETCH_STR_LIT("null")) &&
+                str_is(find_text("sibling"), "sibling 1 2 1 1"), "sibling updates, failed effects discarded");
+    ok &= check(inlay_surface_dispatch(s, ETCH_STR_LIT("retry"), ETCH_STR_LIT("null")) &&
+                str_is(find_text("healthy"), "healthy") &&
+                inlay_surface_dispatch(s, ETCH_STR_LIT("break"), ETCH_STR_LIT("null")) &&
+                inlay_surface_dispatch(s, ETCH_STR_LIT("reset"), ETCH_STR_LIT("null")) &&
+                str_is(find_text("sibling"), "sibling 1 5 2 2"), "retry and resetKey remount only failed panel");
+    ok &= check(inlay_surface_set_script(s, ETCH_STR_LIT(R"JS(
+        function render(){return ui.errorBoundary({render:()=>ui.errorBoundary({
+            render:()=>{throw 0;},fallback:()=>{throw Error('fallback failed');}
+        })});}
+    )JS")) && str_is(find_text("Error:"), "Error: fallback failed"),
+                "nested boundary contains failing fallback");
+
+    ok &= check(inlay_surface_set_script(s, ETCH_STR_LIT(R"JS(
+        let outer=0, inner=0, plain=0, removed=0, active=0, reverse=false, hide=false, update;
+        function Label(p){
+            ++plain;
+            useEffect(()=>()=>{++removed;},[]);
+            return ui.text('static '+p.i);
+        }
+        const CardPanel=memo(Label);
+        const Counter=memo(function Counter(){
+            ++inner;
+            const [n,set]=useState(0);
+            update=set;
+            return ui.text('inner '+n);
+        });
+        const Group=memo(function Group(){ ++outer; return h(Counter,{}); });
+        function render(){
+            const cards=[];
+            for(let j=0;j<50;++j) {
+                const i=reverse?49-j:j;
+                if(!hide || i!==0) cards.push(h(CardPanel,{key:i,i}));
+            }
+            return ui.col({},cards,h(Group,{}),ui.text('active '+active),
+                ui.text('calls '+outer+' '+inner+' '+plain+' '+removed));
+        }
+        function onEvent(k){
+            if(k==='active') ++active;
+            if(k==='reverse') reverse=!reverse;
+            if(k==='update') update(n=>n+1);
+            if(k==='hide') hide=true;
+        }
+    )JS")), "mount nested memo components and 50 panels");
+    if (const auto error = inlay_surface_error(s); error.length)
+        std::fprintf(stderr, "memo mount: %.*s\n", int(error.length), error.chars);
+    ok &= check(inlay_surface_dispatch(s, ETCH_STR_LIT("active"), ETCH_STR_LIT("null")) &&
+                str_is(find_text("active"), "active 1") &&
+                str_is(find_text("calls"), "calls 1 1 50 0"), "unchanged panels skip component execution");
+    ok &= check(inlay_surface_dispatch(s, ETCH_STR_LIT("update"), ETCH_STR_LIT("null")) &&
+                str_is(find_text("inner"), "inner 1") && str_is(find_text("calls"), "calls 2 2 50 0"),
+                "nested state invalidates memo ancestors");
+    ok &= check(inlay_surface_dispatch(s, ETCH_STR_LIT("reverse"), ETCH_STR_LIT("null")) &&
+                str_is(find_text("static"), "static 49") && str_is(find_text("calls"), "calls 2 2 50 0"),
+                "keyed reorder keeps cached trees and effects");
+    ok &= check(inlay_surface_dispatch(s, ETCH_STR_LIT("hide"), ETCH_STR_LIT("null")) &&
+                inlay_surface_dispatch(s, ETCH_STR_LIT("active"), ETCH_STR_LIT("null")) &&
+                str_is(find_text("calls"), "calls 2 2 50 1"), "memo subtree cleanup occurs once");
+
     // 2. Live `dark:` Tailwind prefix with 0 JS ticks across Light <-> Dark theme switches
     ok &= check(inlay_surface_set_state_json(s, ETCH_STR_LIT("{\"n\":0}")), "dark cls state");
     ok &= check(inlay_surface_set_script(s, ETCH_STR_LIT(
@@ -2383,6 +2688,7 @@ int main(int argc, char **argv) {
         return 1;
     }
     bool ok = reactive_controls(context, functional_desc);
+    ok &= async_action_lifecycle(context, functional_desc, argc > 1 ? argv[1] : nullptr);
     ok &= styled_surface_controls(context, functional_desc);
     ok &= expanded_surface_primitives(context, functional_desc);
     ok &= i2_reactive_reconciler_upgrades(context, functional_desc);
@@ -2667,7 +2973,7 @@ int main(int argc, char **argv) {
         ok &= check(!etch_needs_redraw(context), "persistent HMR error settles idle");
         inlay_surface_destroy(missing);
     }
-    ok &= test_scoped_hooks_cls_cache_and_dark(context);
+    ok &= test_scoped_hooks_cls_cache_and_dark(context, functional_desc);
     inlay_surface_destroy(surface);
     etch_destroy_context(context);
     std::puts(ok ? "Sandbox reactive/HMR PASS" : "Sandbox reactive/HMR FAIL");

@@ -27,7 +27,7 @@ function(inlay_cpp target)
   target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic -Werror -fno-exceptions -fno-rtti)
  endif()
 endfunction()
-add_library(inlay STATIC src/inlay_c.cpp src/inlay_doc.cpp src/inlay_view.cpp src/inlay_math.cpp src/inlay_diagram.cpp)
+add_library(inlay STATIC src/inlay_c.cpp src/inlay_doc.cpp src/inlay_view.cpp src/inlay_math.cpp src/inlay_diagram.cpp src/inlay_inbox.cpp)
 add_library(Inlay::inlay ALIAS inlay)
 inlay_cpp(inlay)
 target_compile_definitions(inlay PRIVATE INLAY_BUILD)
@@ -51,7 +51,7 @@ set(_inlay_ui_header_deps
  "${CMAKE_CURRENT_SOURCE_DIR}/src/inlay_ui_internal.h")
 set_source_files_properties(
  src/inlay_c.cpp src/inlay_doc.cpp src/inlay_view.cpp src/inlay_math.cpp
- src/inlay_diagram.cpp src/inlay_portal.cpp src/inlay_portal_webview2.cpp
+ src/inlay_diagram.cpp src/inlay_inbox.cpp src/inlay_portal.cpp src/inlay_portal_webview2.cpp
  PROPERTIES OBJECT_DEPENDS "${_inlay_header_deps}")
 set_source_files_properties(
  src/inlay_ui.cpp
@@ -90,7 +90,7 @@ if(INLAY_ENABLE_SCRIPT)
   target_compile_definitions(inlay_quickjs PRIVATE WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0601)
   target_compile_options(inlay_quickjs PRIVATE /W4 /WX /utf-8 /experimental:c11atomics /wd4018 /wd4061 /wd4098 /wd4100 /wd4127 /wd4132 /wd4146 /wd4200 /wd4242 /wd4244 /wd4245 /wd4267 /wd4334 /wd4388 /wd4389 /wd4456 /wd4457 /wd4701 /wd4702 /wd4703 /wd4710 /wd4711 /wd4820 /wd4996 /wd5045)
  else()
-  target_compile_options(inlay_quickjs PRIVATE -Wall -Wextra -Werror -Wno-unused-parameter -Wno-sign-compare -Wno-missing-field-initializers -Wno-implicit-fallthrough)
+  target_compile_options(inlay_quickjs PRIVATE -Wall -Wextra -Werror -Wno-unused-parameter -Wno-unused-but-set-variable -Wno-sign-compare -Wno-missing-field-initializers -Wno-implicit-fallthrough)
   target_link_libraries(inlay PRIVATE m)
  endif()
  target_sources(inlay PRIVATE $<TARGET_OBJECTS:inlay_quickjs>)

@@ -359,6 +359,9 @@ struct ColdVisualStyle {
 // ============================================================================
 
 struct DocWidgetSpec {
+    uint64_t content_hash;
+    uint32_t path_id, cache_index;
+    TextSlice document_name;
     bool show_line_numbers;
     bool hide_copy_button;
     bool stick_to_bottom;
@@ -614,6 +617,12 @@ struct SlotBinding {
     void* user;
 };
 
+struct ContentBinding {
+    char name[64];
+    InlayUiKind kind;
+    void* resource;
+};
+
 struct TimerEntry {
     JSValue function;
     double due;
@@ -707,6 +716,10 @@ struct InlaySurface {
     uint32_t action_count;
     SlotBinding slots[32];
     uint32_t slot_count;
+    ContentBinding* content;
+    uint32_t content_count, content_cap;
+    InlayImageResolverFn image_resolver_fn;
+    void* image_resolver_user_data;
     JSValue* handlers;
     uint32_t handler_count, handler_capacity;
     TimerEntry timers[32];
@@ -715,6 +728,7 @@ struct InlaySurface {
     uint64_t file_size, deadline, frame_counter;
     double frequency;
     bool running, drawing, draw_parent_col, timed_out, pending_state, state_dirty, loaded, hmr_file_error;
+    bool hide_tree_guide;
     JSValue rejections[32];
     uint32_t rejection_count;
     InlaySurfaceStats stats;
@@ -731,6 +745,13 @@ inline bool inlay_ui_str_eq(const char* chars, size_t len, const char* lit) noex
 
 inline bool inlay_ui_equal(EtchStr value, const char* lit) noexcept {
     return inlay_ui_str_eq(value.chars, value.length, lit);
+}
+
+inline uint32_t inlay_ui_content_index(const InlaySurface* s, InlayUiKind kind, EtchStr name) noexcept {
+    for (uint32_t i = 0; i < s->content_count; ++i) {
+        if (s->content[i].kind == kind && inlay_ui_equal(name, s->content[i].name)) return i;
+    }
+    return s->content_count;
 }
 
 inline EtchStr inlay_ui_slice(const InlaySurface* s, TextSlice sl) noexcept {
@@ -869,5 +890,6 @@ void inlay_ui_draw_ext_widget(InlaySurface* s, uint32_t index, uint32_t id, uint
                               const EtchTheme& theme, bool use_layer, WidgetEvents* events);
 void inlay_ui_reset_widget_specs(InlaySurface* s) noexcept;
 void inlay_ui_free_widget_caches(InlaySurface* s) noexcept;
+void inlay_ui_trim_document_cache(InlaySurface* s) noexcept;
 
 #endif // INLAY_ENABLE_SCRIPT

@@ -29,6 +29,8 @@ struct Parser {
     EtchStr source;
     uint32_t pos;
     bool valid;
+    uint32_t error_offset;
+    InlayMathError error;
     uint32_t depth;
     float base_size;
 };
@@ -168,6 +170,7 @@ Box* atom(Parser*, StyleState) noexcept;
 char parse_delimiter(Parser* p) noexcept {
     spaces(p);
     if (p->pos >= p->source.length) { p->valid = false; return 0; }
+    const uint32_t delimiter = p->pos;
     const char c = p->source.chars[p->pos];
     if (c == '(' || c == ')' || c == '[' || c == ']' || c == '.' || c == '|') {
         ++p->pos;
@@ -200,6 +203,8 @@ char parse_delimiter(Parser* p) noexcept {
         if (n == 6 && !std::memcmp(p->source.chars + start, "lbrace", 6)) return '{';
         if (n == 6 && !std::memcmp(p->source.chars + start, "rbrace", 6)) return '}';
     }
+    p->error_offset = delimiter;
+    p->error = c == '\\' ? INLAY_MATH_ERROR_UNSUPPORTED_COMMAND : INLAY_MATH_ERROR_INVALID_SYNTAX;
     p->valid = false;
     return 0;
 }
@@ -212,8 +217,9 @@ Box* make_fraction_box(Parser* p, StyleState st, bool no_rule) noexcept {
     const StyleState num_st = frac_num_style(st);
     const StyleState den_st = frac_den_style(st);
     box->a = atom(p, num_st);
+    if (!box->a) return nullptr;
     box->b = atom(p, den_st);
-    if (!box->a || !box->b) return nullptr;
+    if (!box->b) return nullptr;
     const float axis = math_axis(size);
     const float rule_t = no_rule ? 0.0f : rule_thickness(size);
     const float rule_gap = (st.style == StyleDisplay) ? std::fmax(2.6f, size * 0.16f) : std::fmax(2.0f, size * 0.12f);
@@ -238,7 +244,7 @@ Box* atom_impl(Parser* p, StyleState st) noexcept {
     const float size = style_font_size(p, st);
 
     if (c == '{') return expression(p, st, true);
-    if (c == '}') { p->valid = false; return nullptr; }
+    if (c == '}') { p->pos = start; p->valid = false; return nullptr; }
     if (c != '\\') {
         while (p->pos < source.length && (uint8_t(source.chars[p->pos]) & 0xc0) == 0x80) ++p->pos;
         const EtchStr tok = { source.chars + start, p->pos - start, false };
@@ -293,7 +299,8 @@ Box* atom_impl(Parser* p, StyleState st) noexcept {
             : is("mathtt") ? ETCH_FONT_MONO
             : ETCH_FONT_SANS);
         spaces(p);
-        if (p->pos == source.length || source.chars[p->pos++] != '{') { p->valid = false; return nullptr; }
+        if (p->pos == source.length || source.chars[p->pos] != '{') { p->valid = false; return nullptr; }
+        ++p->pos;
         const uint32_t text = p->pos;
         while (p->pos < source.length && source.chars[p->pos] != '}') ++p->pos;
         if (p->pos == source.length) { p->valid = false; return nullptr; }
@@ -312,7 +319,8 @@ Box* atom_impl(Parser* p, StyleState st) noexcept {
     }
     if (is("begin")) {
         spaces(p);
-        if (p->pos == source.length || source.chars[p->pos++] != '{') { p->valid = false; return nullptr; }
+        if (p->pos == source.length || source.chars[p->pos] != '{') { p->valid = false; return nullptr; }
+        ++p->pos;
         const uint32_t env = p->pos;
         while (p->pos < source.length && source.chars[p->pos] != '}') ++p->pos;
         const uint32_t env_len = p->pos - env;
@@ -457,9 +465,14 @@ Box* atom_impl(Parser* p, StyleState st) noexcept {
             if (p->pos >= source.length || source.chars[p->pos] != ']') { p->valid = false; return nullptr; }
             const EtchStr idx_src = { source.chars + idx_start, p->pos - idx_start, false };
             ++p->pos;
-            Parser sub_p = { idx_src, 0, true, p->depth, p->base_size };
+            Parser sub_p = { idx_src, 0, true, 0u, INLAY_MATH_ERROR_NONE, p->depth, p->base_size };
             box->b = expression(&sub_p, { StyleScriptScript, true }, false);
-            if (!box->b || !sub_p.valid) { p->valid = false; return nullptr; }
+            if (!box->b || !sub_p.valid) {
+                p->error_offset = idx_start + (sub_p.error == INLAY_MATH_ERROR_NONE ? sub_p.pos : sub_p.error_offset);
+                p->error = sub_p.error == INLAY_MATH_ERROR_NONE ? INLAY_MATH_ERROR_INVALID_SYNTAX : sub_p.error;
+                p->valid = false;
+                return nullptr;
+            }
         }
         StyleState rad_st = st;
         rad_st.cramped = true;
@@ -538,7 +551,7 @@ Box* atom_impl(Parser* p, StyleState st) noexcept {
         box->descent = content->descent;
         return box;
     }
-    if (is("right")) { p->valid = false; return nullptr; }
+    if (is("right")) { p->pos = start; p->valid = false; return nullptr; }
 
     struct Symbol { const char* name; EtchStr text; MathClass cls; uint8_t flags; };
     // flags: bit0 = supports display above/below limits; bit1 = italic Greek variable; bit2 = tall large operator (1.35x in Display)
@@ -597,12 +610,14 @@ Box* atom_impl(Parser* p, StyleState st) noexcept {
             return g;
         }
     }
+    p->error_offset = start;
+    p->error = INLAY_MATH_ERROR_UNSUPPORTED_COMMAND;
     p->valid = false;
     return nullptr;
 }
 
 Box* atom(Parser* p, StyleState st) noexcept {
-    if (++p->depth > 64) { p->valid = false; --p->depth; return nullptr; }
+    if (++p->depth > 64) { p->error_offset = p->pos; p->error = INLAY_MATH_ERROR_DEPTH_LIMIT; p->valid = false; --p->depth; return nullptr; }
     auto* box = atom_impl(p, st);
     --p->depth;
     return box;
@@ -621,7 +636,7 @@ bool match_word_cmd(Parser* p, const char* word) noexcept {
 }
 
 Box* expression(Parser* p, StyleState st, bool grouped, bool cell, bool delimited) noexcept {
-    if (++p->depth > 64) { p->valid = false; --p->depth; return nullptr; }
+    if (++p->depth > 64) { p->error_offset = p->pos; p->error = INLAY_MATH_ERROR_DEPTH_LIMIT; p->valid = false; --p->depth; return nullptr; }
     auto* row = make(p, Row, style_font_size(p, st), ClOrd);
     if (!row) { --p->depth; return nullptr; }
 
@@ -671,12 +686,13 @@ Box* expression(Parser* p, StyleState st, bool grouped, bool cell, bool delimite
             if (p->pos == p->source.length) break;
             const char c = p->source.chars[p->pos];
             if (c != '^' && c != '_') break;
+            if ((c == '^' && sup) || (c == '_' && sub)) { p->valid = false; break; }
             ++p->pos;
             const StyleState sst = (c == '^') ? sup_style(st) : sub_style(st);
             auto* value = atom(p, sst);
             if (!value) break;
-            if (c == '^') { if (sup) p->valid = false; sup = value; }
-            else { if (sub) p->valid = false; sub = value; }
+            if (c == '^') sup = value;
+            else sub = value;
         }
         if (!p->valid) break;
 
@@ -988,12 +1004,17 @@ bool inlay_math_prepare(EtchStr tex, float font_size_px, bool display_style, Inl
     {
         return false;
     }
-    Parser parser = { tex, 0, true, 0, font_size_px };
+    Parser parser = { tex, 0, true, 0u, INLAY_MATH_ERROR_NONE, 0u, font_size_px };
     const StyleState init_st = { display_style ? StyleDisplay : StyleText, false };
     const auto* box = expression(&parser, init_st, false);
-    if (!box || !parser.valid) return false;
+    if (!box || !parser.valid) {
+        const uint32_t error_offset = parser.error == INLAY_MATH_ERROR_NONE ? parser.pos : parser.error_offset;
+        out->metrics = {0.f, 0.f, 0.f, false, error_offset,
+                        parser.error == INLAY_MATH_ERROR_NONE ? INLAY_MATH_ERROR_INVALID_SYNTAX : parser.error};
+        return false;
+    }
     out->root = box;
-    out->metrics = { box->width, box->ascent + box->descent, box->ascent, true };
+    out->metrics = { box->width, box->ascent + box->descent, box->ascent, true, 0u, INLAY_MATH_ERROR_NONE };
     return true;
 }
 
@@ -1006,13 +1027,14 @@ void inlay_math_draw_prepared(const InlayMathPrepared& prep, EtchVec2 pos, EtchC
 extern "C" {
 INLAY_API InlayMathResult inlay_measure_math(EtchStr tex, float size) {
     InlayMathPrepared prep = {};
-    return inlay_math_prepare(tex, size, true, &prep) ? prep.metrics : InlayMathResult{};
+    (void)inlay_math_prepare(tex, size, true, &prep);
+    return prep.metrics;
 }
 INLAY_API InlayMathResult inlay_draw_math(EtchStr tex, const InlayMathDesc* desc_in) {
     InlayMathDesc desc = inlay_math_desc_default();
     if (!inlay_read_abi_struct(desc_in, &desc) || !std::isfinite(desc.pos.x) || !std::isfinite(desc.pos.y)) return {};
     InlayMathPrepared prep = {};
-    if (!inlay_math_prepare(tex, desc.font_size_px, true, &prep)) return {};
+    if (!inlay_math_prepare(tex, desc.font_size_px, true, &prep)) return prep.metrics;
     inlay_math_draw_prepared(prep, desc.pos, desc.color);
     return prep.metrics;
 }

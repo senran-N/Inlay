@@ -393,7 +393,7 @@ struct MdBuilder {
  }
 
  uint8_t current_alert() const noexcept {
-  return alert_sp ? alert_stack[alert_sp - 1u] : INLAY_ALERT_NONE;
+  return alert_sp ? alert_stack[alert_sp - 1u] : uint8_t(INLAY_ALERT_NONE);
  }
 };
 
@@ -435,7 +435,7 @@ int md_enter_block(MD_BLOCKTYPE type, void* detail, void* userdata) {
    ak = InlayAstAlert;
    ++b->quote_depth;
    const auto* det = static_cast<const MD_BLOCK_ADMONITION_DETAIL*>(detail);
-   alert_k = (det && det->type.text) ? map_alert_kind(det->type.text, det->type.size) : INLAY_ALERT_NOTE;
+   alert_k = (det && det->type.text) ? map_alert_kind(det->type.text, det->type.size) : uint8_t(INLAY_ALERT_NOTE);
    if (b->alert_sp < 32u) b->alert_stack[b->alert_sp++] = alert_k;
    flags |= INLAY_BLOCK_FLAG_IN_ALERT;
    break;
@@ -849,6 +849,89 @@ int md_leave_block(MD_BLOCKTYPE type, void*, void* userdata) {
     ex.img_src_len = f.img_src_len;
    }
   }
+  // Promote standalone HTML <img src="..." alt="..." /> (optionally wrapped in <p>/<div>/<center>) to INLAY_IMAGE.
+  if (node.kind != InlayAstImage && node.quote_depth == 0u && node.list_depth == 0u) {
+   uint32_t a = ls, c = le;
+   auto is_ws_ch = [](char ch) noexcept { return ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n'; };
+   auto ci_eq = [](const char* p, uint32_t n, const char* lit) noexcept {
+    uint32_t k = 0u;
+    while (lit[k] && k < n) {
+     char ch = p[k];
+     if (ch >= 'A' && ch <= 'Z') ch = char(ch - 'A' + 'a');
+     if (ch != lit[k]) return false;
+     ++k;
+    }
+    return lit[k] == '\0' && k == n;
+   };
+   while (a < c && is_ws_ch(src[a])) ++a;
+   while (c > a && is_ws_ch(src[c - 1u])) --c;
+   // Unwrap one optional outer container tag (<p ...>...</p>, <div ...>...</div>, <center>...</center>).
+   if (c - a >= 7u && src[a] == '<' && src[c - 1u] == '>') {
+    uint32_t t0 = a + 1u, t1 = t0;
+    while (t1 < c && ((src[t1] >= 'a' && src[t1] <= 'z') || (src[t1] >= 'A' && src[t1] <= 'Z'))) ++t1;
+    const bool is_wrap = ci_eq(src + t0, t1 - t0, "p") || ci_eq(src + t0, t1 - t0, "div") || ci_eq(src + t0, t1 - t0, "center");
+    if (is_wrap) {
+     uint32_t open_gt = t1;
+     while (open_gt < c && src[open_gt] != '>') ++open_gt;
+     uint32_t close_lt = c - 1u;
+     while (close_lt > open_gt && src[close_lt] != '<') --close_lt;
+     if (open_gt < close_lt && close_lt + 2u < c && src[close_lt + 1u] == '/' &&
+         ci_eq(src + close_lt + 2u, (c - 1u) - (close_lt + 2u),
+               ci_eq(src + t0, t1 - t0, "p") ? "p" : (ci_eq(src + t0, t1 - t0, "div") ? "div" : "center"))) {
+      a = open_gt + 1u;
+      c = close_lt;
+      while (a < c && is_ws_ch(src[a])) ++a;
+      while (c > a && is_ws_ch(src[c - 1u])) --c;
+     }
+    }
+   }
+   if (c - a >= 6u && src[a] == '<' && src[c - 1u] == '>' &&
+       ci_eq(src + a + 1u, 3u, "img") && (is_ws_ch(src[a + 4u]) || src[a + 4u] == '/')) {
+    // Ensure there is only one tag (no second '<' before the closing '>').
+    bool single_tag = true;
+    uint32_t p = a + 4u;
+    uint32_t img_src_off = 0u, img_src_len = 0u, img_alt_off = 0u, img_alt_len = 0u;
+    while (p < c - 1u) {
+     while (p < c - 1u && (is_ws_ch(src[p]) || src[p] == '/')) ++p;
+     if (p >= c - 1u) break;
+     if (src[p] == '<' || src[p] == '>') { single_tag = false; break; }
+     const uint32_t k0 = p;
+     while (p < c - 1u && !is_ws_ch(src[p]) && src[p] != '=' && src[p] != '>' && src[p] != '/') ++p;
+     const uint32_t k1 = p;
+     while (p < c - 1u && is_ws_ch(src[p])) ++p;
+     uint32_t v0 = p, v1 = p;
+     if (p < c - 1u && src[p] == '=') {
+      ++p;
+      while (p < c - 1u && is_ws_ch(src[p])) ++p;
+      if (p < c - 1u && (src[p] == '"' || src[p] == '\'')) {
+       const char q = src[p++];
+       v0 = p;
+       while (p < c - 1u && src[p] != q) ++p;
+       v1 = p;
+       if (p < c - 1u && src[p] == q) ++p;
+      } else {
+       v0 = p;
+       while (p < c - 1u && !is_ws_ch(src[p]) && src[p] != '>' && src[p] != '/') ++p;
+       v1 = p;
+      }
+     }
+     if (ci_eq(src + k0, k1 - k0, "src") && v1 > v0) {
+      img_src_off = v0;
+      img_src_len = v1 - v0;
+     } else if (ci_eq(src + k0, k1 - k0, "alt")) {
+      img_alt_off = v0;
+      img_alt_len = v1 - v0;
+     }
+    }
+    if (single_tag && img_src_len > 0u) {
+     node.kind = InlayAstImage;
+     ex.content_off = img_alt_len > 0u ? img_alt_off : img_src_off;
+     ex.content_len = img_alt_len;
+     ex.img_src_off = img_src_off;
+     ex.img_src_len = img_src_len;
+    }
+   }
+  }
   if (after > b->scan_cursor) b->scan_cursor = after;
   propagate_range_up(b, ls, after);
   return 0;
@@ -1027,7 +1110,7 @@ void project_ast_node(MdBuilder* b, int32_t idx, bool in_complex_li, int32_t li_
   blk.content_offset = ex.content_off ? ex.content_off : n.src_offset;
   blk.content_length = ex.content_len ? ex.content_len : n.src_length;
   blk.level = n.level;
-  blk.parent_index = n.parent;
+  blk.parent_index = n.parent >= 0 && d->ast_nodes[n.parent].kind != InlayAstDoc ? n.parent : -1;
   blk.depth = n.depth;
   blk.quote_depth = n.quote_depth;
   blk.list_depth = n.list_depth;
@@ -1707,6 +1790,7 @@ INLAY_API void inlay_doc_destroy(InlayDoc* d) {
   SDL_free(view.tokens);
  }
  SDL_free(d->views);
+ SDL_free(d->anchors);
  SDL_free(d->source);
  SDL_free(d->blocks);
  SDL_free(d->block_meta);
@@ -1717,9 +1801,10 @@ INLAY_API void inlay_doc_destroy(InlayDoc* d) {
  SDL_free(d);
 }
 
-INLAY_API void inlay_doc_clear(InlayDoc* d) {
- if (!d) return;
- d->source_size = 0;
+} // extern "C"
+
+namespace {
+void reset_doc_parse(InlayDoc* d) noexcept {
  d->block_count = 0;
  d->frozen_count = 0;
  d->tail_start = 0;
@@ -1731,7 +1816,11 @@ INLAY_API void inlay_doc_clear(InlayDoc* d) {
  d->frozen_ast_text_size = 0;
  d->ref_def_count = 0;
  d->has_ref_defs = false;
- d->utf8_carry_len = 0;
+ d->parse_pending = false;
+ d->parse_from = 0u;
+}
+
+void invalidate_doc_views(InlayDoc* d) noexcept {
  for (uint32_t i = 0; i < d->view_count; ++i) {
   auto& view = d->views[i];
   view.width = 0;
@@ -1742,24 +1831,17 @@ INLAY_API void inlay_doc_clear(InlayDoc* d) {
   view.doc_sel_dragging = false;
   view.doc_sel_pending_span = false;
  }
- ++d->revision;
- etch_request_redraw(d->context);
 }
 
-INLAY_API bool inlay_doc_append_utf8(InlayDoc* d, EtchStr chunk) {
- if (!d || (!chunk.chars && chunk.length) || chunk.length > max_bytes - d->source_size - d->utf8_carry_len) return false;
- const uintptr_t ptr = reinterpret_cast<uintptr_t>(chunk.chars), base = reinterpret_cast<uintptr_t>(d->source);
- const bool aliases = ptr >= base && ptr - base < d->source_size;
- const uint32_t source_offset = aliases ? uint32_t(ptr - base) : 0u;
- if (aliases && chunk.length > d->source_size - source_offset) return false;
- const uint32_t total = d->utf8_carry_len + chunk.length;
- const auto byte = [&](uint32_t i) noexcept { return uint8_t(i < d->utf8_carry_len ? d->utf8_carry[i] : chunk.chars[i - d->utf8_carry_len]); };
- uint32_t valid = 0, newlines = 0;
+bool scan_doc_utf8(EtchStr chunk, const char* carry, uint32_t carry_len, uint32_t& valid) noexcept {
+ const uint32_t total = carry_len + chunk.length;
+ const auto byte = [&](uint32_t i) noexcept {
+  return uint8_t(i < carry_len ? carry[i] : chunk.chars[i - carry_len]);
+ };
  while (valid < total) {
   const uint8_t lead = byte(valid);
   if (lead == 0u) return false;
   if (lead < 0x80u) {
-   if (lead == '\n') ++newlines;
    ++valid;
    continue;
   }
@@ -1770,6 +1852,11 @@ INLAY_API bool inlay_doc_append_utf8(InlayDoc* d, EtchStr chunk) {
   else return false;
   const uint32_t rem = total - valid;
   if (rem < n) {
+   if (rem >= 2u) {
+    const uint8_t second = byte(valid + 1u);
+    if ((lead == 0xE0u && second < 0xA0u) || (lead == 0xEDu && second >= 0xA0u) ||
+        (lead == 0xF0u && second < 0x90u) || (lead == 0xF4u && second >= 0x90u)) return false;
+   }
    for (uint32_t j = 1u; j < rem; ++j) {
     if ((byte(valid + j) & 0xC0u) != 0x80u) return false;
    }
@@ -1777,8 +1864,8 @@ INLAY_API bool inlay_doc_append_utf8(InlayDoc* d, EtchStr chunk) {
   }
   char tmp[4];
   const char* seq = nullptr;
-  if (valid >= d->utf8_carry_len) {
-   seq = chunk.chars + (valid - d->utf8_carry_len);
+  if (valid >= carry_len) {
+   seq = chunk.chars + (valid - carry_len);
   } else {
    for (uint32_t j = 0u; j < n; ++j) tmp[j] = char(byte(valid + j));
    seq = tmp;
@@ -1788,30 +1875,92 @@ INLAY_API bool inlay_doc_append_utf8(InlayDoc* d, EtchStr chunk) {
   if (pos != n) return false;
   valid += n;
  }
- if (!reserve_source(d, d->source_size + valid) || !reserve_blocks(d, d->block_count + newlines + 4u)) return false;
+ return true;
+}
+
+bool source_boundary(const InlayDoc* d, uint32_t byte) noexcept {
+ return byte == d->source_size || (uint8_t(d->source[byte]) & 0xc0u) != 0x80u;
+}
+
+uint32_t anchor_index(const InlayDoc* d, uint64_t id) noexcept {
+ uint32_t lo = 0, hi = d->anchor_count;
+ while (lo < hi) {
+  const uint32_t mid = lo + (hi - lo) / 2u;
+  if (d->anchors[mid].id < id) lo = mid + 1u;
+  else hi = mid;
+ }
+ return lo;
+}
+
+void move_anchors(InlayDoc* d, uint32_t begin, uint32_t end, uint32_t inserted) noexcept {
+ const uint32_t new_end = begin + inserted;
+ for (uint32_t i = 0u; i < d->anchor_count; ++i) {
+  auto& a = d->anchors[i];
+  if (a.begin == UINT32_MAX) continue;
+  if (a.begin >= end) {
+   a.begin = new_end + (a.begin - end);
+   a.end = new_end + (a.end - end);
+  } else if (a.begin == a.end && a.begin >= begin) {
+   a.begin = a.end = new_end;
+  } else if (a.end > begin) {
+   if (a.begin > begin) a.begin = begin;
+   a.end = a.end > end ? new_end + (a.end - end) : new_end;
+  }
+  if (a.begin == d->source_size) a.begin = a.end = UINT32_MAX;
+ }
+}
+
+bool update_doc_text(InlayDoc* d, EtchStr chunk, bool replace) noexcept {
+ if (!d || (!chunk.chars && chunk.length)) return false;
+ const uint32_t old_size = replace ? 0u : d->source_size;
+ const uint32_t carry_len = replace ? 0u : d->utf8_carry_len;
+ if (chunk.length > max_bytes - old_size - carry_len) return false;
+ const uintptr_t ptr = reinterpret_cast<uintptr_t>(chunk.chars), base = reinterpret_cast<uintptr_t>(d->source);
+ const bool aliases = ptr >= base && ptr - base < d->source_size;
+ const uint32_t source_offset = aliases ? uint32_t(ptr - base) : 0u;
+ if (aliases && chunk.length > d->source_size - source_offset) return false;
+ uint32_t valid = 0;
+ if (!scan_doc_utf8(chunk, d->utf8_carry, carry_len, valid) || !reserve_source(d, old_size + valid)) return false;
  if (aliases) chunk.chars = d->source + source_offset;
  char carry[4] = {};
- const uint32_t carry_count = total - valid;
- for (uint32_t i = 0; i < carry_count; ++i) carry[i] = char(byte(valid + i));
- const uint32_t old_size = d->source_size;
- for (uint32_t i = 0; i < valid; ++i) d->source[d->source_size + i] = char(byte(i));
- d->source_size += valid;
+ const uint32_t carry_count = carry_len + chunk.length - valid;
+ for (uint32_t i = 0; i < carry_count; ++i) {
+  const uint32_t at = valid + i;
+  carry[i] = at < carry_len ? d->utf8_carry[at] : chunk.chars[at - carry_len];
+ }
+ if (replace) {
+  d->anchor_count = 0;
+  reset_doc_parse(d);
+  invalidate_doc_views(d);
+ }
+ if (valid > 0u) {
+  if (carry_len) std::memcpy(d->source + old_size, d->utf8_carry, carry_len);
+  const uint32_t chunk_bytes = valid - carry_len;
+  if (chunk_bytes) std::memmove(d->source + old_size + carry_len, chunk.chars, chunk_bytes);
+ }
+ d->source_size = old_size + valid;
  d->utf8_carry_len = uint8_t(carry_count);
  std::memcpy(d->utf8_carry, carry, 4);
 
- // If any newly touched line introduces a CommonMark reference link definition, reparse from start
- // so forward references in earlier frozen blocks resolve identically to one-shot parsing!
- if (valid > 0u) {
-  uint32_t scan = line_start_of(d->source, old_size, 0u);
-  bool found_ref = false;
-  while (scan < d->source_size) {
-   const uint32_t le = line_end_of(d->source, scan, d->source_size);
-   uint32_t ll = le - scan;
-   if (ll && d->source[le - 1u] == '\r') --ll;
-   if (line_looks_like_ref_def(d->source + scan, ll)) { found_ref = true; break; }
-   scan = le < d->source_size ? le + 1u : le;
-  }
-  if (found_ref) {
+ if (valid > 0u && !d->parse_pending) {
+  d->parse_pending = true;
+  d->parse_from = old_size;
+ }
+ ++d->revision;
+ etch_request_redraw(d->context);
+ return true;
+}
+} // namespace
+
+void inlay_doc_parse_pending(InlayDoc* d) noexcept {
+ if (!d->parse_pending) return;
+ // A new definition can resolve links in the frozen prefix.
+ uint32_t scan = line_start_of(d->source, d->parse_from, 0u);
+ while (scan < d->source_size) {
+  const uint32_t le = line_end_of(d->source, scan, d->source_size);
+  uint32_t ll = le - scan;
+  if (ll && d->source[le - 1u] == '\r') --ll;
+  if (line_looks_like_ref_def(d->source + scan, ll)) {
    d->has_ref_defs = true;
    d->frozen_count = 0;
    d->frozen_ast_count = 0;
@@ -1821,22 +1970,140 @@ INLAY_API bool inlay_doc_append_utf8(InlayDoc* d, EtchStr chunk) {
    for (uint32_t vi = 0; vi < d->view_count; ++vi) {
     d->views[vi].width = 0;
    }
+   break;
   }
+  scan = le < d->source_size ? le + 1u : le;
  }
-
  parse_tail(d);
+ d->parse_pending = false;
+}
+
+extern "C" {
+INLAY_API void inlay_doc_clear(InlayDoc* d) {
+ if (!d) return;
+ d->anchor_count = 0;
+ d->source_size = 0;
+ d->utf8_carry_len = 0;
+ reset_doc_parse(d);
+ invalidate_doc_views(d);
+ ++d->revision;
+ etch_request_redraw(d->context);
+}
+
+INLAY_API bool inlay_doc_append_utf8(InlayDoc* d, EtchStr chunk) {
+ return update_doc_text(d, chunk, false);
+}
+
+INLAY_API bool inlay_doc_set_utf8(InlayDoc* d, EtchStr text) {
+ return update_doc_text(d, text, true);
+}
+
+INLAY_API bool inlay_doc_replace_utf8(InlayDoc* d, uint32_t begin, uint32_t end, EtchStr text) {
+ if (!d || begin > end || end > d->source_size || (!text.chars && text.length) || d->utf8_carry_len) return false;
+ const uint32_t retained = d->source_size - (end - begin);
+ if (text.length > max_bytes - retained || !source_boundary(d, begin) || !source_boundary(d, end)) return false;
+ if (begin == end && !text.length) return true;
+
+ const uintptr_t ptr = reinterpret_cast<uintptr_t>(text.chars), base = reinterpret_cast<uintptr_t>(d->source);
+ const bool aliases = text.length && ptr >= base && ptr - base <= d->source_size;
+ if (aliases && text.length > d->source_size - uint32_t(ptr - base)) return false;
+ uint32_t valid = 0;
+ if (!scan_doc_utf8(text, nullptr, 0u, valid) || valid != text.length) return false;
+ if (text.length == end - begin && std::memcmp(d->source + begin, text.chars, text.length) == 0) return true;
+
+ char* saved = nullptr;
+ if (aliases) {
+  saved = static_cast<char*>(SDL_malloc(text.length));
+  if (!saved) return false;
+  std::memcpy(saved, text.chars, text.length);
+  text.chars = saved;
+ }
+ if (!reserve_source(d, retained + text.length)) {
+  SDL_free(saved);
+  return false;
+ }
+ // A frozen list may depend on the first complete line of the tail.
+ const uint32_t edit_line = line_start_of(d->source, begin, 0u);
+ const bool keep_prefix = !d->has_ref_defs && edit_line > d->tail_start;
+ const uint32_t parse_from = d->parse_pending && d->parse_from < edit_line ? d->parse_from : edit_line;
+ std::memmove(d->source + begin + text.length, d->source + end, d->source_size - end);
+ if (text.length) std::memcpy(d->source + begin, text.chars, text.length);
+ SDL_free(saved);
+ d->source_size = retained + text.length;
+ move_anchors(d, begin, end, text.length);
+ if (!keep_prefix) reset_doc_parse(d);
+ d->parse_from = keep_prefix ? parse_from : 0u;
+ d->parse_pending = d->source_size != 0u;
+ invalidate_doc_views(d);
  ++d->revision;
  etch_request_redraw(d->context);
  return true;
 }
 
-INLAY_API bool inlay_doc_set_utf8(InlayDoc* d, EtchStr text) {
- if (!d) return false;
- inlay_doc_clear(d);
- return inlay_doc_append_utf8(d, text);
+INLAY_API uint32_t inlay_doc_revision(const InlayDoc* d) {
+ return d ? d->revision : 0u;
 }
 
-INLAY_API uint32_t inlay_doc_block_count(const InlayDoc* d) { return d ? d->block_count : 0u; }
-INLAY_API const InlayBlock* inlay_doc_block(const InlayDoc* d, uint32_t i) { return d && i < d->block_count ? d->blocks + i : nullptr; }
+INLAY_API bool inlay_doc_set_anchor(InlayDoc* d, InlayDocAnchor anchor) {
+ if (!d || !anchor.id || anchor.begin > anchor.end || anchor.end > d->source_size ||
+     !source_boundary(d, anchor.begin) || !source_boundary(d, anchor.end)) return false;
+ const uint32_t i = anchor_index(d, anchor.id);
+ if (i == d->anchor_count || d->anchors[i].id != anchor.id) {
+  if (!inlay_grow_pod(d->anchors, d->anchor_capacity, d->anchor_count + 1u, 8u, 65536u)) return false;
+  std::memmove(d->anchors + i + 1u, d->anchors + i, (d->anchor_count - i) * sizeof(anchor));
+  ++d->anchor_count;
+ }
+ // A point at EOF follows the stream. Keeping it symbolic makes appends O(1)
+ // in the number of annotations, including while a UTF-8 sequence is pending.
+ if (anchor.begin == d->source_size) anchor.begin = anchor.end = UINT32_MAX;
+ d->anchors[i] = anchor;
+ return true;
+}
+
+INLAY_API bool inlay_doc_get_anchor(const InlayDoc* d, uint64_t id, InlayDocAnchor* out) {
+ if (!d || !out) return false;
+ const uint32_t i = anchor_index(d, id);
+ if (i == d->anchor_count || d->anchors[i].id != id) return false;
+ return inlay_doc_anchor_at(d, i, out);
+}
+
+INLAY_API bool inlay_doc_remove_anchor(InlayDoc* d, uint64_t id) {
+ if (!d) return false;
+ const uint32_t i = anchor_index(d, id);
+ if (i == d->anchor_count || d->anchors[i].id != id) return false;
+ --d->anchor_count;
+ std::memmove(d->anchors + i, d->anchors + i + 1u, (d->anchor_count - i) * sizeof(*d->anchors));
+ return true;
+}
+
+INLAY_API uint32_t inlay_doc_anchor_count(const InlayDoc* d) { return d ? d->anchor_count : 0u; }
+INLAY_API bool inlay_doc_anchor_at(const InlayDoc* d, uint32_t index, InlayDocAnchor* out) {
+ if (!d || !out || index >= d->anchor_count) return false;
+ *out = d->anchors[index];
+ if (out->begin == UINT32_MAX) out->begin = out->end = d->source_size;
+ return true;
+}
+
+INLAY_API InlayDocStreamStatus inlay_doc_stream_status(const InlayDoc* d) {
+ if (!d) return INLAY_DOC_STREAM_INVALID;
+ if (d->utf8_carry_len) return INLAY_DOC_STREAM_PARTIAL_UTF8;
+ inlay_doc_parse_pending(const_cast<InlayDoc*>(d));
+ if (d->block_count) {
+  const InlayBlock& tail = d->blocks[d->block_count - 1u];
+  if (!tail.complete && (tail.kind == INLAY_CODE_BLOCK || tail.kind == INLAY_MATH_BLOCK)) {
+   return INLAY_DOC_STREAM_OPEN_FENCE;
+  }
+ }
+ return INLAY_DOC_STREAM_READY;
+}
+
+INLAY_API uint32_t inlay_doc_block_count(const InlayDoc* d) {
+ if (!d) return 0u;
+ inlay_doc_parse_pending(const_cast<InlayDoc*>(d));
+ return d->block_count;
+}
+INLAY_API const InlayBlock* inlay_doc_block(const InlayDoc* d, uint32_t i) {
+ return i < inlay_doc_block_count(d) ? d->blocks + i : nullptr;
+}
 INLAY_API EtchStr inlay_doc_source(const InlayDoc* d) { return d ? EtchStr{d->source, d->source_size, false} : EtchStr{}; }
 }

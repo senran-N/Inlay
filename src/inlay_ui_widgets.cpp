@@ -9,7 +9,7 @@
 
 namespace {
 
-constexpr uint32_t kDocCacheCap = 16u;
+constexpr uint32_t kRetainedDocs = 16u;
 constexpr uint32_t kTermCacheCap = 8u;
 constexpr uint32_t kVListCacheCap = 16u;
 constexpr uint32_t kTableSortCacheCap = 8u;
@@ -18,16 +18,7 @@ constexpr uint32_t kTableCellHardCap = 262144u;
 constexpr uint32_t kTableRowHardCap = 65536u;
 constexpr uint32_t kTableColHardCap = 16384u;
 constexpr uint32_t kMenuItemHardCap = 16384u;
-constexpr uint32_t kMaxTreeGuideDepth = 16u;
 constexpr uint32_t kMaxEventJsonBytes = 65536u;
-
-// Per-draw-pass tree indent-guide inheritance stack (Tree -> nested TreeItems).
-bool g_tree_guide_stack[kMaxTreeGuideDepth] = {};
-uint32_t g_tree_guide_depth = 0u;
-
-bool current_tree_guide() noexcept {
-    return g_tree_guide_depth > 0u ? g_tree_guide_stack[g_tree_guide_depth - 1u] : true;
-}
 
 // ============================================================================
 // Common JS Prop, Text Pool, Color & JSON Payload Helpers
@@ -301,16 +292,24 @@ EtchStr frame_json_finish(const FrameJsonBuf& b) noexcept {
 // Persistent Bounded LRU Cache Helpers
 // ============================================================================
 
-DocCacheEntry* find_or_add_doc_cache(InlaySurface* s, uint32_t id) noexcept {
+DocCacheEntry* find_or_add_doc_cache(InlaySurface* s, DocWidgetSpec& spec) noexcept {
+    const uint32_t id = spec.path_id;
+    if (spec.cache_index < s->doc_cache_count && s->doc_cache[spec.cache_index].element_id == id) {
+        auto& entry = s->doc_cache[spec.cache_index];
+        entry.last_used_frame = s->frame_counter;
+        return &entry;
+    }
     for (uint32_t i = 0u; i < s->doc_cache_count; ++i) {
         if (s->doc_cache[i].element_id == id) {
+            spec.cache_index = i;
             s->doc_cache[i].last_used_frame = s->frame_counter;
             return &s->doc_cache[i];
         }
     }
     DocCacheEntry* entry = nullptr;
-    if (s->doc_cache_count < kDocCacheCap) {
-        if (!inlay_grow_pod(s->doc_cache, s->doc_cache_cap, s->doc_cache_count + 1u, 4u, kDocCacheCap))
+    const uint32_t limit = s->doc_spec_count > kRetainedDocs ? s->doc_spec_count : kRetainedDocs;
+    if (s->doc_cache_count < limit) {
+        if (!inlay_grow_pod(s->doc_cache, s->doc_cache_cap, s->doc_cache_count + 1u, 4u, limit))
             return nullptr;
         entry = &s->doc_cache[s->doc_cache_count++];
         *entry = {};
@@ -327,9 +326,17 @@ DocCacheEntry* find_or_add_doc_cache(InlaySurface* s, uint32_t id) noexcept {
         }
         *entry = {};
     }
-    const InlayDocConfig cfg = inlay_doc_config_default();
-    entry->element_id = id;
+    InlayDocConfig cfg = inlay_doc_config_default();
+    cfg.initial_source_bytes = 256u;
+    cfg.initial_blocks = 8u;
+    ++s->stats.document_cache_misses;
     entry->doc = inlay_doc_create(s->etch, &cfg);
+    if (!entry->doc) {
+        *entry = s->doc_cache[--s->doc_cache_count];
+        return nullptr;
+    }
+    entry->element_id = id;
+    spec.cache_index = static_cast<uint32_t>(entry - s->doc_cache);
     entry->last_used_frame = s->frame_counter;
     return entry;
 }
@@ -968,11 +975,13 @@ bool parse_doc_widget(InlaySurface* s, JSValueConst props, bool has_props,
     spec.on_link_handler = INLAY_UI_NONE;
 
     if (has_props) {
-        const EtchStr md = inlay_ui_string_prop(s, props, "markdown");
+        spec.document_name = inlay_ui_string_slice_prop(s, props, "document");
+        if (JS_HasException(s->js)) return false;
+        const EtchStr md = spec.document_name.len ? EtchStr{} : inlay_ui_string_prop(s, props, "markdown");
         if (JS_HasException(s->js)) return false;
         if (md.length > 0u) {
             node.text = md;
-        } else if (node.text.length == 0u) {
+        } else if (!spec.document_name.len && node.text.length == 0u) {
             const EtchStr tx = inlay_ui_string_prop(s, props, "text");
             if (JS_HasException(s->js)) return false;
             if (tx.length > 0u) {
@@ -1994,13 +2003,22 @@ void draw_doc_widget(InlaySurface* s, const InlayUiNode& node, const NodeStyle& 
                      uint32_t id, uint32_t parent_id, const EtchTheme& theme,
                      bool use_layer, WidgetEvents* events) {
     if (st.ext_idx == INLAY_UI_NONE || st.ext_idx >= s->doc_spec_count) return;
-    const DocWidgetSpec& spec = s->doc_specs[st.ext_idx];
-    DocCacheEntry* entry = find_or_add_doc_cache(s, id);
-    if (!entry || !entry->doc) return;
+    DocWidgetSpec& spec = s->doc_specs[st.ext_idx];
+    InlayDoc* document = nullptr;
+    DocCacheEntry* entry = nullptr;
+    if (spec.document_name.len) {
+        const EtchStr name = inlay_ui_slice(s, spec.document_name);
+        const uint32_t i = inlay_ui_content_index(s, INLAY_UI_DOC, name);
+        if (i < s->content_count) document = static_cast<InlayDoc*>(s->content[i].resource);
+    } else {
+        entry = find_or_add_doc_cache(s, spec);
+        if (entry) document = entry->doc;
+    }
+    if (!document) return;
 
     // Sync markdown content with streaming append fast-path when unchanged prefix matches.
-    const uint64_t h = inlay_fnv1a_64(node.text.chars, node.text.length);
-    if (h != entry->content_hash || node.text.length != entry->content_len) {
+    if (entry && (spec.content_hash != entry->content_hash || node.text.length != entry->content_len)) {
+        bool updated = true;
         if (node.text.length == 0u) {
             inlay_doc_clear(entry->doc);
         } else {
@@ -2013,13 +2031,15 @@ void draw_doc_widget(InlaySurface* s, const InlayUiNode& node, const NodeStyle& 
                     node.text.length - existing.length,
                     false
                 };
-                inlay_doc_append_utf8(entry->doc, delta);
+                updated = inlay_doc_append_utf8(entry->doc, delta);
             } else {
-                inlay_doc_set_utf8(entry->doc, node.text);
+                updated = inlay_doc_set_utf8(entry->doc, node.text);
             }
         }
-        entry->content_hash = h;
-        entry->content_len = node.text.length;
+        if (updated) {
+            entry->content_hash = spec.content_hash;
+            entry->content_len = node.text.length;
+        }
     }
 
     auto box = etch_box_desc_default();
@@ -2068,6 +2088,8 @@ void draw_doc_widget(InlaySurface* s, const InlayUiNode& node, const NodeStyle& 
     vd.stick_to_bottom = spec.stick_to_bottom;
     vd.show_code_line_numbers = spec.show_line_numbers;
     vd.hide_code_copy_button = spec.hide_copy_button;
+    vd.image_resolver_fn = s->image_resolver_fn;
+    vd.image_resolver_user_data = s->image_resolver_user_data;
 
     InlayDocStyle custom_style = inlay_doc_style_default();
     if (st.color.set || (st.flags & NfHasFontId)) {
@@ -2081,7 +2103,7 @@ void draw_doc_widget(InlaySurface* s, const InlayUiNode& node, const NodeStyle& 
     }
 
     etch_begin_box(&box);
-    const InlayDocResult res = inlay_doc_view(entry->doc, &vd);
+    const InlayDocResult res = inlay_doc_view(document, &vd);
     etch_end_box();
 
     if (res.clicked_link.length > 0u && has_event(spec.on_link_action, spec.on_link_handler)) {
@@ -2425,17 +2447,16 @@ void draw_virtual_list_widget(InlaySurface* s, const InlayUiNode& node, const No
     const bool escaped = (slice.end_index > slice.first_index) &&
                          (slice.first_index < spec.window_start || slice.end_index > win_end);
     if (escaped && total_count > 0u && win && (has_render_item || has_on_range)) {
-        constexpr uint32_t kMaxWindow = 256u;
+        constexpr uint32_t kPrefetchWindow = 256u;
         uint32_t buf = spec.overscan_rows > 0u ? spec.overscan_rows * 2u : 16u;
         const uint32_t vis = slice.end_index - slice.first_index;
-        if (vis >= kMaxWindow) {
+        if (vis >= kPrefetchWindow) {
             buf = 0u;
-        } else if (buf * 2u > kMaxWindow - vis) {
-            buf = (kMaxWindow - vis) / 2u;
+        } else if (buf * 2u > kPrefetchWindow - vis) {
+            buf = (kPrefetchWindow - vis) / 2u;
         }
         const uint32_t want_first = (slice.first_index > buf) ? (slice.first_index - buf) : 0u;
-        uint32_t want_end = (slice.end_index + buf < total_count) ? (slice.end_index + buf) : total_count;
-        if (want_end - want_first > kMaxWindow) want_end = want_first + kMaxWindow;
+        const uint32_t want_end = (slice.end_index + buf < total_count) ? (slice.end_index + buf) : total_count;
         if (win->first_index != want_first || win->end_index != want_end) {
             win->first_index = want_first;
             win->end_index = want_end;
@@ -2639,8 +2660,8 @@ void draw_tree_widget(InlaySurface* s, const InlayUiNode& node, const NodeStyle&
     box.axis = ETCH_AXIS_COL;
 
     const bool show_guide = (st.int_value >= 0);
-    const bool pushed = g_tree_guide_depth < kMaxTreeGuideDepth;
-    if (pushed) g_tree_guide_stack[g_tree_guide_depth++] = show_guide;
+    const bool previous = s->hide_tree_guide;
+    s->hide_tree_guide = !show_guide;
 
     etch_begin_box(&box);
     EtchA11yOverrideDesc ov = {};
@@ -2657,7 +2678,7 @@ void draw_tree_widget(InlaySurface* s, const InlayUiNode& node, const NodeStyle&
     s->draw_parent_col = prev_col;
     etch_end_box();
 
-    if (pushed) --g_tree_guide_depth;
+    s->hide_tree_guide = previous;
 }
 
 void draw_tree_item_widget(InlaySurface* s, const InlayUiNode& node, const NodeStyle& st,
@@ -2681,7 +2702,7 @@ void draw_tree_item_widget(InlaySurface* s, const InlayUiNode& node, const NodeS
     td.default_open = controlled ? want_open : ((st.flags2 & Nf2DefaultOpen) != 0u);
     td.selected = (st.flags2 & Nf2Selected) != 0u;
     td.leaf = leaf_explicit ? ((st.flags2 & Nf2Leaf) != 0u) : (node.first_child == INLAY_UI_NONE);
-    td.show_indent_guide = guide_explicit ? ((st.int_value & (1 << 1)) != 0) : current_tree_guide();
+    td.show_indent_guide = guide_explicit ? ((st.int_value & (1 << 1)) != 0) : !s->hide_tree_guide;
     td.row_height_px = (st.flags2 & Nf2HasValue) && st.value > 0.f ? st.value : 28.f;
     if ((st.flags2 & Nf2HasMin) && cold && cold->min_val > 0.f) td.indent_px = cold->min_val;
     if ((st.flags & NfHasSize) && st.font_size > 0.f) td.font_size_px = st.font_size;
@@ -3582,6 +3603,16 @@ void inlay_ui_reset_widget_specs(InlaySurface* s) noexcept {
     s->skeleton_spec_count = 0u;
 }
 
+void inlay_ui_trim_document_cache(InlaySurface* s) noexcept {
+    const uint32_t limit = s->doc_spec_count > kRetainedDocs ? s->doc_spec_count : kRetainedDocs;
+    for (uint32_t i = s->doc_cache_count; i > 0 && s->doc_cache_count > limit; --i) {
+        auto& entry = s->doc_cache[i - 1u];
+        if (entry.last_used_frame == s->frame_counter) continue;
+        inlay_doc_destroy(entry.doc);
+        entry = s->doc_cache[--s->doc_cache_count];
+    }
+}
+
 void inlay_ui_free_widget_caches(InlaySurface* s) noexcept {
     if (!s) return;
 
@@ -3648,7 +3679,11 @@ bool inlay_ui_parse_ext_widget(InlaySurface* s, JSValueConst props,
                                uint32_t path_id) {
     const bool has_props = JS_IsObject(props) && !JS_IsNull(props);
     switch (kind) {
-        case INLAY_UI_DOC:          return parse_doc_widget(s, props, has_props, node, st);
+        case INLAY_UI_DOC:
+            if (!parse_doc_widget(s, props, has_props, node, st)) return false;
+            s->doc_specs[st.ext_idx].path_id = path_id;
+            s->doc_specs[st.ext_idx].cache_index = INLAY_UI_NONE;
+            return true;
         case INLAY_UI_TERMINAL:     return parse_terminal_widget(s, props, has_props, node, st);
         case INLAY_UI_VIRTUAL_LIST: return parse_virtual_list_widget(s, props, has_props, st, path_id);
         case INLAY_UI_TABLE:        return parse_table_widget(s, props, has_props, st);

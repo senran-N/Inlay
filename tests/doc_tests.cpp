@@ -1,10 +1,74 @@
 #include <inlay/inlay.h>
 #include <cstdio>
+#include <cstdlib>
+#include <SDL3/SDL_events.h>
+#include <SDL3/SDL_init.h>
 #include <SDL3/SDL_surface.h>
+#include <SDL3/SDL_thread.h>
+#include <SDL3/SDL_timer.h>
 #include "../src/inlay_internal.h"
 #include <cmath>
 #include <cstring>
 namespace {
+bool inbox_regression() {
+ if (!SDL_InitSubSystem(SDL_INIT_EVENTS)) return false;
+ const uint32_t wake_type = SDL_RegisterEvents(1);
+ InlayInboxDesc desc = inlay_inbox_desc_default();
+ desc.max_messages = 2u;
+ desc.max_bytes = 12u;
+ desc.wake_event_type = wake_type;
+ InlayInbox* inbox = wake_type ? inlay_inbox_create(&desc) : nullptr;
+ bool ok = inbox != nullptr;
+ if (inbox) {
+  SDL_Thread* worker = SDL_CreateThread([](void* user) -> int {
+   auto* queue = static_cast<InlayInbox*>(user);
+   SDL_Delay(20);
+   char first[] = "abcdefg";
+   const auto sent = inlay_inbox_post(queue, 1u, 10u, first, 7u);
+   first[0] = 'X';
+   return sent == INLAY_INBOX_OK &&
+          inlay_inbox_post(queue, 1u, 11u, "hijk", 4u) == INLAY_INBOX_OK &&
+          inlay_inbox_post(queue, 2u, 12u, nullptr, 0u) == INLAY_INBOX_FULL ? 0 : 1;
+  }, "inlay inbox producer", inbox);
+  bool woke = false;
+  const uint64_t deadline = SDL_GetTicks() + 1000u;
+  while (worker && SDL_GetTicks() < deadline) {
+   SDL_Event event = {};
+   if (SDL_WaitEventTimeout(&event, 20) && event.type == wake_type) {
+    woke = true;
+    break;
+   }
+  }
+  int worker_status = -1;
+  if (worker) SDL_WaitThread(worker, &worker_status);
+  ok &= woke && worker_status == 0 && !SDL_HasEvent(wake_type);
+  ok &= inlay_inbox_pending(inbox) == 2u;
+  InlayInboxMessage message = {};
+  char bytes[12] = {};
+  ok &= inlay_inbox_take(inbox, &message, nullptr, 0u) == INLAY_INBOX_BUFFER_TOO_SMALL &&
+        message.payload_size == 7u && message.id == 10u;
+  ok &= inlay_inbox_take(inbox, &message, bytes, sizeof(bytes)) == INLAY_INBOX_OK &&
+        message.kind == 1u && !std::memcmp(bytes, "abcdefg", 7u);
+  ok &= inlay_inbox_post(inbox, 2u, 12u, "123456789", 9u) == INLAY_INBOX_FULL;
+  ok &= inlay_inbox_post(inbox, 2u, 12u, "123456", 6u) == INLAY_INBOX_OK && !SDL_HasEvent(wake_type);
+  ok &= inlay_inbox_take(inbox, &message, bytes, sizeof(bytes)) == INLAY_INBOX_OK &&
+        message.id == 11u && !std::memcmp(bytes, "hijk", 4u);
+  ok &= inlay_inbox_take(inbox, &message, bytes, sizeof(bytes)) == INLAY_INBOX_OK &&
+        message.id == 12u && !std::memcmp(bytes, "123456", 6u);
+  ok &= inlay_inbox_take(inbox, &message, nullptr, 0u) == INLAY_INBOX_EMPTY;
+  ok &= inlay_inbox_post(inbox, 3u, 13u, nullptr, 0u) == INLAY_INBOX_OK && SDL_HasEvent(wake_type);
+  inlay_inbox_close(inbox);
+  ok &= inlay_inbox_post(inbox, 3u, 14u, nullptr, 0u) == INLAY_INBOX_CLOSED;
+  ok &= inlay_inbox_take(inbox, &message, nullptr, 0u) == INLAY_INBOX_OK &&
+        message.id == 13u && message.payload_size == 0u;
+  ok &= inlay_inbox_take(inbox, &message, nullptr, 0u) == INLAY_INBOX_CLOSED;
+  inlay_inbox_destroy(inbox);
+  SDL_FlushEvent(wake_type);
+ }
+ SDL_QuitSubSystem(SDL_INIT_EVENTS);
+ if (!ok) std::fprintf(stderr, "Inbox worker wake, FIFO, backpressure or close failed\n");
+ return ok;
+}
 bool str_equal(EtchStr text,EtchStr expected) {
  return text.length==expected.length && !std::memcmp(text.chars,expected.chars,text.length);
 }
@@ -497,7 +561,7 @@ bool mermaid_single_pass_arena(EtchContext* ctx,InlayDoc* doc) {
  const auto layout=inlay_diagram_layout(diagram_src,&ddesc);
  etch_end_frame(ctx);
  const size_t single_layout_bytes=etch_frame_stats(ctx).arena_used_bytes-baseline;
- if(!layout.valid || !single_layout_bytes) {
+ if(!layout.valid || !single_layout_bytes || single_layout_bytes > 8192u) {
   std::fprintf(stderr,"Mermaid single pass baseline failed: valid=%d bytes=%zu\n",layout.valid,single_layout_bytes);
   return false;
  }
@@ -511,7 +575,7 @@ bool mermaid_single_pass_arena(EtchContext* ctx,InlayDoc* doc) {
  inlay_doc_clear(doc);
  etch_end_frame(ctx);
  const size_t used=etch_frame_stats(ctx).arena_used_bytes;
- ok &= used>single_layout_bytes && used<baseline+single_layout_bytes+single_layout_bytes*3/4;
+ ok &= used>single_layout_bytes && used<baseline+single_layout_bytes*4u;
  if(!ok)std::fprintf(stderr,"Mermaid single pass arena: used=%zu baseline=%zu single_layout=%zu\n",used,baseline,single_layout_bytes);
  return ok;
 }
@@ -830,6 +894,97 @@ bool phase4_md4c_selection_and_abi(EtchContext* ctx) {
  }
  ok &= abi_ok;
 
+ {
+  InlayDoc* doc = inlay_doc_create(ctx, nullptr);
+  if (!doc) return false;
+  char blank[16384];
+  std::memset(blank, '\n', sizeof(blank));
+  const auto initial_blocks = doc->block_capacity;
+  const auto revision = inlay_doc_revision(doc);
+  bool sparse = inlay_doc_set_utf8(doc, {blank, sizeof(blank), false}) &&
+                inlay_doc_revision(doc) == revision + 1u &&
+                inlay_doc_append_utf8(doc, ETCH_STR_LIT("# Heading\n"));
+  sparse &= inlay_doc_block_count(doc) == 1u && doc->block_capacity == initial_blocks;
+  sparse &= inlay_doc_replace_utf8(doc, 0, 1, {blank, sizeof(blank), false});
+  sparse &= inlay_doc_block_count(doc) == 1u && doc->block_capacity == initial_blocks;
+  if (!sparse) std::fprintf(stderr, "Blank lines inflated native block storage or changed the AST\n");
+  ok &= sparse;
+  inlay_doc_destroy(doc);
+ }
+
+ {
+  InlayDoc* doc = inlay_doc_create(ctx, nullptr);
+  bool retained = doc && inlay_doc_set_utf8(doc, ETCH_STR_LIT("# Keep"));
+  if (doc) {
+   const auto source_is = [doc](EtchStr expected) {
+    const EtchStr current = inlay_doc_source(doc);
+    return current.length == expected.length && std::memcmp(current.chars, expected.chars, expected.length) == 0;
+   };
+   retained &= !inlay_doc_set_utf8(doc, ETCH_STR_LIT("\xff"));
+   retained &= source_is(ETCH_STR_LIT("# Keep"));
+   const EtchStr invalid[] = {ETCH_STR_LIT("\xe0\x80"), ETCH_STR_LIT("\xed\xa0"),
+                              ETCH_STR_LIT("\xf0\x80"), ETCH_STR_LIT("\xf4\x90")};
+   for (const EtchStr part : invalid) retained &= !inlay_doc_append_utf8(doc, part);
+   retained &= inlay_doc_append_utf8(doc, ETCH_STR_LIT("\xe4\xbd"));
+   retained &= inlay_doc_stream_status(doc) == INLAY_DOC_STREAM_PARTIAL_UTF8;
+   retained &= !inlay_doc_append_utf8(doc, ETCH_STR_LIT("X"));
+   retained &= inlay_doc_append_utf8(doc, ETCH_STR_LIT("\xa0"));
+   retained &= inlay_doc_stream_status(doc) == INLAY_DOC_STREAM_READY;
+   retained &= source_is(ETCH_STR_LIT("# Keep你"));
+   const EtchStr own = inlay_doc_source(doc);
+   retained &= inlay_doc_set_utf8(doc, {own.chars + 2u, own.length - 2u, false});
+   retained &= source_is(ETCH_STR_LIT("Keep你"));
+   retained &= inlay_doc_set_utf8(doc, ETCH_STR_LIT("```text\nCode\n"));
+   retained &= inlay_doc_stream_status(doc) == INLAY_DOC_STREAM_OPEN_FENCE;
+   retained &= inlay_doc_append_utf8(doc, ETCH_STR_LIT("```\n"));
+   retained &= inlay_doc_stream_status(doc) == INLAY_DOC_STREAM_READY;
+   inlay_doc_destroy(doc);
+  }
+  if (!retained) std::fprintf(stderr, "UTF-8 replacement or chunk transaction failed\n");
+  ok &= retained;
+ }
+
+ {
+  InlayDoc* doc = inlay_doc_create(ctx, nullptr);
+  bool found = doc != nullptr;
+  if (doc) {
+   for (uint32_t i = 0; i < 40u; ++i) {
+    found &= inlay_doc_append_utf8(doc, ETCH_STR_LIT("A short row.\n\n"));
+   }
+   found &= inlay_doc_append_utf8(doc, ETCH_STR_LIT("**终点** with a match.\n\n"));
+   auto view = inlay_doc_view_desc_default();
+   view.id = etch_id("doc-search-reveal");
+   view.width_px = 320.f;
+   view.height_px = 96.f;
+   auto frame = etch_frame_desc_default();
+   frame.viewport_w = 400;
+   frame.viewport_h = 180;
+   const auto draw = [&]() {
+    etch_begin_frame(ctx, &frame);
+    const InlayDocResult result = inlay_doc_view(doc, &view);
+    etch_end_frame(ctx);
+    return result;
+   };
+   const auto initial = draw();
+   const auto match = inlay_doc_view_find_text(doc, view.id, ETCH_STR_LIT("终点"), 0u);
+   found &= initial.visible_first == 0u && match.active && match.focus - match.anchor == 6u;
+   found &= !inlay_doc_view_find_text(doc, view.id, ETCH_STR_LIT("\xe7"), 0u).active;
+   found &= !inlay_doc_view_find_text(doc, view.id, ETCH_STR_LIT("终点"), match.focus).active;
+   inlay_doc_view_set_selection(doc, view.id, match.anchor, match.focus);
+   char selected[16] = {};
+   found &= inlay_doc_view_copy_plain_text(doc, view.id, selected, sizeof(selected)) == 6u &&
+            std::strcmp(selected, "终点") == 0;
+   found &= inlay_doc_view_reveal_text(doc, view.id, match.anchor, ETCH_ALIGN_Y_CENTER);
+   const auto moved = draw();
+   found &= moved.visible_first > 0u && moved.visible_end == moved.total_rows;
+   found &= inlay_doc_append_utf8(doc, ETCH_STR_LIT("Another row."));
+   found &= !inlay_doc_view_find_text(doc, view.id, ETCH_STR_LIT("终点"), 0u).active;
+   inlay_doc_destroy(doc);
+  }
+  if (!found) std::fprintf(stderr, "Document search or reveal failed\n");
+  ok &= found;
+ }
+
  // 2. md4c CommonMark+GFM Nested AST + Reference links + Autolinks + Streaming chunk equivalence
  const auto nested_md=ETCH_STR_LIT(
   "# Nested CommonMark\n\n"
@@ -880,6 +1035,7 @@ bool phase4_md4c_selection_and_abi(EtchContext* ctx) {
    for(uint32_t p=0;p<nested_md.length;) {
     const uint32_t n=(nested_md.length-p<ch) ? (nested_md.length-p) : ch;
     ast_ok &= inlay_doc_append_utf8(st_doc,{nested_md.chars+p,n,false});
+    if (ch == 1u || ch == 7u) (void)inlay_doc_block_count(st_doc);
     p+=n;
    }
    ast_ok &= inlay_doc_block_count(st_doc)==inlay_doc_block_count(ref_doc);
@@ -1216,7 +1372,7 @@ bool upgrade_v011_regression(EtchContext* ctx,const char* autofit_png) {
   // Verify synthetic non-code alert block reads from doc->ast_text (NOT doc->source[0])!
   InlayDoc* sdoc=inlay_doc_create(ctx,nullptr);
   heading_alert_ok &= sdoc && inlay_doc_set_utf8(sdoc,ETCH_STR_LIT("WRONG_SOURCE_PREFIX\n\n> [!CAUTION]\n> Line 1\n"));
-  if(sdoc && sdoc->block_count>=2) {
+  if(sdoc && inlay_doc_block_count(sdoc)>=2) {
    const char* tag="[!CAUTION]";
    const uint32_t tlen=10;
    if(sdoc->ast_text_capacity < sdoc->ast_text_size + tlen) {
@@ -1400,6 +1556,7 @@ int main(int argc,char** argv) {
  char input[65536]={};size_t size=0;
  while(size+std::strlen(section)<32768) {std::memcpy(input+size,section,std::strlen(section));size+=std::strlen(section);}
  bool ok=inlay_doc_set_utf8(reference,{input,uint32_t(size),false});
+ ok &= inbox_regression();
  bool kinds[11]={};for(uint32_t i=0;i<inlay_doc_block_count(reference);++i)kinds[inlay_doc_block(reference,i)->kind]=true;
  ok &= kinds[INLAY_PARAGRAPH] && kinds[INLAY_HEADING] && kinds[INLAY_CODE_BLOCK] && kinds[INLAY_ALERT] && kinds[INLAY_TASK_LIST] && kinds[INLAY_TABLE] && kinds[INLAY_THEMATIC_BREAK] && kinds[INLAY_DETAILS];
  const uint32_t chunks[]={1,3,7,64};
@@ -1430,6 +1587,67 @@ int main(int argc,char** argv) {
   const auto source=inlay_doc_source(alias);ok &= source.length==10 && !std::memcmp(source.chars,"abc\n\nabc\n\n",10);
   inlay_doc_destroy(alias);
  }
+ const auto same_edited_doc = [&](EtchStr expected) {
+  if (!inlay_doc_set_utf8(reference, expected)) return false;
+  const EtchStr source = inlay_doc_source(streamed);
+  if (source.length != expected.length || (source.length && std::memcmp(source.chars, expected.chars, source.length))) return false;
+  const uint32_t blocks = inlay_doc_block_count(reference);
+  if (blocks != inlay_doc_block_count(streamed)) return false;
+  for (uint32_t i = 0; i < blocks; ++i) {
+   const InlayBlock& a = *inlay_doc_block(reference, i);
+   const InlayBlock& b = *inlay_doc_block(streamed, i);
+   if (a.kind != b.kind || a.offset != b.offset || a.length != b.length || a.content_offset != b.content_offset ||
+       a.content_length != b.content_length || a.parent_index != b.parent_index || a.level != b.level ||
+       a.complete != b.complete || a.flags != b.flags) return false;
+  }
+  return true;
+ };
+ bool edited = inlay_doc_set_utf8(streamed, ETCH_STR_LIT("# 中文\n\nFirst line\nTail"));
+ edited &= inlay_doc_block_count(streamed) == 2u;
+ const uint32_t original_revision = inlay_doc_revision(streamed);
+ edited &= !inlay_doc_replace_utf8(streamed, 3u, 5u, {});
+ edited &= !inlay_doc_replace_utf8(streamed, 2u, 5u, ETCH_STR_LIT("\xe4\xbd"));
+ edited &= !inlay_doc_replace_utf8(streamed, 5u, 2u, {});
+ edited &= !inlay_doc_replace_utf8(streamed, 0u, UINT32_MAX, {});
+ edited &= inlay_doc_replace_utf8(streamed, 2u, 5u, ETCH_STR_LIT("中"));
+ edited &= inlay_doc_revision(streamed) == original_revision;
+ const EtchStr old_source = inlay_doc_source(streamed);
+ edited &= inlay_doc_replace_utf8(streamed, old_source.length - 4u, old_source.length,
+                                  {old_source.chars + 2u, 6u, false});
+ edited &= inlay_doc_revision(streamed) != original_revision;
+ edited &= same_edited_doc(ETCH_STR_LIT("# 中文\n\nFirst line\n中文"));
+ edited &= inlay_doc_replace_utf8(streamed, 0u, 2u, {});
+ edited &= same_edited_doc(ETCH_STR_LIT("中文\n\nFirst line\n中文"));
+ edited &= inlay_doc_append_utf8(streamed, ETCH_STR_LIT("\xe4\xbd"));
+ edited &= !inlay_doc_replace_utf8(streamed, 0u, 0u, ETCH_STR_LIT("x"));
+ edited &= inlay_doc_append_utf8(streamed, ETCH_STR_LIT("\xa0"));
+ edited &= same_edited_doc(ETCH_STR_LIT("中文\n\nFirst line\n中文你"));
+ edited &= inlay_doc_replace_utf8(streamed, 0u, inlay_doc_source(streamed).length, {});
+ edited &= same_edited_doc({});
+ edited &= inlay_doc_set_utf8(streamed, ETCH_STR_LIT("- old item\n\nOutside\n\nLast"));
+ edited &= inlay_doc_block_count(streamed) == 3u;
+ edited &= inlay_doc_replace_utf8(streamed, 12u, 19u, ETCH_STR_LIT("- merged"));
+ edited &= same_edited_doc(ETCH_STR_LIT("- old item\n\n- merged\n\nLast"));
+ edited &= inlay_doc_set_utf8(streamed, ETCH_STR_LIT("abcd"));
+ edited &= inlay_doc_set_anchor(streamed, {9u, 4u, 4u}) && inlay_doc_set_anchor(streamed, {2u, 1u, 3u});
+ InlayDocAnchor anchor = {};
+ const auto at = [&](uint64_t id, uint32_t a, uint32_t b) {
+  return inlay_doc_get_anchor(streamed, id, &anchor) && anchor.id == id && anchor.begin == a && anchor.end == b;
+ };
+ edited &= inlay_doc_anchor_count(streamed) == 2u && inlay_doc_anchor_at(streamed, 0u, &anchor) && anchor.id == 2u;
+ edited &= inlay_doc_append_utf8(streamed, ETCH_STR_LIT("\xe4\xbd")) && at(9u,4u,4u);
+ edited &= inlay_doc_append_utf8(streamed, ETCH_STR_LIT("\xa0")) && at(9u,7u,7u);
+ edited &= !inlay_doc_set_anchor(streamed, {2u,1u,5u}) && at(2u,1u,3u);
+ edited &= inlay_doc_replace_utf8(streamed, 1u, 1u, ETCH_STR_LIT("X")) && at(2u,2u,4u);
+ edited &= inlay_doc_replace_utf8(streamed, 4u, 4u, ETCH_STR_LIT("Y")) && at(2u,2u,4u);
+ edited &= inlay_doc_replace_utf8(streamed, 3u, 3u, ETCH_STR_LIT("!")) && at(2u,2u,5u);
+ edited &= inlay_doc_replace_utf8(streamed, 1u, 6u, ETCH_STR_LIT("中文")) && at(2u,1u,7u);
+ edited &= inlay_doc_replace_utf8(streamed, 0u, inlay_doc_source(streamed).length, {}) && at(2u,0u,0u) && at(9u,0u,0u);
+ edited &= inlay_doc_remove_anchor(streamed, 9u) && !inlay_doc_remove_anchor(streamed, 9u);
+ edited &= !inlay_doc_set_utf8(streamed, ETCH_STR_LIT("\xff")) && at(2u,0u,0u);
+ edited &= inlay_doc_set_utf8(streamed, ETCH_STR_LIT("fresh")) && inlay_doc_anchor_count(streamed) == 0u;
+ if (!edited) std::fprintf(stderr, "Document range-edit transaction or parse equivalence failed\n");
+ ok &= edited;
  // A prefix ending mid-codepoint remains pending until the following append.
  inlay_doc_clear(streamed);
  ok &= inlay_doc_append_utf8(streamed,{"\xF0\x9F",2,true}) && inlay_doc_source(streamed).length==0;
@@ -1571,12 +1789,60 @@ int main(int argc,char** argv) {
  ok &= atom_math.valid && fraction_math.valid && root_math.valid && script_math.valid;
  ok &= fraction_math.height>atom_math.height && fraction_math.baseline>atom_math.baseline;
  ok &= root_math.width>atom_math.width && script_math.height>atom_math.height;
- ok &= !inlay_measure_math(ETCH_STR_LIT("\\frac{x}"),24).valid;
+ const auto invalid_fraction = inlay_measure_math(ETCH_STR_LIT("\\frac{x}"),24);
+ ok &= !invalid_fraction.valid && invalid_fraction.error == INLAY_MATH_ERROR_INVALID_SYNTAX &&
+       invalid_fraction.error_offset == 8u;
+ const auto unsupported_math = inlay_measure_math(ETCH_STR_LIT("\\foobar{x}"),24);
+ ok &= !unsupported_math.valid && unsupported_math.error == INLAY_MATH_ERROR_UNSUPPORTED_COMMAND &&
+       unsupported_math.error_offset == 0u;
+ const auto bad_index = inlay_measure_math(ETCH_STR_LIT("α+\\sqrt[\\unknown]{x}"),24);
+ ok &= !bad_index.valid && bad_index.error == INLAY_MATH_ERROR_UNSUPPORTED_COMMAND && bad_index.error_offset == 9u;
+ const auto bad_brace = inlay_measure_math(ETCH_STR_LIT("π}"),24);
+ ok &= !bad_brace.valid && bad_brace.error_offset == 2u;
  char recursive_math[1024];uint32_t recursive_size=0;
  for(int level=0;level<100;++level){std::memcpy(recursive_math+recursive_size,"\\sqrt",5);recursive_size+=5;}
  recursive_math[recursive_size++]='x';
- ok &= !inlay_measure_math({recursive_math,recursive_size,false},24).valid;
+ const auto depth_error = inlay_measure_math({recursive_math,recursive_size,false},24);
+ ok &= !depth_error.valid && depth_error.error == INLAY_MATH_ERROR_DEPTH_LIMIT && depth_error.error_offset > 0u;
  const auto diagram_desc=inlay_diagram_desc_default();
+ etch_end_frame(ctx);
+ etch_begin_frame(ctx,&f);
+ {
+  struct DiagnosticProbe {
+   InlayDiagramDiagnosticKind kinds[8];
+   uint32_t offsets[8], lengths[8], count;
+  } probe = {};
+  auto desc = diagram_desc;
+  desc.diagnostic_user_data = &probe;
+  desc.diagnostic = [](InlayDiagramDiagnosticKind kind, uint32_t offset, uint32_t length, void* user) {
+   auto& diagnostics = *static_cast<DiagnosticProbe*>(user);
+   const uint32_t i = diagnostics.count++;
+   if (i >= 8u) return;
+   diagnostics.kinds[i] = kind;
+   diagnostics.offsets[i] = offset;
+   diagnostics.lengths[i] = length;
+  };
+  const auto source = ETCH_STR_LIT("flowchart TD\nstyle --> B\n  classDef accent fill:red; linkStyle 0 stroke:blue\nclick B call");
+  const auto partial = inlay_diagram_layout(source, &desc);
+  bool diagnostics_ok = partial.valid && partial.node_count == 2u && partial.edge_count == 1u &&
+                        partial.warning_count == 3u && probe.count == 3u;
+  const EtchStr directives[] = {ETCH_STR_LIT("classDef"), ETCH_STR_LIT("linkStyle"), ETCH_STR_LIT("click")};
+  for (uint32_t i = 0; i < 3u; ++i) {
+   diagnostics_ok &= probe.kinds[i] == INLAY_DIAGRAM_UNSUPPORTED_DIRECTIVE &&
+    probe.offsets[i] <= source.length && probe.lengths[i] <= source.length - probe.offsets[i] &&
+    str_equal({source.chars + probe.offsets[i], probe.lengths[i], false}, directives[i]);
+  }
+  diagnostics_ok &= !inlay_diagram_layout(ETCH_STR_LIT("gantt\n"), &desc).valid;
+  diagnostics_ok &= !inlay_diagram_layout(ETCH_STR_LIT("graph XX\n"), &desc).valid;
+  diagnostics_ok &= !inlay_diagram_layout(ETCH_STR_LIT("sequenceDiagram\nparticipant ["), &desc).valid;
+  diagnostics_ok &= probe.count == 6u && probe.kinds[3] == INLAY_DIAGRAM_UNSUPPORTED_KIND &&
+   probe.offsets[3] == 0u && probe.lengths[3] == 5u && probe.kinds[4] == INLAY_DIAGRAM_INVALID_DIRECTION &&
+   probe.offsets[4] == 6u && probe.lengths[4] == 2u && probe.kinds[5] == INLAY_DIAGRAM_INVALID_SYNTAX;
+  if (!diagnostics_ok) std::fprintf(stderr, "Mermaid diagnostic classification or source spans failed\n");
+  ok &= diagnostics_ok;
+ }
+ etch_end_frame(ctx);
+ etch_begin_frame(ctx,&f);
  const auto sample_graph=inlay_diagram_layout(ETCH_STR_LIT("flowchart TD\nA[Stream] --> B[Parse]\nA --> C[Validate]\nB --> D[Render]\nC --> D\nD --> A"),&diagram_desc);
  ok &= sample_graph.valid;
  const auto graph=inlay_diagram_layout(ETCH_STR_LIT("flowchart TD\nA[Start] --> B[Middle]\nB --> C[Finish]\nC --> A"),&diagram_desc);

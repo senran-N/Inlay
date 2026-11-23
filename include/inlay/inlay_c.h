@@ -10,7 +10,7 @@
 #define INLAY_STRING_DETAIL(x) #x
 #define INLAY_STRING(x) INLAY_STRING_DETAIL(x)
 #define INLAY_VERSION_STRING INLAY_STRING(INLAY_VERSION_MAJOR) "." INLAY_STRING(INLAY_VERSION_MINOR) "." INLAY_STRING(INLAY_VERSION_PATCH)
-#define INLAY_ABI_VERSION 1u
+#define INLAY_ABI_VERSION 2u
 #ifndef INLAY_API
 #if defined(_WIN32) || defined(__CYGWIN__)
 #if defined(INLAY_SHARED)
@@ -62,7 +62,7 @@ typedef struct InlayBlock {
  uint32_t offset, length, content_offset, content_length, level;
  uint32_t language_offset, language_length;
  bool complete;
- int32_t parent_index;       /* -1 for top-level blocks, or flat index of parent AST container */
+ int32_t parent_index;       /* -1 for top-level blocks, or parent AST index for the current parse */
  uint16_t depth;             /* total container nesting depth (0 = top-level) */
  uint16_t quote_depth;       /* enclosing blockquote/alert nesting depth */
  uint16_t list_depth;        /* enclosing list nesting depth (0 = not inside a list) */
@@ -78,7 +78,8 @@ typedef struct InlayDocConfig {
 typedef enum InlayInlineKind {
  INLAY_INLINE_TEXT=0,
  INLAY_INLINE_CODE=1,
- INLAY_INLINE_LINK=2
+ INLAY_INLINE_LINK=2,
+ INLAY_INLINE_IMAGE=3
 } InlayInlineKind;
 /* Called for code and links. Return true to apply edits. Replacement text must
    live through the view call and any use of clicked_link. url is empty for
@@ -158,6 +159,7 @@ typedef struct InlayDocViewDesc {
  bool show_code_line_numbers;
  InlayCodeHeaderFn diagram_header_fn;
  void* diagram_header_user_data;
+ uint32_t image_epoch; /* Bump to reflow image sizes after async texture loads complete. */
 } InlayDocViewDesc;
 typedef struct InlayDocResult {
  EtchStr clicked_link;
@@ -181,10 +183,28 @@ typedef struct InlayMathDesc {
  float font_size_px;
  EtchColor color;
 } InlayMathDesc;
-typedef struct InlayMathResult {float width,height,baseline;bool valid;} InlayMathResult;
+typedef enum InlayMathError {
+ INLAY_MATH_ERROR_NONE = 0,
+ INLAY_MATH_ERROR_INVALID_SYNTAX = 1,
+ INLAY_MATH_ERROR_UNSUPPORTED_COMMAND = 2,
+ INLAY_MATH_ERROR_DEPTH_LIMIT = 3
+} InlayMathError;
+typedef struct InlayMathResult {
+ float width,height,baseline;
+ bool valid;
+ uint32_t error_offset; /* Zero-based UTF-8 byte position. May equal source length at EOF. */
+ InlayMathError error;
+} InlayMathResult;
 INLAY_API InlayMathDesc inlay_math_desc_default(void);
 INLAY_API InlayMathResult inlay_draw_math(EtchStr tex,const InlayMathDesc* desc);
 INLAY_API InlayMathResult inlay_measure_math(EtchStr tex,float font_size_px);
+typedef enum InlayDiagramDiagnosticKind {
+ INLAY_DIAGRAM_UNSUPPORTED_DIRECTIVE, INLAY_DIAGRAM_UNSUPPORTED_KIND,
+ INLAY_DIAGRAM_INVALID_DIRECTION, INLAY_DIAGRAM_INVALID_SYNTAX
+} InlayDiagramDiagnosticKind;
+/* Synchronous during parsing. Ranges are in source UTF-8 bytes and may be
+   empty at EOF. The callback must not reenter rendering. */
+typedef void (*InlayDiagramDiagnosticFn)(InlayDiagramDiagnosticKind,uint32_t byte_offset,uint32_t byte_length,void* user_data);
 typedef struct InlayDiagramDesc {
  uint32_t struct_size;
  EtchVec2 pos;
@@ -196,6 +216,8 @@ typedef struct InlayDiagramDesc {
  bool has_custom_fonts;   /* When true, uses font_id / bold_font_id instead of defaults. */
  uint16_t font_id;
  uint16_t bold_font_id;
+ InlayDiagramDiagnosticFn diagnostic;
+ void* diagnostic_user_data;
 } InlayDiagramDesc;
 typedef struct InlayDiagramNode {EtchStr id,label;EtchRect bounds;uint32_t rank;} InlayDiagramNode;
 typedef struct InlayDiagramEdge {uint32_t from,to;bool reversed,dashed;EtchStr label;} InlayDiagramEdge;
@@ -209,6 +231,7 @@ typedef struct InlayDiagramResult {
  float scale;          /* 1.0f unscaled, < 1.0f natively auto-fitted. */
  float natural_width;  /* Unscaled layout width before auto-fit. */
  float natural_height; /* Unscaled layout height before auto-fit. */
+ uint32_t warning_count; /* Unsupported directives skipped during parsing. */
 } InlayDiagramResult;
 INLAY_API InlayDiagramDesc inlay_diagram_desc_default(void);
 INLAY_API InlayDiagramResult inlay_diagram_layout(EtchStr source,const InlayDiagramDesc* desc);
@@ -221,6 +244,30 @@ INLAY_API void inlay_doc_destroy(InlayDoc*);
 INLAY_API void inlay_doc_clear(InlayDoc*);
 INLAY_API bool inlay_doc_set_utf8(InlayDoc*,EtchStr);
 INLAY_API bool inlay_doc_append_utf8(InlayDoc*,EtchStr);
+/* Replace [begin, end) in the current source. Offsets and replacement text
+   must be complete UTF-8. A range edit requires an empty stream carry and
+   invalidates rendered text offsets and selections. */
+INLAY_API bool inlay_doc_replace_utf8(InlayDoc*,uint32_t begin,uint32_t end,EtchStr);
+/* Compare for equality to check whether the current document has changed. */
+INLAY_API uint32_t inlay_doc_revision(const InlayDoc*);
+/* Host-defined annotation IDs are nonzero and local to a document. Ranges are
+   half-open UTF-8 source bytes. Inserts on either edge stay outside a range.
+   A point follows an insertion at its position. A replacement overlapping a
+   range becomes part of it. A successful set_utf8 or clear removes all anchors. */
+typedef struct InlayDocAnchor { uint64_t id; uint32_t begin,end; } InlayDocAnchor;
+INLAY_API bool inlay_doc_set_anchor(InlayDoc*,InlayDocAnchor anchor);
+INLAY_API bool inlay_doc_get_anchor(const InlayDoc*,uint64_t id,InlayDocAnchor* out);
+INLAY_API bool inlay_doc_remove_anchor(InlayDoc*,uint64_t id);
+/* Enumerate in ID order for persistence alongside the matching source. */
+INLAY_API uint32_t inlay_doc_anchor_count(const InlayDoc*);
+INLAY_API bool inlay_doc_anchor_at(const InlayDoc*,uint32_t index,InlayDocAnchor* out);
+typedef enum InlayDocStreamStatus {
+ INLAY_DOC_STREAM_INVALID, INLAY_DOC_STREAM_READY, INLAY_DOC_STREAM_PARTIAL_UTF8,
+ INLAY_DOC_STREAM_OPEN_FENCE
+} InlayDocStreamStatus;
+/* End-of-stream check. The returned status leaves the document available for
+   display or further appends. An open fence is valid CommonMark at EOF. */
+INLAY_API InlayDocStreamStatus inlay_doc_stream_status(const InlayDoc*);
 INLAY_API uint32_t inlay_doc_block_count(const InlayDoc*);
 INLAY_API const InlayBlock* inlay_doc_block(const InlayDoc*,uint32_t index);
 INLAY_API EtchStr inlay_doc_source(const InlayDoc*);
@@ -231,6 +278,11 @@ INLAY_API float inlay_doc_measure_height(InlayDoc*,uint32_t view_id,float width_
 INLAY_API bool inlay_doc_view_is_at_bottom(uint32_t view_id);
 INLAY_API void inlay_doc_view_scroll_to_bottom(uint32_t view_id,bool stop_momentum);
 INLAY_API InlayDocSelection inlay_doc_view_selection(const InlayDoc* doc,uint32_t view_id);
+/* Search the current rendered view's plain text, starting at a byte offset.
+   Returns an inactive selection when the view is stale or there is no match. */
+INLAY_API InlayDocSelection inlay_doc_view_find_text(const InlayDoc*,uint32_t view_id,EtchStr query,uint32_t from_byte);
+/* Queue a reveal of a plain-text byte offset in a fixed-height document view. */
+INLAY_API bool inlay_doc_view_reveal_text(InlayDoc*,uint32_t view_id,uint32_t byte_offset,EtchAlignY align);
 INLAY_API void inlay_doc_view_set_selection(InlayDoc* doc,uint32_t view_id,uint32_t anchor,uint32_t focus);
 INLAY_API void inlay_doc_view_select_all(InlayDoc* doc,uint32_t view_id);
 INLAY_API void inlay_doc_view_clear_selection(InlayDoc* doc,uint32_t view_id);
@@ -255,7 +307,7 @@ typedef enum InlayUiKind {
  INLAY_UI_MATH, INLAY_UI_DIAGRAM, INLAY_UI_SLOT,
  INLAY_UI_DOC, INLAY_UI_TERMINAL, INLAY_UI_VIRTUAL_LIST, INLAY_UI_TABLE,
  INLAY_UI_TREE, INLAY_UI_TREE_ITEM, INLAY_UI_MENU, INLAY_UI_CONTEXT_MENU,
- INLAY_UI_AVATAR, INLAY_UI_TOAST, INLAY_UI_ACCORDION, INLAY_UI_SKELETON
+ INLAY_UI_AVATAR, INLAY_UI_TOAST, INLAY_UI_ACCORDION, INLAY_UI_SKELETON, INLAY_UI_CODE_EDITOR
 } InlayUiKind;
 typedef struct InlayUiNode {InlayUiKind kind;uint32_t id,first_child,next_sibling;EtchStr text;} InlayUiNode;
 typedef struct InlaySurfaceViewDesc {
@@ -264,10 +316,26 @@ typedef struct InlaySurfaceViewDesc {
  float width_px,height_px; /* <= 0 grows to fill parent container (etch_sizing_grow). */
 } InlaySurfaceViewDesc;
 /* last_reload_ms measures engine reload; total includes filesystem read latency. */
-typedef struct InlaySurfaceStats {uint64_t js_ticks,reloads;uint32_t node_count;double last_tick_ms,last_reload_ms,last_reload_total_ms;bool has_error;} InlaySurfaceStats;
+typedef struct InlaySurfaceStats {
+ uint64_t js_ticks,reloads;
+ uint32_t node_count;
+ double last_tick_ms,last_reload_ms,last_reload_total_ms;
+ bool has_error;
+ uint32_t cached_documents;
+ uint64_t document_cache_misses;
+} InlaySurfaceStats;
 /* Callbacks may set state, but must not destroy or recursively dispatch the surface.
    The host calls poll_hmr periodically while idle; timers advance when view is built. */
 typedef void (*InlayActionFn)(InlaySurface*,EtchStr payload_json,void* user_data);
+typedef enum InlayAsyncActionKind {
+ INLAY_ASYNC_ACTION_NONE, INLAY_ASYNC_ACTION_START, INLAY_ASYNC_ACTION_CANCEL
+} InlayAsyncActionKind;
+typedef struct InlayAsyncActionEvent {
+ uint32_t struct_size;
+ InlayAsyncActionKind kind;
+ uint32_t request_id;
+ EtchStr name, payload_json;
+} InlayAsyncActionEvent;
 /* Host-bound native content bridge mounted inside declarative ui.slot() nodes.
    Invoked during inlay_surface_view inside the slot's Etch layout box. Must not
    destroy or recursively dispatch the surface. */
@@ -280,7 +348,24 @@ INLAY_API bool inlay_surface_set_script(InlaySurface*,EtchStr script);
 INLAY_API bool inlay_surface_set_state_json(InlaySurface*,EtchStr json);
 INLAY_API EtchStr inlay_surface_state_json(const InlaySurface*);
 INLAY_API bool inlay_surface_bind_action(InlaySurface*,EtchStr name,InlayActionFn,void* user_data);
+/* Exposes a host-approved name to request(name, payload) in script. */
+INLAY_API bool inlay_surface_allow_async_action(InlaySurface*,EtchStr name);
+/* Poll on the owner thread after script updates. Copy the borrowed start event
+   slices before starting a worker. A cancel event carries only its request_id. */
+INLAY_API InlayAsyncActionEvent inlay_surface_poll_async_action(InlaySurface*);
+/* Complete on the owner thread. A stale ID or invalid JSON returns false. */
+INLAY_API bool inlay_surface_complete_async_action(InlaySurface*,uint32_t request_id,bool success,EtchStr result_json);
+/* Close permanently and drain pending cancel events before destroying the surface. */
+INLAY_API void inlay_surface_close_async_actions(InlaySurface*);
 INLAY_API bool inlay_surface_bind_slot(InlaySurface*,EtchStr name,InlaySlotRenderFn,void* user_data);
+/* ui.doc({document: name}) borrows a document from the same Etch context.
+   Pass NULL to unbind. Unbind before destroying a document on a live surface. */
+INLAY_API bool inlay_surface_bind_document(InlaySurface*,EtchStr name,InlayDoc*);
+/* Borrow a host-owned Etch editor buffer. Pass NULL to unbind, then finish a frame
+   without the editor before freeing the buffer, so its native selection and accessibility snapshots expire.
+   The buffer retains text and undo history across script and view rebuilds. */
+INLAY_API bool inlay_surface_bind_text_buffer(InlaySurface*,EtchStr name,EtchTextBuffer*);
+INLAY_API bool inlay_surface_set_image_resolver(InlaySurface*,InlayImageResolverFn,void* user_data);
 INLAY_API bool inlay_surface_dispatch(InlaySurface*,EtchStr name,EtchStr payload_json);
 INLAY_API bool inlay_surface_enable_hmr(InlaySurface*,const char* script_path);
 INLAY_API bool inlay_surface_poll_hmr(InlaySurface*);
@@ -293,6 +378,37 @@ INLAY_API InlaySurfaceStats inlay_surface_stats(const InlaySurface*);
 INLAY_API EtchStr inlay_surface_error(const InlaySurface*);
 /* Native nodes/text survive until the next script/state/event evaluation. */
 INLAY_API const InlayUiNode* inlay_surface_nodes(const InlaySurface*,uint32_t* count);
+
+typedef struct InlayInbox InlayInbox;
+typedef struct InlayInboxDesc {
+ uint32_t struct_size;
+ uint32_t max_messages, max_bytes;
+ uint32_t wake_event_type; /* Host-registered SDL user event, or 0 for polling. */
+} InlayInboxDesc;
+typedef struct InlayInboxMessage {
+ uint32_t struct_size;
+ uint32_t kind, id, payload_size;
+} InlayInboxMessage;
+typedef enum InlayInboxStatus {
+ INLAY_INBOX_OK, INLAY_INBOX_EMPTY, INLAY_INBOX_FULL, INLAY_INBOX_CLOSED,
+ INLAY_INBOX_BUFFER_TOO_SMALL, INLAY_INBOX_INVALID, INLAY_INBOX_NO_MEMORY
+} InlayInboxStatus;
+INLAY_API InlayInboxDesc inlay_inbox_desc_default(void);
+INLAY_API InlayInbox* inlay_inbox_create(const InlayInboxDesc*);
+/* Thread-safe. A successful post copies the bytes. An empty-to-nonempty
+   transition pushes the configured event, which carries no inbox pointer.
+   Event delivery depends on the host's SDL event queue and filters. */
+INLAY_API InlayInboxStatus inlay_inbox_post(InlayInbox*,uint32_t kind,uint32_t id,const void* payload,uint32_t size);
+/* Single consumer. BUFFER_TOO_SMALL returns the required size in the message
+   header and leaves the front message queued. */
+INLAY_API InlayInboxStatus inlay_inbox_take(InlayInbox*,InlayInboxMessage*,void* payload,uint32_t capacity);
+/* If the consumer stops at a frame budget, poll this before sleeping. */
+INLAY_API uint32_t inlay_inbox_pending(InlayInbox*);
+/* Close rejects new posts. The consumer can still drain queued messages.
+   Join producers and stop the consumer before destroying the inbox. */
+INLAY_API void inlay_inbox_close(InlayInbox*);
+INLAY_API void inlay_inbox_destroy(InlayInbox*);
+
 /* Windowless portal. Backends own returned pixel spans until the next callback;
    all callbacks run synchronously on the host UI thread. Context outlives portal.
    Backend callbacks must not destroy or reenter the portal. */

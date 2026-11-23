@@ -1,5 +1,29 @@
 # Changelog
 
+## [Unreleased]
+
+- Add JSX error boundaries with panel-local fallback rendering, cleanup and retry.
+- Add keyed component memoization with nested hook invalidation and effect cleanup.
+- Expose a native JSX code editor backed by a named, host-owned Etch text buffer.
+- Track source annotations through range edits and stream appends, and expose
+  their stable IDs and byte ranges for host persistence.
+- Grow Markdown block storage when the parser emits a block. Long runs of blank
+  lines and multiline fenced code no longer reserve one block per source line.
+- Retain active keyed Markdown documents across surface views, retire surplus
+  caches when the tree shrinks and expose cache occupancy and miss counts.
+- Advance the C ABI to version 2 for expanded by-value results and surface statistics.
+- Add cancellable host actions and a bounded worker-to-owner message inbox.
+- Bind host documents directly to JSX and add transactional UTF-8 range edits,
+  document revisions, stream status, rendered text search and match reveal.
+- Preserve the last interactive view when an HMR candidate fails source
+  loading, JSX translation or compilation.
+- Expose source positions and diagnostic kinds for unsupported Mermaid
+  directives and parse failures.
+- Return structured TeX error kinds and byte offsets from math measurement and
+  drawing helpers.
+- Support native password semantics, read-only and multiline text inputs, and
+  render the full visible range of dense virtual lists within the surface budget.
+
 ## [0.13.0] - 2026-11-23
 
 - Require Etch 0.28 across `CMakeLists.txt`, installed `InlayConfig.cmake`, and downstream consumer checks.

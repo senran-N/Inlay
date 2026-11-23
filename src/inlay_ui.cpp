@@ -17,7 +17,8 @@ constexpr uint32_t kHardMaxTextBytes = 4u * 1024u * 1024u;
 constexpr uint32_t kInitTextBytes = 8192u;
 constexpr uint32_t kMaxScriptBytes = 1024u * 1024u;
 constexpr double kHmrViewPollIntervalMs = 80.0;
-constexpr uint32_t kMaxVListWindowItems = 256u;
+constexpr uint32_t kAsyncActionCapacity = 32u;
+constexpr size_t kAsyncPayloadLimit = 65536u;
 
 enum BadgeVariant : uint8_t {
     BadgeDefault   = 0,
@@ -41,7 +42,11 @@ enum CoreExtraFlags : uint16_t {
     CefBadgeDot            = 1u << 5,
     CefSwitchHasTrackW     = 1u << 6,
     CefSwitchHasTrackH     = 1u << 7,
-    CefProgressHasThick    = 1u << 8
+    CefProgressHasThick    = 1u << 8,
+    CefInputPassword       = 1u << 9,
+    CefInputMultiline      = 1u << 10,
+    CefInputReadOnly       = 1u << 11,
+    CefInputWordWrap       = 1u << 12
 };
 
 // Sparse per-node extra spec allocated lazily only for core widgets using extended props.
@@ -53,6 +58,9 @@ struct CoreNodeExtra {
     uint32_t dbl_handler;
     TextSlice rclick_action;
     uint32_t rclick_handler;
+    TextSlice password_text;
+    TextSlice submit_action;
+    uint32_t submit_handler;
     ColorRef color_a;       // Text selection_color OR Switch off_color
     ColorRef color_b;       // Switch thumb_color
     float aux_f0;           // Switch track_width OR Progress ring thickness
@@ -81,6 +89,21 @@ struct HoverTrackEntry {
     uint64_t last_used_frame;
 };
 
+enum class AsyncActionPhase : uint8_t { Empty, Queued, Started, Cancelled };
+
+struct AsyncActionName {
+    char value[64];
+};
+
+struct AsyncActionSlot {
+    JSValue settle[2];
+    char* payload;
+    uint32_t payload_length;
+    uint32_t name_index;
+    uint32_t id;
+    AsyncActionPhase phase;
+};
+
 // Standard-layout wrapper keeping private inlay_ui.cpp state out of inlay_ui_internal.h.
 struct SurfaceStorage {
     InlaySurface pub; // Must remain first member (pointer-interconvertible with InlaySurface*).
@@ -96,6 +119,12 @@ struct SurfaceStorage {
     uint32_t indet_slot_count;
     HoverTrackEntry hover_track[32];
     uint32_t hover_track_count;
+    AsyncActionName* async_action_names;
+    uint32_t async_action_name_count, async_action_name_cap;
+    AsyncActionSlot* async_actions;
+    uint32_t next_async_action;
+    bool async_actions_closed;
+    char* reload_error;
 };
 static_assert(std::is_standard_layout_v<SurfaceStorage>);
 static_assert(offsetof(SurfaceStorage, pub) == 0);
@@ -106,6 +135,39 @@ inline SurfaceStorage* ext(InlaySurface* s) noexcept {
 
 inline const SurfaceStorage* ext(const InlaySurface* s) noexcept {
     return reinterpret_cast<const SurfaceStorage*>(s);
+}
+
+void release_async_action(InlaySurface* s, AsyncActionSlot& slot, bool notify_host) noexcept {
+    JS_FreeValue(s->js, slot.settle[0]);
+    JS_FreeValue(s->js, slot.settle[1]);
+    SDL_free(slot.payload);
+    const uint32_t id = slot.id;
+    const bool notify = notify_host && slot.phase == AsyncActionPhase::Started;
+    slot = {};
+    if (notify) {
+        slot.id = id;
+        slot.phase = AsyncActionPhase::Cancelled;
+    }
+}
+
+void retire_async_actions(InlaySurface* s) noexcept {
+    if (auto* slots = ext(s)->async_actions) {
+        for (uint32_t i = 0u; i < kAsyncActionCapacity; ++i) {
+            auto& slot = slots[i];
+            if (slot.phase == AsyncActionPhase::Queued || slot.phase == AsyncActionPhase::Started) {
+                release_async_action(s, slot, true);
+            }
+        }
+    }
+}
+
+AsyncActionSlot* find_async_action(InlaySurface* s, uint32_t id) noexcept {
+    if (auto* slots = ext(s)->async_actions) {
+        for (uint32_t i = 0u; i < kAsyncActionCapacity; ++i) {
+            if (slots[i].id == id) return &slots[i];
+        }
+    }
+    return nullptr;
 }
 
 inline bool has_event(TextSlice action, uint32_t handler) noexcept {
@@ -132,6 +194,7 @@ CoreNodeExtra* ensure_core_extra(InlaySurface* s, uint32_t node_index) {
     cx = {};
     cx.dbl_handler = INLAY_UI_NONE;
     cx.rclick_handler = INLAY_UI_NONE;
+    cx.submit_handler = INLAY_UI_NONE;
     e->node_extra_idx[node_index] = idx;
     return &cx;
 }
@@ -182,8 +245,26 @@ JSValue parse_json(InlaySurface* s, EtchStr json) {
 
 void record_error(InlaySurface* s, const char* message) {
     if (s->stats.has_error && !std::strcmp(s->error, message)) return;
+    retire_async_actions(s);
     std::snprintf(s->error, sizeof(s->error), "%s", message);
     s->stats.has_error = true;
+    etch_request_redraw(s->etch);
+}
+
+void record_reload_error(InlaySurface* s, const char* message) {
+    if (!s->loaded || s->stats.has_error) {
+        record_error(s, message);
+        return;
+    }
+    auto& previous = ext(s)->reload_error;
+    if (previous && std::strcmp(previous, message) == 0) return;
+    char* copy = SDL_strdup(message);
+    if (!copy) {
+        record_error(s, message);
+        return;
+    }
+    SDL_free(previous);
+    previous = copy;
     etch_request_redraw(s->etch);
 }
 
@@ -1444,6 +1525,22 @@ void parse_clickable_events(InlaySurface* s, JSValueConst props, NodeStyle& st, 
     if (clickable) st.flags |= NfClickable;
 }
 
+bool has_only_class_style(JSContext* js, JSValueConst props) {
+    JSPropertyEnum* names = nullptr;
+    uint32_t count = 0u;
+    if (JS_GetOwnPropertyNames(js, &names, &count, props, JS_GPN_STRING_MASK) < 0) return false;
+    bool only_classes = count <= 6u;
+    for (uint32_t i = 0u; i < count && only_classes; ++i) {
+        const char* name = JS_AtomToCString(js, names[i].atom);
+        only_classes = name && (std::strcmp(name, "axis") == 0 || std::strcmp(name, "cls") == 0 ||
+            std::strcmp(name, "className") == 0 || std::strcmp(name, "id") == 0 ||
+            std::strcmp(name, "key") == 0 || std::strcmp(name, "text") == 0);
+        if (name) JS_FreeCString(js, name);
+    }
+    JS_FreePropertyEnum(js, names, count);
+    return only_classes;
+}
+
 void parse_style(InlaySurface* s, JSValueConst props, InlayUiKind kind,
                  NodeStyle& st, uint32_t node_index, bool default_col_hint) {
     inlay_ui_init_node_style(st);
@@ -1471,6 +1568,7 @@ void parse_style(InlaySurface* s, JSValueConst props, InlayUiKind kind,
         });
     }
     if (JS_HasException(s->js)) return;
+    if ((kind == INLAY_UI_TEXT || kind == INLAY_UI_BOX) && has_only_class_style(s->js, props)) return;
 
     // 2. Shared opacity, transforms, compositing & transitions
     float op = st.opacity;
@@ -1943,9 +2041,38 @@ void parse_style(InlaySurface* s, JSValueConst props, InlayUiKind kind,
             return true;
         });
         parse_clickable_events(s, props, st, node_index);
+    } else if (kind == INLAY_UI_CODE_EDITOR) {
+        inlay_ui_parse_event_prop(s, props, "onChange", &st.action, &st.handler);
+        uint16_t flags = CefNone;
+        if (inlay_ui_bool_prop(s, props, "readOnly")) flags |= CefInputReadOnly;
+        if (inlay_ui_bool_prop(s, props, "wordWrap")) flags |= CefInputWordWrap;
+        if (flags) {
+            if (auto* options = ensure_core_extra(s, node_index)) options->flags |= flags;
+        }
     } else if (kind == INLAY_UI_INPUT) {
         if (!inlay_ui_parse_event_prop(s, props, "onChange", &st.action, &st.handler)) {
             inlay_ui_parse_event_prop(s, props, "action", &st.action, &st.handler);
+        }
+        bool password = inlay_ui_bool_prop(s, props, "password");
+        peek_str_prop(s, props, "type", [&](const char* c, size_t n) noexcept {
+            password |= inlay_ui_str_eq(c, n, "password");
+            return true;
+        });
+        uint16_t flags = password ? CefInputPassword : CefNone;
+        if (inlay_ui_bool_prop(s, props, "multiline") && !password) flags |= CefInputMultiline;
+        if (inlay_ui_bool_prop(s, props, "readOnly")) flags |= CefInputReadOnly;
+        if (inlay_ui_bool_prop(s, props, "wordWrap")) flags |= CefInputWordWrap;
+        TextSlice submit_action = {};
+        uint32_t submit_handler = INLAY_UI_NONE;
+        if (!JS_HasException(s->js)) {
+            inlay_ui_parse_event_prop(s, props, "onSubmit", &submit_action, &submit_handler);
+        }
+        if (flags || has_event(submit_action, submit_handler)) {
+            if (auto* cx = ensure_core_extra(s, node_index)) {
+                cx->flags |= flags;
+                cx->submit_action = submit_action;
+                cx->submit_handler = submit_handler;
+            }
         }
     } else if (kind == INLAY_UI_TOGGLE || kind == INLAY_UI_CHECKBOX) {
         if (inlay_ui_bool_prop(s, props, "checked")) st.flags |= NfChecked;
@@ -2141,6 +2268,7 @@ bool parse_tag_kind(const char* chars, size_t len, InlayUiKind* out, bool* out_d
     if (inlay_ui_str_eq(chars, len, "text")) { *out = INLAY_UI_TEXT; return true; }
     if (inlay_ui_str_eq(chars, len, "button")) { *out = INLAY_UI_BUTTON; return true; }
     if (inlay_ui_str_eq(chars, len, "input")) { *out = INLAY_UI_INPUT; return true; }
+    if (inlay_ui_str_eq(chars, len, "codeEditor")) { *out = INLAY_UI_CODE_EDITOR; return true; }
     if (inlay_ui_str_eq(chars, len, "toggle") || inlay_ui_str_eq(chars, len, "switch")) {
         *out = INLAY_UI_TOGGLE; return true;
     }
@@ -2387,6 +2515,11 @@ uint32_t build_node(InlaySurface* s, JSValueConst value, uint32_t depth, uint32_
             JS_FreeValue(s->js, props);
             return INLAY_UI_NONE;
         }
+    } else if (kind == INLAY_UI_CODE_EDITOR) {
+        s->nodes[index].text = inlay_ui_string_prop(s, props, "buffer");
+        if (!s->nodes[index].text.length && !JS_HasException(s->js)) {
+            JS_ThrowTypeError(s->js, "CodeEditor requires a buffer name");
+        }
     } else if (kind == INLAY_UI_INPUT) {
         s->nodes[index].text = inlay_ui_string_prop(s, props, "value");
         const TextSlice ph = inlay_ui_string_slice_prop(s, props, "placeholder");
@@ -2471,7 +2604,6 @@ uint32_t build_node(InlaySurface* s, JSValueConst value, uint32_t depth, uint32_
                     first = (first < total) ? first : (total > 48u ? total - 48u : 0u);
                     end = (first + 48u < total) ? (first + 48u) : total;
                 }
-                if (end - first > kMaxVListWindowItems) end = first + kMaxVListWindowItems;
                 s->vlist_specs[ext_idx].window_start = first;
 
                 uint32_t previous = INLAY_UI_NONE;
@@ -2538,6 +2670,18 @@ uint32_t build_node(InlaySurface* s, JSValueConst value, uint32_t depth, uint32_
         }
         JS_FreeValue(s->js, children);
     }
+    if (kind == INLAY_UI_DOC && s->styles[index].ext_idx != INLAY_UI_NONE) {
+        const EtchStr text = s->nodes[index].text;
+        auto& spec = s->doc_specs[s->styles[index].ext_idx];
+        if (!spec.document_name.len) spec.content_hash = inlay_fnv1a_64(text.chars, text.length);
+    } else if (kind == INLAY_UI_INPUT) {
+        const auto* input = get_core_extra(s, index);
+        auto& text = s->nodes[index].text;
+        if (input && (input->flags & CefInputPassword) && text.length) {
+            ensure_core_extra(s, index)->password_text = {static_cast<uint32_t>(text.chars - s->text), text.length};
+            text = {};
+        }
+    }
     return index;
 }
 
@@ -2569,6 +2713,109 @@ JSValue js_action(JSContext* js, JSValueConst, int argc, JSValueConst* argv) {
     if (payload) JS_FreeCString(js, payload);
     JS_FreeValue(js, json);
     return JS_HasException(js) ? JS_EXCEPTION : JS_UNDEFINED;
+}
+
+JSValue settle_async_action(InlaySurface* s, AsyncActionSlot& slot, JSValueConst result,
+                           bool success, bool notify_host) {
+    JSValue function = JS_DupValue(s->js, slot.settle[success ? 0 : 1]);
+    release_async_action(s, slot, notify_host);
+    JSValue completed = JS_Call(s->js, function, JS_UNDEFINED, 1, &result);
+    JS_FreeValue(s->js, function);
+    return completed;
+}
+
+JSValue js_cancel_async_action(JSContext* js, JSValueConst, int, JSValueConst*, int, JSValueConst* data) {
+    auto* s = static_cast<InlaySurface*>(JS_GetContextOpaque(js));
+    uint32_t id = 0u;
+    if (JS_ToUint32(js, &id, data[0]) < 0) return JS_EXCEPTION;
+    auto* slot = find_async_action(s, id);
+    if (!slot || slot->phase == AsyncActionPhase::Cancelled) return JS_NewBool(js, false);
+    const JSValue error = JS_NewError(js);
+    if (JS_IsException(error)) return error;
+    if (JS_SetPropertyStr(js, error, "name", JS_NewString(js, "AbortError")) < 0 ||
+        JS_SetPropertyStr(js, error, "message", JS_NewString(js, "Async action cancelled")) < 0) {
+        JS_FreeValue(js, error);
+        return JS_EXCEPTION;
+    }
+    JSValue done = settle_async_action(s, *slot, error, false, true);
+    JS_FreeValue(js, error);
+    if (JS_IsException(done)) return done;
+    JS_FreeValue(js, done);
+    return JS_NewBool(js, true);
+}
+
+JSValue js_request_async_action(JSContext* js, JSValueConst, int argc, JSValueConst* argv) {
+    auto* s = static_cast<InlaySurface*>(JS_GetContextOpaque(js));
+    auto* storage = ext(s);
+    if (s->stats.has_error) return JS_ThrowTypeError(js, "Surface has an error");
+    if (storage->async_actions_closed) return JS_ThrowTypeError(js, "Async actions are closed");
+    if (argc < 1 || !JS_IsString(argv[0])) return JS_ThrowTypeError(js, "request requires an action name");
+    size_t name_length = 0u;
+    const char* name = JS_ToCStringLen(js, &name_length, argv[0]);
+    if (!name) return JS_EXCEPTION;
+    uint32_t name_index = 0u;
+    for (; name_index < storage->async_action_name_count; ++name_index) {
+        const char* allowed = storage->async_action_names[name_index].value;
+        if (name_length == std::strlen(allowed) && std::memcmp(name, allowed, name_length) == 0) break;
+    }
+    JS_FreeCString(js, name);
+    if (name_index == storage->async_action_name_count) {
+        return JS_ThrowTypeError(js, "Async action is not allowed");
+    }
+
+    const JSValue json = JS_JSONStringify(js, argc > 1 ? argv[1] : JS_NULL, JS_UNDEFINED, JS_UNDEFINED);
+    if (JS_IsException(json)) return json;
+    if (JS_IsUndefined(json)) return JS_ThrowTypeError(js, "Async action payload must be JSON serializable");
+    size_t payload_length = 0u;
+    const char* payload = JS_ToCStringLen(js, &payload_length, json);
+    JS_FreeValue(js, json);
+    if (!payload) return JS_EXCEPTION;
+    if (payload_length > kAsyncPayloadLimit) {
+        JS_FreeCString(js, payload);
+        return JS_ThrowTypeError(js, "Async action payload exceeds 64 KiB");
+    }
+    // JSON serialization can run toJSON and enqueue another action.
+    if (!storage->async_actions) {
+        storage->async_actions = static_cast<AsyncActionSlot*>(SDL_calloc(kAsyncActionCapacity, sizeof(AsyncActionSlot)));
+        if (!storage->async_actions) {
+            JS_FreeCString(js, payload);
+            return JS_ThrowOutOfMemory(js);
+        }
+    }
+    AsyncActionSlot* slot = nullptr;
+    for (uint32_t i = 0u; i < kAsyncActionCapacity; ++i) {
+        if (storage->async_actions[i].phase == AsyncActionPhase::Empty) {
+            slot = &storage->async_actions[i];
+            break;
+        }
+    }
+    if (!slot || storage->next_async_action == UINT32_MAX) {
+        JS_FreeCString(js, payload);
+        return JS_ThrowInternalError(js, "Async action capacity exceeded");
+    }
+    auto* copy = static_cast<char*>(SDL_malloc(payload_length));
+    if (copy) std::memcpy(copy, payload, payload_length);
+    JS_FreeCString(js, payload);
+    if (!copy) return JS_ThrowOutOfMemory(js);
+
+    const JSValue promise = JS_NewPromiseCapability(js, slot->settle);
+    if (JS_IsException(promise)) {
+        SDL_free(copy);
+        return promise;
+    }
+    slot->id = ++storage->next_async_action;
+    slot->payload = copy;
+    slot->payload_length = static_cast<uint32_t>(payload_length);
+    slot->name_index = name_index;
+    slot->phase = AsyncActionPhase::Queued;
+    JSValue id = JS_NewUint32(js, slot->id);
+    const JSValue cancel = JS_NewCFunctionData(js, js_cancel_async_action, 0, 0, 1, &id);
+    if (JS_IsException(cancel) || JS_DefinePropertyValueStr(js, promise, "cancel", cancel, 0) < 0) {
+        release_async_action(s, *slot, false);
+        JS_FreeValue(js, promise);
+        return JS_EXCEPTION;
+    }
+    return promise;
 }
 
 JSValue js_set_timeout(JSContext* js, JSValueConst, int argc, JSValueConst* argv) {
@@ -2842,6 +3089,7 @@ bool run_update(InlaySurface* s, EtchStr name, EtchStr payload) {
 
 void clear_context(InlaySurface* s) {
     if (s->js) {
+        retire_async_actions(s);
         clear_handlers(s);
         for (uint32_t i = 0u; i < s->rejection_count; ++i) {
             JS_FreeValue(s->js, s->rejections[i]);
@@ -2879,7 +3127,9 @@ bool load(InlaySurface* s, EtchStr script, bool is_hmr = false) {
                                  &s->jsx_buf, &s->jsx_cap, &jsx_len,
                                  jsx_err, sizeof(jsx_err))) {
             // Fail fast; keep last-good tree/state intact on HMR.
-            record_error(s, jsx_err[0] ? jsx_err : "JSXSyntaxError: Failed to transpile JSX");
+            const char* message = jsx_err[0] ? jsx_err : "JSXSyntaxError: Failed to transpile JSX";
+            if (is_hmr) record_reload_error(s, message);
+            else record_error(s, message);
             return false;
         }
         if (jsx_len > 0u) {
@@ -2892,7 +3142,8 @@ bool load(InlaySurface* s, EtchStr script, bool is_hmr = false) {
         while (cap < needed) cap *= 2u;
         auto* memory = static_cast<char*>(SDL_realloc(s->source, cap));
         if (!memory) {
-            record_error(s, "Source storage allocation failed");
+            if (is_hmr) record_reload_error(s, "Source storage allocation failed");
+            else record_error(s, "Source storage allocation failed");
             return false;
         }
         s->source = memory;
@@ -2906,6 +3157,8 @@ bool load(InlaySurface* s, EtchStr script, bool is_hmr = false) {
     const size_t length = sizeof(prefix) - 1u + effective.length + sizeof(suffix) - 1u;
 
     const bool fresh = !is_hmr || !s->loaded || s->stats.has_error || !s->js;
+    JSValue compiled = JS_UNDEFINED;
+    uint64_t start = 0u;
     if (fresh) {
         clear_context(s);
         if (s->runtime) JS_FreeRuntime(s->runtime);
@@ -2925,6 +3178,30 @@ bool load(InlaySurface* s, EtchStr script, bool is_hmr = false) {
         }
         JS_SetContextOpaque(s->js, s);
     } else {
+        start = SDL_GetPerformanceCounter();
+        begin_tick(s);
+        compiled = JS_Eval(s->js, s->source, length, filename,
+                           JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
+        const bool expired = SDL_GetPerformanceCounter() >= s->deadline;
+        if (JS_IsException(compiled) || expired) {
+            if (JS_IsException(compiled)) {
+                const JSValue error = JS_GetException(s->js);
+                const char* message = JS_ToCString(s->js, error);
+                record_reload_error(s, expired ? "Script compilation exceeded its tick time limit"
+                                               : message ? message : "HMR script compilation failed");
+                if (message) JS_FreeCString(s->js, message);
+                JS_FreeValue(s->js, error);
+                if (JS_HasException(s->js)) JS_FreeValue(s->js, JS_GetException(s->js));
+            } else {
+                JS_FreeValue(s->js, compiled);
+                record_reload_error(s, "Script compilation exceeded its tick time limit");
+            }
+            s->deadline = 0u;
+            s->running = false;
+            s->stats.last_tick_ms = double(SDL_GetPerformanceCounter() - start) * 1000.0 / s->frequency;
+            return false;
+        }
+        retire_async_actions(s);
         for (auto& timer : s->timers) {
             JS_FreeValue(s->js, timer.function);
             timer.function = JS_UNDEFINED;
@@ -2932,8 +3209,6 @@ bool load(InlaySurface* s, EtchStr script, bool is_hmr = false) {
         }
     }
 
-    const uint64_t start = SDL_GetPerformanceCounter();
-    begin_tick(s);
     s->stats.has_error = false;
     s->error[0] = '\0';
     s->pending_state = false;
@@ -2941,6 +3216,7 @@ bool load(InlaySurface* s, EtchStr script, bool is_hmr = false) {
     const JSValue global = JS_GetGlobalObject(s->js);
     if (fresh) {
         JS_SetPropertyStr(s->js, global, "action", JS_NewCFunction(s->js, js_action, "action", 2));
+        JS_SetPropertyStr(s->js, global, "request", JS_NewCFunction(s->js, js_request_async_action, "request", 2));
         JS_SetPropertyStr(s->js, global, "setTimeout",
                           JS_NewCFunction(s->js, js_set_timeout, "setTimeout", 2));
         JS_SetPropertyStr(s->js, global, "clearTimeout",
@@ -2952,7 +3228,8 @@ bool load(InlaySurface* s, EtchStr script, bool is_hmr = false) {
             "globalThis.__inlay_hm=Object.create(null);globalThis.__inlay_stk=[];globalThis.__inlay_has_hm=false;"
             "globalThis.__inlay_seen=Object.create(null);globalThis.__inlay_fx=[];globalThis.__inlay_dirty=false;"
             "globalThis.__inlay_begin=()=>{globalThis.__inlay_dirty=false;globalThis.__inlay_seen=Object.create(null);"
-            "globalThis.__inlay_fx.length=0;globalThis.__inlay_stk=[{k:'__root',i:0,c:0}];globalThis.__inlay_seen.__root=1;};"
+            "globalThis.__inlay_fx.length=0;globalThis.__inlay_stk=[{k:'__root',i:0,c:0}];"
+            "globalThis.__inlay_seen.__root=globalThis.__inlay_visit=1;};"
             "globalThis.__inlay_commit=()=>{if(globalThis.__inlay_has_hm){const hm=globalThis.__inlay_hm,seen=globalThis.__inlay_seen;"
             "let any=false;for(const k in hm){if(!seen[k]){const a=hm[k];for(let j=0;j<a.length;++j){"
             "const sl=a[j];if(sl&&sl.__fx&&typeof sl.cl==='function'){try{sl.cl();}catch(_){}}}delete hm[k];}else any=true;}"
@@ -2967,7 +3244,7 @@ bool load(InlaySurface* s, EtchStr script, bool is_hmr = false) {
             "const stk=globalThis.__inlay_stk,pf=stk.length?stk[stk.length-1]:{k:'__root',i:0,c:0};"
             "const nm=tag.name||'C',hk=props&&props.key!==undefined&&props.key!==null;"
             "const sk=pf.k+'/'+(hk?(nm+'#'+String(props.key)):(nm+'@'+(pf.c++)));"
-            "globalThis.__inlay_seen[sk]=1;stk.push({k:sk,i:0,c:0});"
+            "globalThis.__inlay_seen[sk]=++globalThis.__inlay_visit;stk.push({k:sk,i:0,c:0,memo:pf.memo});"
             "const mp=children.length||!(props&&'children'in props)?Object.assign({},props,{children}):Object.assign({},props);"
             "try{return tag(mp);}finally{stk.pop();}}"
             "if(tag==='switch')return{tag:'toggle',props:props||{},children};"
@@ -2985,7 +3262,7 @@ bool load(InlaySurface* s, EtchStr script, bool is_hmr = false) {
             "progress:m('progress'),slider:m('slider'),badge:x('badge'),divider:m('divider'),"
             "image:m('image'),modal:m('modal'),popover:m('popover'),tooltip:m('tooltip'),"
             "split:m('split'),math:x('math'),diagram:x('diagram'),slot:x('slot','name'),"
-            "doc:x('doc','markdown'),terminal:x('terminal','ansi'),virtualList:m('virtualList'),"
+            "doc:x('doc','markdown'),codeEditor:x('codeEditor','buffer'),terminal:x('terminal','ansi'),virtualList:m('virtualList'),"
             "table:m('table'),tree:m('tree'),treeItem:x('treeItem','label'),"
             "menu:m('menu'),contextMenu:m('contextMenu'),avatar:x('avatar','name'),"
             "toast:x('toast','description'),accordion:x('accordion','title'),skeleton:m('skeleton'),"
@@ -2997,33 +3274,128 @@ bool load(InlaySurface* s, EtchStr script, bool is_hmr = false) {
             "G.Progress='progress';G.Slider='slider';G.Badge='badge';G.Divider='divider';"
             "G.Image='image';G.Modal='modal';G.Popover='popover';G.Tooltip='tooltip';"
             "G.Split='split';G.Spacer='spacer';G.Diagram='diagram';G.Slot='slot';"
-            "G.Doc='doc';G.Terminal='terminal';G.VirtualList='virtualList';G.Table='table';"
+            "G.Doc='doc';G.CodeEditor='codeEditor';G.Terminal='terminal';G.VirtualList='virtualList';G.Table='table';"
             "G.Tree='tree';G.TreeItem='treeItem';G.Menu='menu';G.ContextMenu='contextMenu';"
             "G.Avatar='avatar';G.Toast='toast';G.Accordion='accordion';G.Skeleton='skeleton';"
             "G.Fragment=G.__frag;"
             "const slot=()=>{const stk=G.__inlay_stk,f=stk.length?stk[stk.length-1]:{k:'__root',i:0,c:0};"
+            "if(f.i===0&&G.__inlay_collect)G.__inlay_collect.push(f.k);"
             "const hm=G.__inlay_hm;let a=hm[f.k];if(!a){a=hm[f.k]=[];G.__inlay_has_hm=true;}return[a,f.i++];};"
             "const same=(a,b)=>{if(!a||!b||a.length!==b.length)return false;"
             "for(let j=0;j<a.length;++j)if(!Object.is(a[j],b[j]))return false;return true;};"
             "G.useState=init=>{const[a,i]=slot();if(i>=a.length)a[i]=typeof init==='function'?init():init;"
+            "const frame=G.__inlay_stk[G.__inlay_stk.length-1],owner=frame&&frame.memo;"
             "return[a[i],v=>{const n=typeof v==='function'?v(a[i]):v;"
-            "if(!Object.is(a[i],n)){a[i]=n;G.__inlay_dirty=true;}}];};"
+            "if(!Object.is(a[i],n)){a[i]=n;for(let m=owner;m;m=m.parent)m.dirty=true;G.__inlay_dirty=true;}}];};"
             "G.useRef=init=>{const[a,i]=slot();if(i>=a.length)a[i]={current:init};return a[i];};"
             "G.useMemo=(fn,deps)=>{const[a,i]=slot();"
             "if(i>=a.length||!deps||!same(a[i].d,deps))a[i]={v:fn(),d:deps?deps.slice():null};return a[i].v;};"
             "G.useCallback=(fn,deps)=>G.useMemo(()=>fn,deps);"
             "G.useEffect=(fn,deps)=>{const[a,i]=slot();"
             "if(i>=a.length){const r={__fx:1,d:deps?deps.slice():null,fn,cl:undefined};a[i]=r;G.__inlay_fx.push(r);}"
-            "else if(!deps||!same(a[i].d,deps)){a[i].d=deps?deps.slice():null;a[i].fn=fn;G.__inlay_fx.push(a[i]);}};})();";
+            "else if(!deps||!same(a[i].d,deps)){a[i].d=deps?deps.slice():null;a[i].fn=fn;G.__inlay_fx.push(a[i]);}};})();"
+            R"JS(
+            (() => {
+                const G = globalThis;
+                function equalProps(a, b) {
+                    const keys = Object.keys(a);
+                    if (keys.length !== Object.keys(b).length) return false;
+                    for (const key of keys) {
+                        if (!Object.hasOwn(b, key)) return false;
+                        const x = a[key], y = b[key];
+                        if (Object.is(x, y)) continue;
+                        if (key !== 'children' || !Array.isArray(x) || !Array.isArray(y) ||
+                            x.length !== y.length || !x.every((v, i) => Object.is(v, y[i]))) return false;
+                    }
+                    return true;
+                }
+                G.memo = (component, equal = equalProps) => {
+                    function Memo(props) {
+                        const ref = G.useRef(null);
+                        const cache = ref.current || (ref.current = {});
+                        const stack = G.__inlay_stk, frame = stack[stack.length - 1];
+                        const collect = G.__inlay_collect;
+                        cache.parent = frame.memo;
+                        if (cache.component === component && !cache.dirty && equal(cache.props, props)) {
+                            for (const key of cache.scopes) {
+                                G.__inlay_seen[key] = ++G.__inlay_visit;
+                                if (collect) collect.push(key);
+                            }
+                            return cache.tree;
+                        }
+                        cache.component = null;
+                        cache.dirty = false;
+                        frame.memo = cache;
+                        const scopes = [];
+                        G.__inlay_collect = scopes;
+                        try {
+                            cache.tree = G.h(component, props);
+                        } finally {
+                            G.__inlay_collect = collect;
+                            frame.memo = cache.parent;
+                        }
+                        // A nested boundary may have unmounted scopes while rendering.
+                        cache.scopes = scopes.filter(k => Object.hasOwn(G.__inlay_seen, k));
+                        if (collect) for (const key of cache.scopes) collect.push(key);
+                        cache.props = props;
+                        cache.component = component;
+                        return cache.tree;
+                    }
+                    Object.defineProperty(Memo, 'name', {value: 'memo(' + component.name + ')'});
+                    return Memo;
+                };
+                function Content(p) { return p.render(); }
+                function Fallback(p) { return p.render(p.error, p.retry); }
+                function ErrorBoundary(p) {
+                    const slot = G.useRef(null);
+                    const [, invalidate] = G.useState(0);
+                    if (!slot.current || !Object.is(slot.current.key, p.resetKey))
+                        slot.current = {key: p.resetKey, failed: false};
+                    const state = slot.current;
+                    if (!state.failed) {
+                        const visit = G.__inlay_visit, effects = G.__inlay_fx.length;
+                        try {
+                            return G.h(Content, {render: p.render});
+                        } catch (error) {
+                            G.__inlay_fx.length = effects;
+                            for (const key in G.__inlay_seen)
+                                if (G.__inlay_seen[key] > visit) delete G.__inlay_seen[key];
+                            state.failed = true;
+                            state.error = error;
+                        }
+                    }
+                    const retry = () => {
+                        if (state !== slot.current || !state.failed) return;
+                        slot.current = null;
+                        invalidate(n => n + 1);
+                    };
+                    return typeof p.fallback === 'function'
+                        ? G.h(Fallback, {render: p.fallback, error: state.error, retry})
+                        : G.ui.text(String(state.error));
+                }
+                G.ErrorBoundary = ErrorBoundary;
+                G.ui.errorBoundary = p => G.h(ErrorBoundary, p);
+                G.ui.errorBoundary.__ui = true;
+            })();
+            )JS";
         const JSValue bootstrap_result =
             JS_Eval(s->js, bootstrap, sizeof(bootstrap) - 1u, "<inlay>", JS_EVAL_TYPE_GLOBAL);
         JS_FreeValue(s->js, bootstrap_result);
+        // The fixed framework bootstrap runs in a new, empty VM. Start the
+        // caller's execution budget before installing state or running user JS.
+        start = SDL_GetPerformanceCounter();
+        begin_tick(s);
     }
     JSValue result = JS_UNDEFINED;
-    bool ok = install_state(s, global);
+    bool ok = !JS_HasException(s->js) && install_state(s, global);
     JS_FreeValue(s->js, global);
     if (ok) {
-        result = JS_Eval(s->js, s->source, length, filename, JS_EVAL_TYPE_GLOBAL);
+        if (fresh) {
+            result = JS_Eval(s->js, s->source, length, filename, JS_EVAL_TYPE_GLOBAL);
+        } else {
+            result = JS_EvalFunction(s->js, compiled);
+            compiled = JS_UNDEFINED;
+        }
         ok = !JS_IsException(result);
         if (ok) {
             const JSValue target = JS_GetGlobalObject(s->js);
@@ -3033,9 +3405,14 @@ bool load(InlaySurface* s, EtchStr script, bool is_hmr = false) {
         }
         JS_FreeValue(s->js, result);
     }
+    JS_FreeValue(s->js, compiled);
     if (ok && !JS_HasException(s->js)) ok = rebuild(s, true);
     const bool completed = finish_tick(s, start) && ok;
     s->loaded = completed;
+    if (completed) {
+        SDL_free(ext(s)->reload_error);
+        ext(s)->reload_error = nullptr;
+    }
     etch_request_redraw(s->etch);
     return completed;
 }
@@ -3424,7 +3801,7 @@ BadgeColors resolve_badge_variant(uint8_t variant, const EtchTheme& theme, bool 
     }
 }
 
-void draw_error_card(InlaySurface* s, const EtchTheme& theme) {
+void draw_error_card(InlaySurface* s, const EtchTheme& theme, const char* error, bool reload) {
     const bool dark = inlay_is_dark_theme(theme);
     auto wrap = etch_box_desc_default();
     wrap.axis = ETCH_AXIS_COL;
@@ -3470,7 +3847,7 @@ void draw_error_card(InlaySurface* s, const EtchTheme& theme) {
     title.font_size_px = 13.f;
     title.color = dark ? etch_rgb_hex(0xFCA5A5u, 255u) : etch_rgb_hex(0xB91C1Cu, 255u);
     title.wrap = false;
-    etch_text(ETCH_STR_LIT("Surface Error"), &title);
+    etch_text(reload ? ETCH_STR_LIT("Reload Error") : ETCH_STR_LIT("Surface Error"), &title);
 
     if (s->path[0]) {
         const char* base = s->path;
@@ -3506,7 +3883,7 @@ void draw_error_card(InlaySurface* s, const EtchTheme& theme) {
     msg.color = theme.text_primary;
     msg.wrap = true;
     msg.selectable = true;
-    etch_text(inlay_ui_frame_text(s, {s->error, uint32_t(std::strlen(s->error)), false}), &msg);
+    etch_text(inlay_ui_frame_text(s, {error, uint32_t(std::strlen(error)), false}), &msg);
 
     etch_end_box();
     etch_end_box();
@@ -4190,7 +4567,7 @@ void inlay_ui_draw_node(InlaySurface* s, uint32_t index, uint32_t parent,
             ov.element_id = id;
             ov.role = ETCH_A11Y_BUTTON;
             ov.label = label;
-            ov.add_states = disabled ? ETCH_A11Y_STATE_DISABLED : 0u;
+            ov.add_states = disabled ? uint32_t(ETCH_A11Y_STATE_DISABLED) : 0u;
             ov.actions_mask = disabled ? 0u : 3u;
             ov.has_role = true;
             ov.has_label = true;
@@ -4318,6 +4695,29 @@ void inlay_ui_draw_node(InlaySurface* s, uint32_t index, uint32_t parent,
                 dispatch_hover_focus(s, cold, id, events);
             }
         }
+    } else if (n.kind == INLAY_UI_CODE_EDITOR) {
+        const uint32_t i = inlay_ui_content_index(s, n.kind, n.text);
+        if (i < s->content_count) {
+            auto editor = etch_code_editor_desc_default();
+            editor.id = id;
+            editor.buffer = static_cast<EtchTextBuffer*>(s->content[i].resource);
+            editor.width = inlay_ui_resolve_sizing(s, st, cold, false, editor.width);
+            editor.height = inlay_ui_resolve_sizing(s, st, cold, true, editor.height);
+            if (st.flags & NfHasSize) editor.font_size_px = st.font_size;
+            if (st.flags & NfHasFontId) editor.font_id = st.font_id;
+            if (st.flags & NfHasPadding) editor.padding = st.padding;
+            editor.read_only = extra && (extra->flags & CefInputReadOnly);
+            editor.word_wrap = extra && (extra->flags & CefInputWordWrap);
+            const auto edit = etch_code_editor(&editor);
+            if (edit.changed && has_event(st.action, st.handler)) {
+                char payload[128];
+                const int len = std::snprintf(payload, sizeof(payload),
+                    "{\"cursorByte\":%u,\"anchorByte\":%u,\"byteLength\":%u,\"lineCount\":%u}",
+                    edit.cursor_byte, edit.selection_anchor_byte, etch_text_buffer_byte_length(editor.buffer), edit.total_lines);
+                inlay_ui_queue_event(s, events, inlay_ui_slice(s, st.action), st.handler,
+                                     inlay_ui_frame_text(s, {payload, uint32_t(len), false}));
+            }
+        }
     } else if (n.kind == INLAY_UI_INPUT) {
         auto input = etch_text_input_desc_default();
         input.id = id;
@@ -4352,14 +4752,20 @@ void inlay_ui_draw_node(InlaySurface* s, uint32_t index, uint32_t parent,
             input.continuous_corners = (cold->cflags & CfContinuousCorners) != 0u;
         }
         input.disabled = disabled;
-        uint32_t length = n.text.length;
+        input.password = extra && (extra->flags & CefInputPassword);
+        input.multiline = extra && (extra->flags & CefInputMultiline);
+        input.read_only = extra && (extra->flags & CefInputReadOnly);
+        input.word_wrap = extra && (extra->flags & CefInputWordWrap);
+        input.submit_on_enter = extra && has_event(extra->submit_action, extra->submit_handler);
+        const EtchStr edit_text = input.password ? inlay_ui_slice(s, extra->password_text) : n.text;
+        uint32_t length = edit_text.length;
         if (length >= INLAY_UI_INPUT_CAPACITY) {
             length = INLAY_UI_INPUT_CAPACITY - 1u;
-            while (length > 0u && (static_cast<uint8_t>(n.text.chars[length]) & 0xC0u) == 0x80u) {
+            while (length > 0u && (static_cast<uint8_t>(edit_text.chars[length]) & 0xC0u) == 0x80u) {
                 --length;
             }
         }
-        if (length > 0u) std::memcpy(s->edit_buffer, n.text.chars, length);
+        if (length > 0u) std::memcpy(s->edit_buffer, edit_text.chars, length);
         s->edit_buffer[length] = '\0';
         input.buffer = s->edit_buffer;
         input.capacity = INLAY_UI_INPUT_CAPACITY;
@@ -4367,6 +4773,10 @@ void inlay_ui_draw_node(InlaySurface* s, uint32_t index, uint32_t parent,
         if (edit.changed && has_event(st.action, st.handler)) {
             inlay_ui_queue_event(s, events, inlay_ui_slice(s, st.action), st.handler,
                                  input_json(s->etch, s->edit_buffer, edit.byte_length));
+        }
+        if (edit.submitted && input.submit_on_enter) {
+            inlay_ui_queue_event(s, events, inlay_ui_slice(s, extra->submit_action), extra->submit_handler,
+                                 input_json(s->etch, s->edit_buffer, edit.byte_length), true);
         }
     } else if (n.kind == INLAY_UI_TOGGLE) {
         auto toggle = etch_toggle_switch_desc_default();
@@ -4469,8 +4879,8 @@ void inlay_ui_draw_node(InlaySurface* s, uint32_t index, uint32_t parent,
             tab_ov.element_id = tab_id;
             tab_ov.role = ETCH_A11Y_TAB;
             tab_ov.label = label;
-            tab_ov.add_states = (active ? ETCH_A11Y_STATE_SELECTED : 0u) |
-                                (tab_disabled ? ETCH_A11Y_STATE_DISABLED : 0u);
+            tab_ov.add_states = (active ? uint32_t(ETCH_A11Y_STATE_SELECTED) : 0u) |
+                                (tab_disabled ? uint32_t(ETCH_A11Y_STATE_DISABLED) : 0u);
             tab_ov.actions_mask = tab_disabled ? 0u : 3u;
             tab_ov.has_role = true;
             tab_ov.has_label = true;
@@ -5052,12 +5462,26 @@ void inlay_ui_draw_node(InlaySurface* s, uint32_t index, uint32_t parent,
         if (cold && (cold->cflags & CfHasBlendMode)) box.blend_mode = cold->blend_mode;
         etch_box(&box);
     } else if (n.kind == INLAY_UI_IMAGE) {
-        if ((st.flags2 & Nf2HasSprite) && cold && cold->sprite_id != ETCH_INVALID_SPRITE) {
+        InlayImageResult resolved = {};
+        const bool has_resolved = !(st.flags2 & Nf2HasSprite) && s->image_resolver_fn && cold && cold->src.len > 0u &&
+            s->image_resolver_fn(n.text, inlay_ui_slice(s, cold->src), &resolved, s->image_resolver_user_data) &&
+            resolved.texture != nullptr && std::isfinite(resolved.width_px) && std::isfinite(resolved.height_px) &&
+            resolved.width_px > 0.f && resolved.height_px > 0.f;
+        if (((st.flags2 & Nf2HasSprite) && cold && cold->sprite_id != ETCH_INVALID_SPRITE) || has_resolved) {
             auto img = etch_image_desc_default();
             img.id = id;
-            img.sprite_id = cold->sprite_id;
-            img.width = inlay_ui_resolve_sizing(s, st, cold, false, etch_sizing_fit(0.f, 0.f));
-            img.height = inlay_ui_resolve_sizing(s, st, cold, true, etch_sizing_fit(0.f, 0.f));
+            if (has_resolved) {
+                img.texture = resolved.texture;
+                img.width = inlay_ui_resolve_sizing(s, st, cold, false, etch_sizing_fixed(resolved.width_px));
+                img.height = inlay_ui_resolve_sizing(s, st, cold, true, etch_sizing_fixed(resolved.height_px));
+                if (resolved.radius_px > 0.f && !(st.flags & NfRadiusSet)) {
+                    img.radius = etch_corners_all(resolved.radius_px);
+                }
+            } else {
+                img.sprite_id = cold->sprite_id;
+                img.width = inlay_ui_resolve_sizing(s, st, cold, false, etch_sizing_fit(0.f, 0.f));
+                img.height = inlay_ui_resolve_sizing(s, st, cold, true, etch_sizing_fit(0.f, 0.f));
+            }
             if (st.flags & NfRadiusSet) img.radius = inlay_ui_resolve_corners(st, cold, theme, 0.f);
             if (st.color.set) img.tint = inlay_ui_resolve_color(st.color, theme, etch_color_white(255u));
             if (st.border_color.set) img.border_color = inlay_ui_resolve_color(st.border_color, theme, {});
@@ -5066,6 +5490,8 @@ void inlay_ui_draw_node(InlaySurface* s, uint32_t index, uint32_t parent,
             if (cold->col_span > 1u) img.grid_col_span = cold->col_span;
             if (cold->cflags & CfHasContinuousCorners) {
                 img.continuous_corners = (cold->cflags & CfContinuousCorners) != 0u;
+            } else if (has_resolved) {
+                img.continuous_corners = true;
             }
             if (cold->cflags & CfHasBlendMode) img.blend_mode = cold->blend_mode;
             img.fit = static_cast<EtchImageFit>(st.image_fit);
@@ -5211,7 +5637,11 @@ INLAY_API InlaySurface* inlay_surface_create(EtchContext* context, const InlaySu
 INLAY_API void inlay_surface_destroy(InlaySurface* s) {
     if (!s) return;
     auto* storage = ext(s);
+    SDL_free(s->content);
     clear_context(s);
+    SDL_free(storage->async_actions);
+    SDL_free(storage->async_action_names);
+    SDL_free(storage->reload_error);
     if (s->runtime) JS_FreeRuntime(s->runtime);
     inlay_ui_free_widget_caches(s);
     SDL_free(s->handlers);
@@ -5287,6 +5717,75 @@ INLAY_API bool inlay_surface_bind_action(InlaySurface* s, EtchStr name, InlayAct
     return true;
 }
 
+INLAY_API bool inlay_surface_allow_async_action(InlaySurface* s, EtchStr name) {
+    if (!s || s->running || s->drawing || !name.chars || !name.length ||
+        name.length >= sizeof(AsyncActionName::value) || std::memchr(name.chars, 0, name.length)) return false;
+    auto* storage = ext(s);
+    if (storage->async_actions_closed) return false;
+    for (uint32_t i = 0u; i < storage->async_action_name_count; ++i) {
+        if (inlay_ui_equal(name, storage->async_action_names[i].value)) return true;
+    }
+    if (!inlay_grow_pod(storage->async_action_names, storage->async_action_name_cap,
+                        storage->async_action_name_count + 1u, 4u, kAsyncActionCapacity)) return false;
+    auto& allowed = storage->async_action_names[storage->async_action_name_count++];
+    std::memcpy(allowed.value, name.chars, name.length);
+    allowed.value[name.length] = '\0';
+    return true;
+}
+
+INLAY_API InlayAsyncActionEvent inlay_surface_poll_async_action(InlaySurface* s) {
+    InlayAsyncActionEvent event = {sizeof(InlayAsyncActionEvent), INLAY_ASYNC_ACTION_NONE, 0u, {}, {}};
+    if (!s || s->running || s->drawing || !ext(s)->async_actions) return event;
+    auto* storage = ext(s);
+    AsyncActionSlot* next = nullptr;
+    for (uint32_t i = 0u; i < kAsyncActionCapacity; ++i) {
+        auto& slot = storage->async_actions[i];
+        if ((slot.phase == AsyncActionPhase::Queued || slot.phase == AsyncActionPhase::Cancelled) &&
+            (!next || slot.id < next->id)) next = &slot;
+    }
+    if (!next) return event;
+    event.request_id = next->id;
+    if (next->phase == AsyncActionPhase::Cancelled) {
+        event.kind = INLAY_ASYNC_ACTION_CANCEL;
+        *next = {};
+    } else {
+        event.kind = INLAY_ASYNC_ACTION_START;
+        const char* name = storage->async_action_names[next->name_index].value;
+        event.name = {name, static_cast<uint32_t>(std::strlen(name)), true};
+        event.payload_json = {next->payload, next->payload_length, false};
+        next->phase = AsyncActionPhase::Started;
+    }
+    return event;
+}
+
+INLAY_API bool inlay_surface_complete_async_action(InlaySurface* s, uint32_t id, bool success, EtchStr json) {
+    if (!s || !s->loaded || s->stats.has_error || s->running || s->drawing ||
+        !id || !json.chars || !json.length || json.length > kAsyncPayloadLimit) return false;
+    auto* slot = find_async_action(s, id);
+    if (!slot || slot->phase != AsyncActionPhase::Started) return false;
+    const JSValue result = parse_json(s, json);
+    if (JS_IsException(result)) {
+        JS_FreeValue(s->js, JS_GetException(s->js));
+        return false;
+    }
+    const uint64_t start = SDL_GetPerformanceCounter();
+    begin_tick(s);
+    const JSValue done = settle_async_action(s, *slot, result, success, false);
+    bool ok = !JS_IsException(done);
+    JS_FreeValue(s->js, done);
+    JS_FreeValue(s->js, result);
+    if (ok) ok = rebuild(s, false);
+    ok = finish_tick(s, start) && ok;
+    etch_request_redraw(s->etch);
+    return ok;
+}
+
+INLAY_API void inlay_surface_close_async_actions(InlaySurface* s) {
+    if (!s || s->running || s->drawing) return;
+    ext(s)->async_actions_closed = true;
+    retire_async_actions(s);
+}
+
 INLAY_API bool inlay_surface_bind_slot(InlaySurface* s, EtchStr name, InlaySlotRenderFn fn, void* user) {
     if (!s || !name.chars || !name.length || name.length >= 64u || !fn ||
         std::memchr(name.chars, 0, name.length)) {
@@ -5306,6 +5805,43 @@ INLAY_API bool inlay_surface_bind_slot(InlaySurface* s, EtchStr name, InlaySlotR
     sl.name[name.length] = '\0';
     sl.callback = fn;
     sl.user = user;
+    etch_request_redraw(s->etch);
+    return true;
+}
+
+static bool bind_content(InlaySurface* s, EtchStr name, InlayUiKind kind, void* resource) {
+    if (!s || s->running || s->drawing || !name.chars || !name.length ||
+        name.length >= sizeof(ContentBinding::name) || std::memchr(name.chars, 0, name.length)) return false;
+    const uint32_t i = inlay_ui_content_index(s, kind, name);
+    if (i < s->content_count) {
+        if (resource) s->content[i].resource = resource;
+        else s->content[i] = s->content[--s->content_count];
+    } else {
+        if (!resource) return true;
+        if (!inlay_grow_pod(s->content, s->content_cap, i + 1u, 4u, 64u)) return false;
+        auto& binding = s->content[s->content_count++];
+        std::memcpy(binding.name, name.chars, name.length);
+        binding.name[name.length] = '\0';
+        binding.kind = kind;
+        binding.resource = resource;
+    }
+    etch_request_redraw(s->etch);
+    return true;
+}
+
+INLAY_API bool inlay_surface_bind_document(InlaySurface* s, EtchStr name, InlayDoc* doc) {
+    if (doc && (!s || doc->context != s->etch)) return false;
+    return bind_content(s, name, INLAY_UI_DOC, doc);
+}
+
+INLAY_API bool inlay_surface_bind_text_buffer(InlaySurface* s, EtchStr name, EtchTextBuffer* buffer) {
+    return bind_content(s, name, INLAY_UI_CODE_EDITOR, buffer);
+}
+
+INLAY_API bool inlay_surface_set_image_resolver(InlaySurface* s, InlayImageResolverFn fn, void* user_data) {
+    if (!s) return false;
+    s->image_resolver_fn = fn;
+    s->image_resolver_user_data = user_data;
     etch_request_redraw(s->etch);
     return true;
 }
@@ -5332,11 +5868,11 @@ INLAY_API bool inlay_surface_poll_hmr(InlaySurface* s) {
     SDL_PathInfo info = {};
     if (!SDL_GetPathInfo(s->path, &info)) {
         s->hmr_file_error = true;
-        record_error(s, "HMR file is unavailable");
+        record_reload_error(s, "HMR file is unavailable");
         return false;
     }
     if (info.modify_time == s->modified && info.size == s->file_size && !s->hmr_file_error) {
-        return true;
+        return !s->stats.has_error && !ext(s)->reload_error;
     }
     const uint64_t start = SDL_GetPerformanceCounter();
     size_t length = 0u;
@@ -5348,7 +5884,7 @@ INLAY_API bool inlay_surface_poll_hmr(InlaySurface* s) {
     }
     if (!script) {
         s->hmr_file_error = true;
-        record_error(s, "HMR source could not be read");
+        record_reload_error(s, "HMR source could not be read");
         return false;
     }
     s->hmr_file_error = false;
@@ -5423,15 +5959,19 @@ INLAY_API void inlay_surface_view(InlaySurface* s, const InlaySurfaceViewDesc* i
     }
     WidgetEvents events = {};
     if (s->stats.has_error) {
-        draw_error_card(s, theme);
-    } else if (s->node_count > 0u) {
-        s->drawing = true;
-        s->draw_parent_col = true;
-        inlay_ui_draw_node(s, 0u, input.id, theme, &events);
-        s->drawing = false;
+        draw_error_card(s, theme, s->error, false);
+    } else {
+        if (const char* message = ext(s)->reload_error) draw_error_card(s, theme, message, true);
+        if (s->node_count > 0u) {
+            s->drawing = true;
+            s->draw_parent_col = true;
+            inlay_ui_draw_node(s, 0u, input.id, theme, &events);
+            s->drawing = false;
+        }
     }
     etch_end_box();
 
+    inlay_ui_trim_document_cache(s);
     bool vlist_refill = false;
     if (s->vlist_cache_count > 0u) {
         for (uint32_t i = 0u; i < s->vlist_cache_count; ++i) {
@@ -5493,11 +6033,17 @@ INLAY_API int32_t inlay_surface_next_timer_ms(const InlaySurface* s) {
 }
 
 INLAY_API InlaySurfaceStats inlay_surface_stats(const InlaySurface* s) {
-    return s ? s->stats : InlaySurfaceStats{};
+    if (!s) return {};
+    InlaySurfaceStats result = s->stats;
+    result.cached_documents = s->doc_cache_count;
+    result.has_error |= ext(s)->reload_error != nullptr;
+    return result;
 }
 
 INLAY_API EtchStr inlay_surface_error(const InlaySurface* s) {
-    return s ? EtchStr{s->error, static_cast<uint32_t>(std::strlen(s->error)), false} : EtchStr{};
+    if (!s) return {};
+    const char* message = s->stats.has_error ? s->error : ext(s)->reload_error;
+    return message ? EtchStr{message, static_cast<uint32_t>(std::strlen(message)), true} : EtchStr{};
 }
 
 INLAY_API const InlayUiNode* inlay_surface_nodes(const InlaySurface* s, uint32_t* count) {
@@ -5513,7 +6059,16 @@ INLAY_API bool inlay_surface_set_script(InlaySurface*, EtchStr) { return false; 
 INLAY_API bool inlay_surface_set_state_json(InlaySurface*, EtchStr) { return false; }
 INLAY_API EtchStr inlay_surface_state_json(const InlaySurface*) { return {}; }
 INLAY_API bool inlay_surface_bind_action(InlaySurface*, EtchStr, InlayActionFn, void*) { return false; }
+INLAY_API bool inlay_surface_allow_async_action(InlaySurface*, EtchStr) { return false; }
+INLAY_API InlayAsyncActionEvent inlay_surface_poll_async_action(InlaySurface*) {
+    return {sizeof(InlayAsyncActionEvent), INLAY_ASYNC_ACTION_NONE, 0u, {}, {}};
+}
+INLAY_API bool inlay_surface_complete_async_action(InlaySurface*, uint32_t, bool, EtchStr) { return false; }
+INLAY_API void inlay_surface_close_async_actions(InlaySurface*) {}
 INLAY_API bool inlay_surface_bind_slot(InlaySurface*, EtchStr, InlaySlotRenderFn, void*) { return false; }
+INLAY_API bool inlay_surface_bind_document(InlaySurface*, EtchStr, InlayDoc*) { return false; }
+INLAY_API bool inlay_surface_bind_text_buffer(InlaySurface*, EtchStr, EtchTextBuffer*) { return false; }
+INLAY_API bool inlay_surface_set_image_resolver(InlaySurface*, InlayImageResolverFn, void*) { return false; }
 INLAY_API bool inlay_surface_dispatch(InlaySurface*, EtchStr, EtchStr) { return false; }
 INLAY_API bool inlay_surface_enable_hmr(InlaySurface*, const char*) { return false; }
 INLAY_API bool inlay_surface_poll_hmr(InlaySurface*) { return false; }

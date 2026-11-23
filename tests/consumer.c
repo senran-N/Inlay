@@ -36,6 +36,14 @@ static void render_c99_slot(InlaySurface* surface,uint32_t element_id,float widt
 }
 int main(void) {
  if(inlay_abi_version()!=INLAY_ABI_VERSION)return 1;
+ {
+  InlayInbox* inbox=inlay_inbox_create(NULL);
+  InlayInboxMessage message={0};
+  const bool ok=inbox && inlay_inbox_post(inbox,1u,2u,NULL,0u)==INLAY_INBOX_OK &&
+   inlay_inbox_take(inbox,&message,NULL,0u)==INLAY_INBOX_OK && message.id==2u;
+  inlay_inbox_destroy(inbox);
+  if(!ok)return 1;
+ }
 #if INLAY_VERSION_MAJOR != 0 || INLAY_VERSION_MINOR != 13
 #error "Unexpected Inlay version"
 #endif
@@ -74,6 +82,15 @@ int main(void) {
  if(inlay_doc_create(ctx,&bad_big_cfg)!=NULL)return 1;
 
  InlayDoc* doc=inlay_doc_create(ctx,NULL);if(!doc)return 1;
+ {
+  const uint32_t before=inlay_doc_revision(doc);
+  if(!inlay_doc_replace_utf8(doc,0u,0u,ETCH_STR_LIT("C99")) || inlay_doc_revision(doc)==before)return 1;
+  InlayDocAnchor anchor={1u,0u,3u};
+  if(!inlay_doc_set_anchor(doc,anchor) || !inlay_doc_get_anchor(doc,1u,&anchor) || anchor.end!=3u)return 1;
+ }
+ if(inlay_doc_stream_status(doc)!=INLAY_DOC_STREAM_READY ||
+    inlay_doc_view_find_text(doc,0,ETCH_STR_LIT("missing"),0).active ||
+    inlay_surface_poll_async_action(NULL).kind!=INLAY_ASYNC_ACTION_NONE)return 1;
  const InlaySurfaceDesc surface=inlay_surface_desc_default();
  if(surface.struct_size!=(uint32_t)sizeof(InlaySurfaceDesc) ||
     surface.disable_jsx ||

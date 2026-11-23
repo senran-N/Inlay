@@ -6,11 +6,12 @@ C99 includes `<inlay/inlay_c.h>`; C++20 may include `<inlay/inlay.h>`.
 Create a document with an Etch context, append UTF-8 chunks, and call
 `inlay_doc_view` during that context's frame. Four carry bytes bridge incomplete
 codepoints. Invalid input is rejected; clear the document to discard a pending
-partial sequence. Frozen blocks retain source offsets while the open tail is
-reparsed. Appending the document's own source is supported. Returned slices and
+partial sequence. Appends received between layout or block queries parse together.
+Frozen blocks retain source offsets while the open tail is reparsed. Appending
+the document's own source is supported. Returned slices and
 block pointers are borrowed until the next mutation. The context must outlive
-documents; do not mutate documents during a view call. Up to 16 view IDs per
-document retain stable virtual-list measurement slots.
+documents. Mutate a document between view calls. Each view ID has its own
+virtual-list measurement state, allocated on demand up to 4,096 views per document.
 
 Document and diagram rendering follows the active Etch theme, including code,
 alerts, tables, syntax highlighting, diagram nodes, and feedback edges.
@@ -50,7 +51,13 @@ participate in the main layout. Sequence diagrams support participants, `as`
 names, solid `->>` messages and dashed `-->>` messages. Inputs are bounded to
 16 KiB, 256 nodes and 1024 edges. Use `canvas_id` for an interactive pan/zoom
 canvas or call inside an existing Etch canvas.
+Use `InlayDiagramDesc::diagnostic` to receive byte ranges for unsupported
+directives, unsupported diagram types and parse errors. A partial rendering
+reports skipped directives through `InlayDiagramResult::warning_count`.
 `inlay_document --math` and `--diagram` render standalone native examples.
+Invalid TeX returns `InlayMathResult::error` and `error_offset` so an editor
+can underline the failing source location. Unsupported commands and excessive
+nesting have separate error kinds.
 
 
 Reactive surfaces use optional QuickJS-NG (`INLAY_ENABLE_SCRIPT=ON`). Create an
@@ -75,21 +82,91 @@ h("toggle", {label: "Live", checked: !!s.live, onChange: "setLive"})
 
 An edit dispatches a string to `onEvent(name, payload, state)` and a toggle
 dispatches a boolean. Update the corresponding state field in `onEvent` to
-keep the new value. Input supports IME and up to 8191 UTF-8 bytes. Idle views
+keep the new value. Input supports IME, `password` (also `type: "password"`),
+`multiline`, `wordWrap`, `readOnly`, `onSubmit`, and up to 8191 UTF-8 bytes.
+Password values are masked for accessibility and omitted from public node text.
+Idle views
 reuse the cached nodes without running JavaScript, and repeated `cls` utility
 strings hit a persistent 2-way parsed style cache across rebuilds and theme
 switches (`hover:`, `active:`, `focus:`, and live `dark:` prefixes). Declarative
 functional components support call-path and `key`-scoped `useState`, `useRef`,
 `useMemo`, `useCallback`, and `useEffect` (with automatic unmount cleanup).
+Define `const Panel = memo(PanelBody)` at script scope to reuse a keyed
+component's JS tree while its props remain shallow-equal. Pass external
+state as props, including revisions for mutable data. Setters inside a
+memoized subtree invalidate its memoized ancestors. An optional second
+argument compares the previous and next props. Native nodes still rebuild
+on a surface update.
+Wrap a panel in `<ErrorBoundary render={() => <Panel/>} fallback={(err, retry) => <Button text={String(err)} onClick={retry}/>}/>`
+or pass the same props to `ui.errorBoundary`. A synchronous render exception
+unmounts that subtree and displays the fallback. Sibling panels keep their
+state. Invoke `retry()` or change `resetKey` to mount the panel again.
+Event handlers, async jobs, effects and the surface watchdog retain their surface-level error handling.
 Color props also accept `var(--etch-border-subtle)` and `var(--etch-text-muted)`.
+Bind a host-owned `InlayDoc` with `inlay_surface_bind_document` and use
+`ui.doc({document: "name"})` to render it directly. Appending UTF-8 to the document
+updates the view without re-evaluating the script. Unbind before destroying the
+document while the surface is live.
+String-backed document widgets reuse their parsed document across views of
+the same keyed node. `InlaySurfaceStats` reports resident cached documents
+and cumulative cache misses.
+
+Bind a host-owned `EtchTextBuffer` with `inlay_surface_bind_text_buffer` and
+render `<CodeEditor buffer="source" onChange={handleEdit} />`. It supports
+`readOnly` and `wordWrap`. Edits stay in the native buffer, including undo
+history. Each change reports `cursorByte`, `anchorByte`, `byteLength` and
+`lineCount` to the handler. Unbind the buffer, render a frame without its editor
+to retire the native selection and accessibility snapshots, then free it.
+
+At the end of a byte stream, use `inlay_doc_stream_status` to detect a partial
+UTF-8 sequence or an open fence. Search the rendered view's plain text with
+`inlay_doc_view_find_text`. Pass the returned offsets to the selection API and
+queue `inlay_doc_view_reveal_text` to scroll a fixed-height view to the match.
+Search again after changing the document and rendering its updated view.
+
+For annotations, store a nonzero host ID and a half-open UTF-8 source range
+with `inlay_doc_set_anchor`. Range edits move the endpoints. A point at EOF
+follows streamed text as complete characters arrive. Enumerate anchors with
+`inlay_doc_anchor_at` to save them alongside the source, then restore them
+after loading the matching document.
+
+For editors and patch previews, `inlay_doc_replace_utf8` applies an insertion,
+deletion, or replacement by source byte range. Endpoints must be UTF-8
+boundaries. A pending partial streaming sequence must be completed first.
+Use `inlay_doc_revision` to detect changes and refresh the view's search offsets.
+
+`InlayInbox` passes copied byte messages from workers to an owner thread with
+limits on both message count and payload bytes. Set `wake_event_type` to an SDL
+user event allocated by the host and drain the inbox before rendering. If the
+frame's work budget leaves messages queued, keep pumping while
+`inlay_inbox_pending` is nonzero. Use the message kind and ID to route document
+chunks or async results to the corresponding owner-thread API. Treat
+`INLAY_INBOX_FULL` as backpressure. On shutdown, close the inbox, join its
+producers, then drain or discard the remaining messages and destroy it.
+
 Scripts may invoke explicitly bound host `action(name,payload)` callbacks.
+For background work, authorize names with `inlay_surface_allow_async_action`.
+In script, `request(name, payload)` returns a Promise with a `cancel()` method.
+On the owner thread, poll `inlay_surface_poll_async_action` after script updates
+until it returns `INLAY_ASYNC_ACTION_NONE`. Copy a start event's name and JSON
+before handing the work to a worker. Deliver completion on the owner thread
+with `inlay_surface_complete_async_action`. Report progress through regular
+surface events. A cancel event identifies the work to cancel. Script replacement
+and close discard queued work and emit cancellation for work already taken.
+Call `inlay_surface_close_async_actions` and drain those events before destroying
+a surface that has background work. Each surface supports up to 32 active
+requests and up to 64 KiB of JSON per request or result.
+
 There are no std/os, filesystem or network globals. Defaults are 8MiB VM memory,
 512KiB stack and a 4ms tick budget. Errors display a themed inline card; a new
 script recovers the surface. JS allocation occurs only during explicit updates.
 
 Call `inlay_surface_enable_hmr` with a trusted local path and poll HMR from the
-host event loop, including during idle periods. Reload retains serialized state;
-mtime/size changes trigger evaluation. `setTimeout`/`clearTimeout` are bounded
+host event loop, including during idle periods. Once a script is running, unreadable files and JavaScript or JSX
+syntax failures leave the current UI, handlers and host requests active. The
+view shows a reload diagnostic until the next successful reload.
+Reload retains serialized state. Changes to modification time or size trigger
+evaluation. `setTimeout`/`clearTimeout` are bounded
 one-shot timers serviced by view builds; outstanding timers request redraw.
 Cached node pointers expire on evaluation. View labels are copied to frame
 storage so later state updates cannot invalidate deferred Etch drawing. The
