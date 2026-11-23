@@ -76,8 +76,12 @@ h("toggle", {label: "Live", checked: !!s.live, onChange: "setLive"})
 An edit dispatches a string to `onEvent(name, payload, state)` and a toggle
 dispatches a boolean. Update the corresponding state field in `onEvent` to
 keep the new value. Input supports IME and up to 8191 UTF-8 bytes. Idle views
-reuse the cached nodes without running JavaScript. Color props also accept
-`var(--etch-border-subtle)` and `var(--etch-text-muted)`.
+reuse the cached nodes without running JavaScript, and repeated `cls` utility
+strings hit a persistent 2-way parsed style cache across rebuilds and theme
+switches (`hover:`, `active:`, `focus:`, and live `dark:` prefixes). Declarative
+functional components support call-path and `key`-scoped `useState`, `useRef`,
+`useMemo`, `useCallback`, and `useEffect` (with automatic unmount cleanup).
+Color props also accept `var(--etch-border-subtle)` and `var(--etch-text-muted)`.
 Scripts may invoke explicitly bound host `action(name,payload)` callbacks.
 There are no std/os, filesystem or network globals. Defaults are 8MiB VM memory,
 512KiB stack and a 4ms tick budget. Errors display a themed inline card; a new
@@ -131,14 +135,14 @@ the host pumps Windows messages.
 The completion callback reports asynchronous creation failures; it must not reenter
 or destroy the portal. Destroy may precede completion; pending callbacks remain safe.
 
-This backend supports UNDERLAY only. The host provides a dedicated native HWND
-behind an alpha-composited Etch surface with matching client coordinates and owns
-native focus, keyboard and OS IME dispatch. Child-HWND content is hidden under
-partial clipping; rounded masking and desktop alpha composition require host
-window/compositor integration. It does not offer OSR pixels or transformed browser
-input; use a texture-producing backend for those. Linux WPE and macOS WKWebView
-can implement the same public vtable; the built-in web accessor returns NULL when
-disabled or unsupported. No unimplemented native feature is silently mocked.
+This backend supports UNDERLAY mode. On Windows it prefers windowless
+DirectComposition hosting (`ICoreWebView2CompositionController` +
+`IDCompositionRectangleClip`) for rounded and partial scroll clipping with
+automatic classic child-HWND fallback when composition is unavailable. It does
+not offer OSR pixels or transformed browser input; use a texture-producing
+backend for those. Linux WPE and macOS WKWebView can implement the same public
+vtable; the built-in web accessor returns NULL when disabled or unsupported. No
+unimplemented native feature is silently mocked.
 Set `INLAY_WEBVIEW2_LOADER` to enable the real-runtime async/destruction smoke test.
 
 Release candidate scope: Inlay 0.13.0 requires Etch 0.28 and remains pre-1.0.

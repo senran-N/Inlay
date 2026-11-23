@@ -2693,8 +2693,14 @@ bool rebuild(InlaySurface* s, bool eager_state) {
     bool repeat = false;
     do {
         const JSValue global = JS_GetGlobalObject(s->js);
-        JS_SetPropertyStr(s->js, global, "__inlay_hi", JS_NewUint32(s->js, 0u));
-        JS_SetPropertyStr(s->js, global, "__inlay_dirty", JS_FALSE);
+        {
+            const JSValue begin_fn = JS_GetPropertyStr(s->js, global, "__inlay_begin");
+            if (JS_IsFunction(s->js, begin_fn)) {
+                const JSValue br = JS_Call(s->js, begin_fn, global, 0, nullptr);
+                JS_FreeValue(s->js, br);
+            }
+            JS_FreeValue(s->js, begin_fn);
+        }
         const JSValue render = JS_GetPropertyStr(s->js, global, "render");
         JSValue state = JS_GetPropertyStr(s->js, global, "state");
         if (!JS_IsFunction(s->js, render)) {
@@ -2715,6 +2721,14 @@ bool rebuild(InlaySurface* s, bool eager_state) {
         JS_FreeValue(s->js, tree);
         JS_FreeValue(s->js, render);
         JS_FreeValue(s->js, state);
+        if (!JS_HasException(s->js)) {
+            const JSValue commit_fn = JS_GetPropertyStr(s->js, global, "__inlay_commit");
+            if (JS_IsFunction(s->js, commit_fn)) {
+                const JSValue cr = JS_Call(s->js, commit_fn, global, 0, nullptr);
+                JS_FreeValue(s->js, cr);
+            }
+            JS_FreeValue(s->js, commit_fn);
+        }
         if (!JS_HasException(s->js) && !s->pending_state) {
             if (eager_state || s->path[0]) {
                 serialize_state(s, global);
@@ -2935,11 +2949,27 @@ bool load(InlaySurface* s, EtchStr script, bool is_hmr = false) {
         JS_SetPropertyStr(s->js, global, "SharedArrayBuffer", JS_UNDEFINED);
         static constexpr char bootstrap[] =
             "globalThis.__frag=Symbol('frag');"
+            "globalThis.__inlay_hm=Object.create(null);globalThis.__inlay_stk=[];globalThis.__inlay_has_hm=false;"
+            "globalThis.__inlay_seen=Object.create(null);globalThis.__inlay_fx=[];globalThis.__inlay_dirty=false;"
+            "globalThis.__inlay_begin=()=>{globalThis.__inlay_dirty=false;globalThis.__inlay_seen=Object.create(null);"
+            "globalThis.__inlay_fx.length=0;globalThis.__inlay_stk=[{k:'__root',i:0,c:0}];globalThis.__inlay_seen.__root=1;};"
+            "globalThis.__inlay_commit=()=>{if(globalThis.__inlay_has_hm){const hm=globalThis.__inlay_hm,seen=globalThis.__inlay_seen;"
+            "let any=false;for(const k in hm){if(!seen[k]){const a=hm[k];for(let j=0;j<a.length;++j){"
+            "const sl=a[j];if(sl&&sl.__fx&&typeof sl.cl==='function'){try{sl.cl();}catch(_){}}}delete hm[k];}else any=true;}"
+            "globalThis.__inlay_has_hm=any;}const fx=globalThis.__inlay_fx;if(!fx.length)return;"
+            "globalThis.__inlay_fx=[];for(let j=0;j<fx.length;++j){const r=fx[j];if(typeof r.cl==='function')r.cl();"
+            "const cl=r.fn();r.cl=typeof cl==='function'?cl:undefined;}};"
             "globalThis.h=(tag,props,...children)=>{"
             "if(tag===globalThis.__frag)return children;"
             "if(tag===Math)tag='math';"
-            "if(typeof tag==='function')"
-            "return tag.__ui?tag(props||{},...children):tag(children.length||!(props&&'children'in props)?Object.assign({},props,{children}):Object.assign({},props));"
+            "if(typeof tag==='function'){"
+            "if(tag.__ui)return tag(props||{},...children);"
+            "const stk=globalThis.__inlay_stk,pf=stk.length?stk[stk.length-1]:{k:'__root',i:0,c:0};"
+            "const nm=tag.name||'C',hk=props&&props.key!==undefined&&props.key!==null;"
+            "const sk=pf.k+'/'+(hk?(nm+'#'+String(props.key)):(nm+'@'+(pf.c++)));"
+            "globalThis.__inlay_seen[sk]=1;stk.push({k:sk,i:0,c:0});"
+            "const mp=children.length||!(props&&'children'in props)?Object.assign({},props,{children}):Object.assign({},props);"
+            "try{return tag(mp);}finally{stk.pop();}}"
             "if(tag==='switch')return{tag:'toggle',props:props||{},children};"
             "return{tag,props:props||{},children};};"
             "globalThis.__jsx=globalThis.h;"
@@ -2970,12 +3000,21 @@ bool load(InlaySurface* s, EtchStr script, bool is_hmr = false) {
             "G.Doc='doc';G.Terminal='terminal';G.VirtualList='virtualList';G.Table='table';"
             "G.Tree='tree';G.TreeItem='treeItem';G.Menu='menu';G.ContextMenu='contextMenu';"
             "G.Avatar='avatar';G.Toast='toast';G.Accordion='accordion';G.Skeleton='skeleton';"
-            "G.Fragment=G.__frag;})();"
-            "globalThis.__inlay_hooks=[];globalThis.__inlay_hi=0;globalThis.__inlay_dirty=false;"
-            "globalThis.useState=init=>{const i=globalThis.__inlay_hi++,a=globalThis.__inlay_hooks;"
-            "if(i>=a.length)a[i]=typeof init==='function'?init():init;"
+            "G.Fragment=G.__frag;"
+            "const slot=()=>{const stk=G.__inlay_stk,f=stk.length?stk[stk.length-1]:{k:'__root',i:0,c:0};"
+            "const hm=G.__inlay_hm;let a=hm[f.k];if(!a){a=hm[f.k]=[];G.__inlay_has_hm=true;}return[a,f.i++];};"
+            "const same=(a,b)=>{if(!a||!b||a.length!==b.length)return false;"
+            "for(let j=0;j<a.length;++j)if(!Object.is(a[j],b[j]))return false;return true;};"
+            "G.useState=init=>{const[a,i]=slot();if(i>=a.length)a[i]=typeof init==='function'?init():init;"
             "return[a[i],v=>{const n=typeof v==='function'?v(a[i]):v;"
-            "if(!Object.is(a[i],n)){a[i]=n;globalThis.__inlay_dirty=true;}}];};";
+            "if(!Object.is(a[i],n)){a[i]=n;G.__inlay_dirty=true;}}];};"
+            "G.useRef=init=>{const[a,i]=slot();if(i>=a.length)a[i]={current:init};return a[i];};"
+            "G.useMemo=(fn,deps)=>{const[a,i]=slot();"
+            "if(i>=a.length||!deps||!same(a[i].d,deps))a[i]={v:fn(),d:deps?deps.slice():null};return a[i].v;};"
+            "G.useCallback=(fn,deps)=>G.useMemo(()=>fn,deps);"
+            "G.useEffect=(fn,deps)=>{const[a,i]=slot();"
+            "if(i>=a.length){const r={__fx:1,d:deps?deps.slice():null,fn,cl:undefined};a[i]=r;G.__inlay_fx.push(r);}"
+            "else if(!deps||!same(a[i].d,deps)){a[i].d=deps?deps.slice():null;a[i].fn=fn;G.__inlay_fx.push(a[i]);}};})();";
         const JSValue bootstrap_result =
             JS_Eval(s->js, bootstrap, sizeof(bootstrap) - 1u, "<inlay>", JS_EVAL_TYPE_GLOBAL);
         JS_FreeValue(s->js, bootstrap_result);
@@ -3271,7 +3310,8 @@ void dispatch_box_interaction(InlaySurface* s, const NodeStyle& st, const ColdVi
 
 EtchColor resolve_live_text_color(InlaySurface* s, const NodeStyle& st, const ColdVisualStyle* cold,
                                   uint32_t id, const EtchTheme& theme, EtchColor fallback) noexcept {
-    EtchColor target = st.color.set ? inlay_ui_resolve_color(st.color, theme, fallback) : fallback;
+    const ColorRef eff_text = inlay_ui_eff_text(st, cold, inlay_is_dark_theme(theme));
+    EtchColor target = eff_text.set ? inlay_ui_resolve_color(eff_text, theme, fallback) : fallback;
     const bool disabled = (st.flags & NfDisabled) != 0u;
     if (!disabled && cold && cold->hover_text_color.set && etch_hovered(id)) {
         target = inlay_ui_resolve_color(cold->hover_text_color, theme, target);
@@ -3723,13 +3763,15 @@ void inlay_ui_populate_box_desc(InlaySurface* s, const NodeStyle& st, const Etch
         if (cold->row_span > 1u) box.grid_row_span = cold->row_span;
     }
 
-    if (st.bg.set) box.background = inlay_ui_resolve_color(st.bg, theme, box.background);
+    const ColorRef eff_bg = inlay_ui_eff_bg(st, cold, dark);
+    const ColorRef eff_border = inlay_ui_eff_border(st, cold, dark);
+    if (eff_bg.set) box.background = inlay_ui_resolve_color(eff_bg, theme, box.background);
     if (st.flags & NfHasBorderWidth) box.border_width = std::fmax(0.f, st.border_width);
     if (cold && (cold->cflags & CfHasBorderSides) && has_border_sides(cold->border_sides)) {
         box.border_sides = cold->border_sides;
     }
-    if (st.border_color.set) {
-        box.border_color = inlay_ui_resolve_color(st.border_color, theme, theme.border_subtle);
+    if (eff_border.set) {
+        box.border_color = inlay_ui_resolve_color(eff_border, theme, theme.border_subtle);
     } else if ((box.border_width > 0.f || has_border_sides(box.border_sides)) && box.border_color.a == 0u) {
         box.border_color = theme.border_subtle;
     }
@@ -4124,7 +4166,8 @@ void inlay_ui_draw_node(InlaySurface* s, uint32_t index, uint32_t parent,
             box.radius = etch_corners_all(theme.radius_control_px);
             box.focusable = !disabled;
             if (!disabled && !(cold && cold->hover_bg.set)) {
-                const EtchColor base_bg = st.bg.set ? inlay_ui_resolve_color(st.bg, theme, var_bg) : var_bg;
+                const ColorRef eff_bg = inlay_ui_eff_bg(st, cold, inlay_is_dark_theme(theme));
+                const EtchColor base_bg = eff_bg.set ? inlay_ui_resolve_color(eff_bg, theme, var_bg) : var_bg;
                 const EtchColor tint = (variant == ETCH_BUTTON_PRIMARY || variant == ETCH_BUTTON_DANGER)
                                            ? var_fg
                                            : theme.text_primary;
@@ -4235,29 +4278,32 @@ void inlay_ui_draw_node(InlaySurface* s, uint32_t index, uint32_t parent,
             }
             if (st.flags & NfHasAlignX) button.align_x = static_cast<EtchAlignX>(st.align_x);
             // Bug 3 fix: override variant's actual theme colors (primary -> accent_primary/on_primary, danger -> danger/on_error).
-            const bool custom_theme = st.bg.set || st.color.set;
+            const bool btn_dark = inlay_is_dark_theme(theme);
+            const ColorRef btn_bg = inlay_ui_eff_bg(st, cold, btn_dark);
+            const ColorRef btn_fg = inlay_ui_eff_text(st, cold, btn_dark);
+            const bool custom_theme = btn_bg.set || btn_fg.set;
             if (custom_theme) {
                 EtchTheme btn_theme = theme;
-                if (st.bg.set) {
+                if (btn_bg.set) {
                     if (button.variant == ETCH_BUTTON_PRIMARY) {
-                        const EtchColor c = inlay_ui_resolve_color(st.bg, theme, theme.accent_primary);
+                        const EtchColor c = inlay_ui_resolve_color(btn_bg, theme, theme.accent_primary);
                         btn_theme.accent_primary = c;
                         btn_theme.accent = c;
                     } else if (button.variant == ETCH_BUTTON_DANGER) {
-                        btn_theme.danger = inlay_ui_resolve_color(st.bg, theme, theme.danger);
+                        btn_theme.danger = inlay_ui_resolve_color(btn_bg, theme, theme.danger);
                     } else {
-                        btn_theme.surface_control = inlay_ui_resolve_color(st.bg, theme, theme.surface_control);
+                        btn_theme.surface_control = inlay_ui_resolve_color(btn_bg, theme, theme.surface_control);
                     }
                 }
-                if (st.color.set) {
+                if (btn_fg.set) {
                     if (button.variant == ETCH_BUTTON_PRIMARY) {
-                        btn_theme.on_primary = inlay_ui_resolve_color(st.color, theme, theme.on_primary);
+                        btn_theme.on_primary = inlay_ui_resolve_color(btn_fg, theme, theme.on_primary);
                     } else if (button.variant == ETCH_BUTTON_DANGER) {
-                        const EtchColor c = inlay_ui_resolve_color(st.color, theme, theme.on_error);
+                        const EtchColor c = inlay_ui_resolve_color(btn_fg, theme, theme.on_error);
                         btn_theme.on_error = c;
                         btn_theme.on_primary = c;
                     } else {
-                        btn_theme.text_primary = inlay_ui_resolve_color(st.color, theme, theme.text_primary);
+                        btn_theme.text_primary = inlay_ui_resolve_color(btn_fg, theme, theme.text_primary);
                     }
                 }
                 etch_push_theme(&btn_theme);
@@ -4287,9 +4333,13 @@ void inlay_ui_draw_node(InlaySurface* s, uint32_t index, uint32_t parent,
         if (st.flags & NfHasPadding) input.padding = st.padding;
         input.font_size_px = st.font_size > 0.f ? st.font_size : 15.f;
         if (st.flags & NfHasFontId) input.font_id = st.font_id;
-        if (st.bg.set) input.background = inlay_ui_resolve_color(st.bg, theme, input.background);
-        if (st.color.set) input.text_color = inlay_ui_resolve_color(st.color, theme, input.text_color);
-        if (st.border_color.set) input.border_color = inlay_ui_resolve_color(st.border_color, theme, input.border_color);
+        const bool inp_dark = inlay_is_dark_theme(theme);
+        const ColorRef inp_bg = inlay_ui_eff_bg(st, cold, inp_dark);
+        const ColorRef inp_fg = inlay_ui_eff_text(st, cold, inp_dark);
+        const ColorRef inp_bd = inlay_ui_eff_border(st, cold, inp_dark);
+        if (inp_bg.set) input.background = inlay_ui_resolve_color(inp_bg, theme, input.background);
+        if (inp_fg.set) input.text_color = inlay_ui_resolve_color(inp_fg, theme, input.text_color);
+        if (inp_bd.set) input.border_color = inlay_ui_resolve_color(inp_bd, theme, input.border_color);
         if (cold && cold->hover_border_color.set) {
             input.hover_border_color = inlay_ui_resolve_color(cold->hover_border_color, theme, input.hover_border_color);
         }
@@ -5172,6 +5222,8 @@ INLAY_API void inlay_surface_destroy(InlaySurface* s) {
     SDL_free(s->gradient_pool);
     SDL_free(s->item_pool);
     SDL_free(s->color_tweens);
+    SDL_free(s->cls_cache);
+    SDL_free(s->cls_cache_strs);
     SDL_free(s->jsx_buf);
     SDL_free(s->text);
     SDL_free(s->json_scratch);

@@ -1508,10 +1508,23 @@ bool inlay_ui_parse_alpha_mask(InlaySurface* s, JSValueConst val, EtchAlphaMaskD
 // 7. Utility Class Engine (`cls` / `className`)
 // ============================================================================
 
-void inlay_ui_apply_cls(InlaySurface* s, const char* cls, size_t cls_len,
-                        InlayUiKind kind, NodeStyle& st) {
-    if (!s || !cls || cls_len == 0u) return;
+constexpr uint32_t kClsCacheSets = 128u;
+constexpr uint32_t kClsCacheWays = 2u;
+constexpr uint32_t kClsCacheSlots = kClsCacheSets * kClsCacheWays;
+constexpr uint32_t kClsCacheStrCap = 32768u;
+constexpr size_t   kClsCacheMaxStrLen = 512u;
 
+uint64_t cls_hash64(const char* chars, size_t len) noexcept {
+    uint64_t h = 14695981039346656037ULL;
+    for (size_t i = 0u; i < len; ++i) {
+        h ^= static_cast<uint8_t>(chars[i]);
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+void inlay_ui_apply_cls_parse(InlaySurface* s, const char* cls, size_t cls_len,
+                              InlayUiKind kind, NodeStyle& st) {
     int8_t axis_override = -1; // -1 = unchanged, 0 = row, 1 = col
     int8_t pending_items = -1; // -1 = none, 0 = start, 1 = center, 2 = end
     bool saw_gap_x = false;
@@ -1525,6 +1538,36 @@ void inlay_ui_apply_cls(InlaySurface* s, const char* cls, size_t cls_len,
         while (pos < cls_len && !is_ascii_space(cls[pos])) ++pos;
         const char* tok = cls + start;
         size_t len = pos - start;
+
+        // Parse optional `dark:` theme modifier (`dark:bg-*`, `dark:border-*`, `dark:text-*`).
+        if (starts_with(tok, len, "dark:")) {
+            tok += 5u;
+            len -= 5u;
+            if (len == 0u) continue;
+            if (starts_with(tok, len, "bg-")) {
+                const ColorRef c = parse_cls_color(tok, len, tok + 3u, len - 3u);
+                if (c.set) {
+                    ColdVisualStyle* cold = inlay_ui_ensure_cold(s, st);
+                    if (!cold) return;
+                    cold->dark_bg = c;
+                }
+            } else if (starts_with(tok, len, "border-")) {
+                const ColorRef c = parse_cls_color(tok, len, tok + 7u, len - 7u);
+                if (c.set) {
+                    ColdVisualStyle* cold = inlay_ui_ensure_cold(s, st);
+                    if (!cold) return;
+                    cold->dark_border_color = c;
+                }
+            } else if (starts_with(tok, len, "text-")) {
+                const ColorRef c = parse_cls_color(tok, len, tok + 5u, len - 5u);
+                if (c.set) {
+                    ColdVisualStyle* cold = inlay_ui_ensure_cold(s, st);
+                    if (!cold) return;
+                    cold->dark_text_color = c;
+                }
+            }
+            continue;
+        }
 
         // Parse optional state prefix (`hover:`, `active:`, `press:`, `focus:`, `focus-visible:`).
         ClsState state = ClsNormal;
@@ -2514,6 +2557,95 @@ void inlay_ui_apply_cls(InlaySurface* s, const char* cls, size_t cls_len,
             st.gap = cold->row_gap;
             st.flags |= NfHasGap;
         }
+    }
+}
+
+void inlay_ui_apply_cls(InlaySurface* s, const char* cls, size_t cls_len,
+                        InlayUiKind kind, NodeStyle& st) {
+    if (!s || !cls || cls_len == 0u) return;
+
+    // Bypass cache if node already carries cold state or exceeds cache string cap.
+    if (st.cold_idx != INLAY_UI_NONE || cls_len > kClsCacheMaxStrLen) {
+        inlay_ui_apply_cls_parse(s, cls, cls_len, kind, st);
+        return;
+    }
+
+    const bool default_col_kind =
+        kind == INLAY_UI_SCROLL || kind == INLAY_UI_CARD ||
+        kind == INLAY_UI_MODAL || kind == INLAY_UI_POPOVER;
+    const uint8_t key_bits = static_cast<uint8_t>(((st.flags & NfColumn) != 0u ? 1u : 0u) |
+                                                  (default_col_kind ? 2u : 0u));
+    const uint64_t h = cls_hash64(cls, cls_len);
+    const uint32_t base_slot = static_cast<uint32_t>(h & (kClsCacheSets - 1u)) * kClsCacheWays;
+
+    if (s->cls_cache && s->cls_cache_strs) {
+        for (uint32_t w = 0u; w < kClsCacheWays; ++w) {
+            auto& e = s->cls_cache[base_slot + w];
+            if ((e.key_flags & 0x80u) != 0u && e.hash == h && e.str_len == uint16_t(cls_len) &&
+                (e.key_flags & 0x03u) == key_bits &&
+                std::memcmp(s->cls_cache_strs + e.str_off, cls, cls_len) == 0)
+            {
+                e.last_hit = ++s->cls_cache_clock;
+                st = e.style;
+                st.cold_idx = INLAY_UI_NONE;
+                if ((e.key_flags & 0x04u) != 0u) {
+                    ColdVisualStyle* cold = inlay_ui_ensure_cold(s, st);
+                    if (!cold) return;
+                    *cold = e.cold;
+                }
+                return;
+            }
+        }
+    }
+
+    const uint32_t prev_shadows = s->shadow_pool_count;
+    const uint32_t prev_grads = s->gradient_pool_count;
+    inlay_ui_apply_cls_parse(s, cls, cls_len, kind, st);
+    if (JS_HasException(s->js) || s->shadow_pool_count != prev_shadows || s->gradient_pool_count != prev_grads) {
+        return;
+    }
+
+    if (!s->cls_cache) {
+        s->cls_cache = static_cast<ClsCacheEntry*>(SDL_calloc(kClsCacheSlots, sizeof(ClsCacheEntry)));
+        s->cls_cache_strs = static_cast<char*>(SDL_malloc(kClsCacheStrCap));
+        if (!s->cls_cache || !s->cls_cache_strs) {
+            SDL_free(s->cls_cache);
+            SDL_free(s->cls_cache_strs);
+            s->cls_cache = nullptr;
+            s->cls_cache_strs = nullptr;
+            return;
+        }
+        s->cls_cache_str_used = 0u;
+    }
+    if (s->cls_cache_str_used + uint32_t(cls_len) > kClsCacheStrCap) {
+        std::memset(s->cls_cache, 0, size_t(kClsCacheSlots) * sizeof(ClsCacheEntry));
+        s->cls_cache_str_used = 0u;
+    }
+
+    uint32_t pick = base_slot;
+    if ((s->cls_cache[base_slot].key_flags & 0x80u) != 0u) {
+        if ((s->cls_cache[base_slot + 1u].key_flags & 0x80u) == 0u ||
+            s->cls_cache[base_slot + 1u].last_hit < s->cls_cache[base_slot].last_hit)
+        {
+            pick = base_slot + 1u;
+        }
+    }
+
+    auto& dst = s->cls_cache[pick];
+    dst.hash = h;
+    dst.str_off = s->cls_cache_str_used;
+    dst.str_len = uint16_t(cls_len);
+    dst.last_hit = ++s->cls_cache_clock;
+    std::memcpy(s->cls_cache_strs + dst.str_off, cls, cls_len);
+    s->cls_cache_str_used += uint32_t(cls_len);
+    dst.style = st;
+    dst.style.cold_idx = INLAY_UI_NONE;
+    const ColdVisualStyle* cold = inlay_ui_get_cold(s, st);
+    if (cold) {
+        dst.cold = *cold;
+        dst.key_flags = static_cast<uint8_t>(0x80u | 0x04u | key_bits);
+    } else {
+        dst.key_flags = static_cast<uint8_t>(0x80u | key_bits);
     }
 }
 

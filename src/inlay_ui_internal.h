@@ -320,7 +320,7 @@ struct ColdVisualStyle {
     float backdrop_brightness;
     float backdrop_noise;
     float top_rim_alpha;
-    // Hover / press / focus state overrides
+    // Hover / press / focus / dark-mode state overrides
     ColorRef hover_bg;
     ColorRef hover_border_color;
     ColorRef hover_text_color;
@@ -328,6 +328,9 @@ struct ColdVisualStyle {
     ColorRef press_border_color;
     ColorRef focus_border_color;
     ColorRef focus_ring_color;
+    ColorRef dark_bg;
+    ColorRef dark_border_color;
+    ColorRef dark_text_color;
     float hover_scale;
     float press_scale;
     float hover_opacity;
@@ -584,6 +587,17 @@ struct ColorTweenSlot {
     bool active;
 };
 
+struct ClsCacheEntry {
+    uint64_t hash;
+    uint32_t str_off;
+    uint32_t last_hit;
+    uint16_t str_len;
+    uint8_t key_flags; // bit0=init_col, bit1=default_col_kind, bit2=has_cold, bit7=valid
+    uint8_t pad_;
+    NodeStyle style;
+    ColdVisualStyle cold;
+};
+
 // ============================================================================
 // Runtime Surface Struct & Frame Event Queue
 // ============================================================================
@@ -674,6 +688,11 @@ struct InlaySurface {
     uint32_t skeleton_cache_count, skeleton_cache_cap;
     ColorTweenSlot* color_tweens;
     uint32_t color_tween_count, color_tween_cap;
+    // Persistent 2-way parsed `cls` utility cache (theme-independent ColorRef tokens)
+    ClsCacheEntry* cls_cache;
+    char* cls_cache_strs;
+    uint32_t cls_cache_str_used;
+    uint32_t cls_cache_clock;
     // Reusable JSX transpilation scratch buffer (owned via SDL_realloc / SDL_free)
     char* jsx_buf;
     size_t jsx_cap;
@@ -757,6 +776,18 @@ inline const ColdVisualStyle* inlay_ui_get_cold(const InlaySurface* s, const Nod
     return (st.cold_idx != INLAY_UI_NONE && st.cold_idx < s->cold_visual_count)
         ? &s->cold_visuals[st.cold_idx]
         : nullptr;
+}
+
+inline ColorRef inlay_ui_eff_bg(const NodeStyle& st, const ColdVisualStyle* cold, bool dark) noexcept {
+    return (dark && cold && cold->dark_bg.set) ? cold->dark_bg : st.bg;
+}
+
+inline ColorRef inlay_ui_eff_border(const NodeStyle& st, const ColdVisualStyle* cold, bool dark) noexcept {
+    return (dark && cold && cold->dark_border_color.set) ? cold->dark_border_color : st.border_color;
+}
+
+inline ColorRef inlay_ui_eff_text(const NodeStyle& st, const ColdVisualStyle* cold, bool dark) noexcept {
+    return (dark && cold && cold->dark_text_color.set) ? cold->dark_text_color : st.color;
 }
 
 inline ColdVisualStyle* inlay_ui_ensure_cold(InlaySurface* s, NodeStyle& st) {

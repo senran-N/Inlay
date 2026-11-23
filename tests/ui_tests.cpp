@@ -2169,6 +2169,204 @@ function onEvent(n, v, s) {
     inlay_surface_destroy(s);
     return ok;
 }
+bool test_scoped_hooks_cls_cache_and_dark(EtchContext *ctx) {
+    bool ok = true;
+    auto *s = inlay_surface_create(ctx, nullptr);
+    if (!check(s != nullptr, "scoped hooks surface created")) return false;
+    auto view = inlay_surface_view_desc_default();
+    view.id = etch_id("scoped_hooks_cls_view");
+    view.width_px = 640.f;
+    view.height_px = 480.f;
+
+    auto step_frame = [&](EtchVec2 ptr = {-1.f, -1.f}, bool down = false) {
+        auto fd = etch_frame_desc_default();
+        fd.viewport_w = 640u;
+        fd.viewport_h = 480u;
+        fd.pointer_pos = ptr;
+        fd.pointer_down = down;
+        etch_begin_frame(ctx, &fd);
+        inlay_surface_view(s, &view);
+        etch_end_frame(ctx);
+    };
+
+    // 1. Key-scoped & conditional-mount-safe useState + useRef + useMemo + useCallback + useEffect cleanup
+    ok &= check(inlay_surface_set_state_json(s, ETCH_STR_LIT("{\"showA\":true,\"swap\":false,\"dep\":1,\"tick\":0}")),
+                "scoped hooks initial state");
+    ok &= check(inlay_surface_set_script(s, ETCH_STR_LIT(
+        "let memoRuns=0, fxRuns=0, fxCleanups=0, lastCb=null, cbSame=0;"
+        "function Counter({label, dep}) {"
+        "  const [n, setN] = useState(0);"
+        "  const ref = useRef(0);"
+        "  ref.current += 1;"
+        "  const doubled = useMemo(() => { memoRuns++; return dep * 2; }, [dep]);"
+        "  const inc = useCallback(() => setN(c => c + 1), []);"
+        "  if (label === 'B') { if (lastCb === inc) cbSame++; lastCb = inc; }"
+        "  useEffect(() => { fxRuns++; return () => { fxCleanups++; }; }, [dep]);"
+        "  return <Row><Text>{label+':'+n+':'+doubled+':'+ref.current}</Text><Button text={'+'+label} onClick={inc} /></Row>;"
+        "}"
+        "function render(st) {"
+        "  const a = st.showA ? <Counter key='a' label='A' dep={st.dep} /> : null;"
+        "  const b = <Counter key='b' label='B' dep={st.dep} />;"
+        "  return <Col>"
+        "    <Text>{'M='+memoRuns+',E='+fxRuns+',C='+fxCleanups+',S='+cbSame}</Text>"
+        "    {st.swap ? [b, a] : [a, b]}"
+        "  </Col>;"
+        "}"
+        "function onEvent(name, val, st) {"
+        "  if (name === 'hideA') st.showA = false;"
+        "  if (name === 'showA') st.showA = true;"
+        "  if (name === 'swap') st.swap = !st.swap;"
+        "  if (name === 'dep') st.dep = val;"
+        "  if (name === 'noop') st.tick++;"
+        "}")),
+        "scoped hooks JSX script");
+
+    auto find_text = [&](const char *prefix) -> EtchStr {
+        uint32_t cnt = 0;
+        const auto *nodes = inlay_surface_nodes(s, &cnt);
+        const size_t plen = std::strlen(prefix);
+        for (uint32_t i = 0; i < cnt; ++i) {
+            if (nodes[i].kind == INLAY_UI_TEXT && nodes[i].text.length >= plen &&
+                std::memcmp(nodes[i].text.chars, prefix, plen) == 0)
+            {
+                return nodes[i].text;
+            }
+        }
+        return {};
+    };
+    auto str_is = [](EtchStr a, const char *lit) {
+        const size_t n = std::strlen(lit);
+        return a.length == n && a.chars && std::memcmp(a.chars, lit, n) == 0;
+    };
+
+    // Initial mount: both A and B mounted -> memoRuns=2, fxRuns=2, fxCleanups=0
+    ok &= check(str_is(find_text("A:"), "A:0:2:1") && str_is(find_text("B:"), "B:0:2:1"),
+                "scoped hooks initial render values");
+    step_frame();
+    uint32_t cnt = 0;
+    const auto *nodes = inlay_surface_nodes(s, &cnt);
+    uint32_t btn_b_id = 0;
+    for (uint32_t i = 0; i < cnt; ++i) {
+        if (nodes[i].kind == INLAY_UI_BUTTON && str_is(nodes[i].text, "+B")) {
+            uint32_t path[16] = {};
+            uint32_t depth = 0;
+            uint32_t cur = i;
+            while (cur < cnt && depth < 16) {
+                path[depth++] = nodes[cur].id;
+                uint32_t parent = UINT32_MAX;
+                for (uint32_t p = 0; p < cnt; ++p) {
+                    for (uint32_t ch = nodes[p].first_child; ch != UINT32_MAX && ch < cnt; ch = nodes[ch].next_sibling) {
+                        if (ch == cur) { parent = p; break; }
+                    }
+                    if (parent != UINT32_MAX) break;
+                }
+                cur = parent;
+            }
+            uint32_t eid = view.id;
+            for (uint32_t d = depth; d > 0; --d) eid = etch_id_index(eid, path[d - 1]);
+            btn_b_id = eid;
+            break;
+        }
+    }
+    const EtchRect bb = etch_element_bounds(btn_b_id);
+    ok &= check(bb.w > 0.f && bb.h > 0.f, "+B button bounds valid");
+    const EtchVec2 bp = {bb.x + bb.w * 0.5f, bb.y + bb.h * 0.5f};
+    step_frame(bp, true);
+    step_frame(bp, false);
+    ok &= check(str_is(find_text("A:"), "A:0:2:2") && str_is(find_text("B:"), "B:1:2:2"),
+                "scoped useState click increments only B");
+    ok &= check(str_is(find_text("M="), "M=2,E=2,C=0,S=1"),
+                "useMemo/useCallback/useEffect stable when dep unchanged");
+
+    // Hide A: A unmounts -> A's useEffect cleanup runs (C=1), B preserves state B:1!
+    ok &= check(inlay_surface_dispatch(s, ETCH_STR_LIT("hideA"), ETCH_STR_LIT("null")), "hide A");
+    ok &= check(find_text("A:").length == 0 && str_is(find_text("B:"), "B:1:2:3"),
+                "hiding A preserves B state cleanly");
+    ok &= check(inlay_surface_dispatch(s, ETCH_STR_LIT("noop"), ETCH_STR_LIT("null")), "noop render after hideA");
+    ok &= check(str_is(find_text("M="), "M=2,E=2,C=1,S=3"),
+                "unmount cleanup ran exactly once and callback identity held");
+
+    // Remount A + swap order: A starts fresh at 0 while B stays at 1!
+    ok &= check(inlay_surface_dispatch(s, ETCH_STR_LIT("showA"), ETCH_STR_LIT("null")), "show A");
+    ok &= check(inlay_surface_dispatch(s, ETCH_STR_LIT("swap"), ETCH_STR_LIT("null")), "swap A and B");
+    ok &= check(str_is(find_text("A:"), "A:0:2:2") && str_is(find_text("B:"), "B:1:2:6"),
+                "keyed swap keeps B=1 and fresh A=0 isolated");
+
+    // Change dep 1 -> 5: both useMemo & useEffect re-run with cleanups first!
+    ok &= check(inlay_surface_dispatch(s, ETCH_STR_LIT("dep"), ETCH_STR_LIT("5")), "change dep to 5");
+    ok &= check(str_is(find_text("A:"), "A:0:10:3") && str_is(find_text("B:"), "B:1:10:7"),
+                "useMemo recomputed on dep change");
+    ok &= check(inlay_surface_dispatch(s, ETCH_STR_LIT("noop"), ETCH_STR_LIT("null")), "observe post-dep counters");
+    ok &= check(str_is(find_text("M="), "M=5,E=5,C=3,S=7"),
+                "useEffect cleanup ran before re-run on dep change");
+
+    // 2. Live `dark:` Tailwind prefix with 0 JS ticks across Light <-> Dark theme switches
+    ok &= check(inlay_surface_set_state_json(s, ETCH_STR_LIT("{\"n\":0}")), "dark cls state");
+    ok &= check(inlay_surface_set_script(s, ETCH_STR_LIT(
+        "function render(st) {"
+        "  return <Box cls='w-40 h-20 p-3 rounded-lg bg-[#FFFFFF] dark:bg-[#112233] border border-[#DDDDDD] dark:border-[#445566]'>"
+        "    <Text cls='text-[#111111] dark:text-[#EEEEEE]'>{'Mode ' + st.n}</Text>"
+        "  </Box>;"
+        "}")),
+        "dark: cls script");
+    const uint64_t ticks_before_theme = inlay_surface_stats(s).js_ticks;
+    auto has_rect_color = [&](uint32_t expected_rgba8) -> bool {
+        const uint32_t pcnt = etch_frame_prim_count(ctx);
+        for (uint32_t i = 0; i < pcnt; ++i) {
+            EtchPrim p = {};
+            if (etch_get_frame_prim(ctx, i, &p) &&
+                (p.style.x & 15u) == uint32_t(ETCH_PRIM_RECT) && p.style.y == expected_rgba8)
+            {
+                return true;
+            }
+        }
+        return false;
+    };
+    const EtchTheme prev_theme = etch_get_theme(ctx);
+    const EtchTheme light_t = etch_theme_light();
+    const EtchTheme dark_t = etch_theme_dark();
+    etch_set_theme(&light_t, ctx);
+    step_frame();
+    ok &= check(has_rect_color(etch_color_pack_rgba8(etch_rgb_hex(0xFFFFFFu, 255u))),
+                "light theme uses base bg-[#FFFFFF]");
+    etch_set_theme(&dark_t, ctx);
+    step_frame();
+    ok &= check(has_rect_color(etch_color_pack_rgba8(etch_rgb_hex(0x112233u, 255u))),
+                "dark theme switches live to dark:bg-[#112233]");
+    ok &= check(inlay_surface_stats(s).js_ticks == ticks_before_theme,
+                "dark: theme switch runs 0 JS ticks");
+    etch_set_theme(&prev_theme, ctx);
+
+    // 3. ClsCache stress & latency check (150 repeated Tailwind cards = 301 nodes across 15 rebuilds)
+    ok &= check(inlay_surface_set_state_json(s, ETCH_STR_LIT("{\"v\":0}")), "cls cache bench state");
+    ok &= check(inlay_surface_set_script(s, ETCH_STR_LIT(
+        "function render(st) {"
+        "  const items = [];"
+        "  for (let i = 0; i < 150; ++i) {"
+        "    items.push(<Row key={i} cls='w-full px-3 py-2 gap-2 items-center rounded-md bg-surface dark:bg-elevated border border-subtle hover:bg-hover transition-colors'>"
+        "<Text cls='text-sm font-medium text-primary dark:text-[#F8FAFC]'>{'Row ' + i + ':' + st.v}</Text>"
+        "</Row>);"
+        "  }"
+        "  return <Col cls='w-full gap-1 p-2'>{items}</Col>;"
+        "}"
+        "function onEvent(n, v, st) { if (n === 'bump') st.v++; }")),
+        "150-row cls cache script");
+    double rebuild_ms[15] = {};
+    for (int i = 0; i < 15; ++i) {
+        ok &= check(inlay_surface_dispatch(s, ETCH_STR_LIT("bump"), ETCH_STR_LIT("null")), "cls bench bump");
+        rebuild_ms[i] = inlay_surface_stats(s).last_tick_ms;
+    }
+    for (int i = 1; i < 15; ++i)
+        for (int j = i; j > 0 && rebuild_ms[j] < rebuild_ms[j - 1]; --j) {
+            const double tmp = rebuild_ms[j]; rebuild_ms[j] = rebuild_ms[j - 1]; rebuild_ms[j - 1] = tmp;
+        }
+    std::printf("Cached 150-row (301-node) cls rebuild median: %.3fms\n", rebuild_ms[7]);
+    ok &= check(inlay_surface_stats(s).node_count == 301u && rebuild_ms[7] < 3.0,
+                "cached 150-row cls rebuild stays fast and complete");
+
+    inlay_surface_destroy(s);
+    return ok;
+}
 } // namespace
 int main(int argc, char **argv) {
     auto config = etch_context_desc_default();
@@ -2469,6 +2667,7 @@ int main(int argc, char **argv) {
         ok &= check(!etch_needs_redraw(context), "persistent HMR error settles idle");
         inlay_surface_destroy(missing);
     }
+    ok &= test_scoped_hooks_cls_cache_and_dark(context);
     inlay_surface_destroy(surface);
     etch_destroy_context(context);
     std::puts(ok ? "Sandbox reactive/HMR PASS" : "Sandbox reactive/HMR FAIL");
