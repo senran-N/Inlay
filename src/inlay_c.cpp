@@ -127,6 +127,7 @@ INLAY_API InlaySurfaceDesc inlay_surface_desc_default(void) {
  d.max_tick_ms = 4.f;
  d.max_nodes = 4096u;
  d.max_text_bytes = 65536u;
+ d.disable_jsx = false;
  return d;
 }
 

@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.13.0] - 2026-11-23
+
+- Require Etch 0.28 across `CMakeLists.txt`, installed `InlayConfig.cmake`, and downstream consumer checks.
+- Upgrade `InlaySurface` with zero-dependency line-preserving JSX transpilation (`src/inlay_ui_jsx.cpp`, enabled by default with `InlaySurfaceDesc::disable_jsx` opt-out), Tailwind-style utility classes & transitions (`src/inlay_ui_style.cpp`), hot/cold `NodeStyle` + `ColdVisualStyle` split with Etch 0.28 blend modes, alpha masks, and OpenType flags, grow-to-parent sizing (`width_px <= 0` / `height_px <= 0`), and 12 new native/composite UI widgets (`INLAY_UI_DOC`, `INLAY_UI_TERMINAL`, `INLAY_UI_VIRTUAL_LIST`, `INLAY_UI_TABLE`, `INLAY_UI_TREE`, `INLAY_UI_TREE_ITEM`, `INLAY_UI_MENU`, `INLAY_UI_CONTEXT_MENU`, `INLAY_UI_AVATAR`, `INLAY_UI_TOAST`, `INLAY_UI_ACCORDION`, `INLAY_UI_SKELETON` in `src/inlay_ui_widgets.cpp`).
+- Consolidate core geometric POD growth (`inlay_grow_pod`), FNV-1a hashing (`inlay_fnv1a_32` / `inlay_fnv1a_64`), and UTF-8 decoding (`inlay_utf8_next`) into `src/inlay_internal.h`.
+
 ## [0.12.0] - 2026-11-23
 
 - Require Etch 0.27 (`Etch 0.27.0`) across `CMakeLists.txt`, installed `InlayConfig.cmake`, and downstream checks.

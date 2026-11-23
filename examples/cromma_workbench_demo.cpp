@@ -100,7 +100,7 @@ void populate_terminal(Workbench *app) noexcept {
     auto *r = app->terminal + 3u * kTermCols;
     write_term_seg(r, col, "[ui]     ", c_violet, true);
     write_term_seg(r, col,
-                   "QuickJS-NG v" INLAY_VERSION_STRING " sandbox · tabs + math + slot      ",
+                   "QuickJS-NG v" INLAY_VERSION_STRING " JSX + cls · table + ring + slot   ",
                    c_body);
     write_term_seg(r, col, "0 IDLE", c_amber, true);
   }
@@ -109,7 +109,7 @@ void populate_terminal(Workbench *app) noexcept {
     auto *r = app->terminal + 4u * kTermCols;
     write_term_seg(r, col, "[gpu]    ", c_teal, true);
     write_term_seg(r, col,
-                   "Etch uber batch · Oklab stops · R8 stem-darkened     ",
+                   "Etch micro-shaders · Oklab stops · R8 stem-darkened  ",
                    c_body);
     write_term_seg(r, col, "OK", c_emerald, true);
   }
@@ -313,12 +313,12 @@ void build(Context *ctx, Workbench *app) noexcept {
       .gap = 14.0f,
   });
 
-  // Left Column: Research · Streamed Document (380px)
+  // Left Column: Research · Streamed Document (356px)
   begin_box({
       .axis = Axis::Col,
-      .width = Sizing::fixed(380.0f),
+      .width = Sizing::fixed(356.0f),
       .height = Sizing::grow(),
-      .padding = Padding::all(16.0f),
+      .padding = Padding::all(14.0f),
       .gap = 10.0f,
       .background = t.bg_surface,
       .border_color = card_border,
@@ -344,12 +344,22 @@ void build(Context *ctx, Workbench *app) noexcept {
   label("STREAMING", 9.5f, emerald, kFontMono);
   end_box();
 
+  begin_box({
+      .id = id("research-scroll"),
+      .axis = Axis::Col,
+      .width = Sizing::grow(),
+      .height = Sizing::grow(),
+      .clip_children = true,
+      .scroll_y = true,
+      .show_scrollbar = true,
+  });
   auto doc_view = inlay_doc_view_desc_default();
   doc_view.id = id("research");
-  doc_view.width_px = 348.0f;
-  doc_view.height_px = 640.0f;
-  doc_view.font_size_px = 13.5f;
+  doc_view.width_px = 322.0f;
+  doc_view.height_px = 0.0f;
+  doc_view.font_size_px = 13.0f;
   inlay_doc_view(app->document, &doc_view);
+  end_box();
   end_box();
 
   // Center Column (Grow)
@@ -415,7 +425,7 @@ void build(Context *ctx, Workbench *app) noexcept {
       .id = id("portal-canvas"),
       .width = Sizing::grow(),
       .height = Sizing::grow(),
-      .default_pan = {174.0f, 81.0f},
+      .default_pan = {152.0f, 81.0f},
       .default_zoom = 0.65f,
       .background = Color::transparent(),
       .border_color = Color::transparent(),
@@ -611,13 +621,13 @@ void build(Context *ctx, Workbench *app) noexcept {
   end_box();
   end_box();
 
-  // Right Column: Declarative Inspector · QuickJS-NG (276px, toggleable)
+  // Right Column: Declarative Inspector · JSX + QuickJS-NG (348px, toggleable)
   if (app->inspect) {
     begin_box({
         .axis = Axis::Col,
-        .width = Sizing::fixed(276.0f),
+        .width = Sizing::fixed(348.0f),
         .height = Sizing::grow(),
-        .padding = Padding::all(16.0f),
+        .padding = Padding::all(14.0f),
         .gap = 10.0f,
         .background = t.bg_surface,
         .border_color = card_border,
@@ -640,14 +650,14 @@ void build(Context *ctx, Workbench *app) noexcept {
          .radius = Corners::all(4.0f)});
     label("Declarative Inspector", 13.0f, t.text_primary, kFontBold);
     box({.width = Sizing::grow()});
-    label("QuickJS-NG", 9.5f, indigo, kFontMono);
+    label("JSX · QuickJS-NG", 9.5f, indigo, kFontMono);
     end_box();
 
     if (app->inspector) {
       InlaySurfaceViewDesc surface_view = inlay_surface_view_desc_default();
       surface_view.id = id("sandbox-inspector");
-      surface_view.width_px = 244.0f;
-      surface_view.height_px = 640.0f;
+      surface_view.width_px = 0.0f;
+      surface_view.height_px = 0.0f;
       inlay_surface_view(app->inspector, &surface_view);
     } else {
       label("Scripting disabled", 12.5f, t.text_muted);
@@ -751,72 +761,250 @@ int main(int argc, char **argv) {
   }
 
   if (app.inspector) {
+    ok &= inlay_surface_bind_slot(app.inspector, ETCH_STR_LIT("live-badge"),
+                                  render_telemetry_slot, &app);
     ok &= inlay_surface_bind_slot(app.inspector, ETCH_STR_LIT("telemetry"),
                                   render_telemetry_slot, &app);
     static const char inspector_js[] = R"JS(
+const PIPELINE_COLS = [
+  { key: 'pass',   title: 'Pass',   minWidth: 68 },
+  { key: 'time',   title: 'Time',   width: 66, numeric: true },
+  { key: 'mem',    title: 'Mem',    width: 60, numeric: true },
+  { key: 'status', title: 'Status', width: 58, align: 'right' }
+];
+
+const PIPELINE_ROWS = [
+  { pass: 'Doc',      time: '0.42ms', mem: '1.8MB', status: 'Ready' },
+  { pass: 'Portal',   time: '1.15ms', mem: '4.2MB', status: 'Sync'  },
+  { pass: 'JSX UI',   time: '0.00ms', mem: '0.6MB', status: 'Idle'  },
+  { pass: 'Etch GPU', time: '0.68ms', mem: '6.4MB', status: 'OK'    }
+];
+
+function SectionTitle({ title, tag }) {
+  return (
+    <Row cls="w-full justify-between items-center">
+      <Text cls="text-2xs font-mono text-muted tracking-wide">{title}</Text>
+      {tag ? <Badge variant="secondary" cls="text-2xs">{tag}</Badge> : null}
+    </Row>
+  );
+}
+
 function render(s) {
   const tab = s.tab || 0;
   const budget = s.budget !== undefined ? s.budget : 4.0;
   const pct = Math.round(Math.min(100, Math.max(0, (budget / 8.0) * 100)));
-  const pillGrad = {
-    kind: 'linear',
-    oklab: true,
-    dir: [1, 0],
-    stops: [
-      { color: '#6366f1', pos: 0.0 },
-      { color: '#06b6d4', pos: 0.55 },
-      { color: '#10b981', pos: 1.0 }
-    ]
-  };
-  const body = tab === 0
-    ? [
-        ui.card({ elevation: 'sm', padding: 10, gap: 8, width: -1, continuousCorners: true },
-          ui.row({ width: -1, justify: 'between', alignItems: 'center' },
-            ui.text({ text: 'Filter & Budget', fontSize: 12, bold: true }),
-            ui.badge({ text: 'v)JS" INLAY_VERSION_STRING R"JS(', color: '#ffffff', bg: '#3b82f6', gradient: pillGrad })
-          ),
-          ui.input({ value: s.query || '', placeholder: 'Filter evidence...', onChange: 'setQuery', width: -1, fontSize: 12.5 }),
-          ui.toggle({ label: 'Live stream sync', checked: s.live !== false, onChange: 'setLive', fontSize: 12.5 }),
-          ui.checkbox({ label: 'Optical vibrancy', checked: s.vibrancy !== false, onChange: 'setVibrancy', fontSize: 12.5 }),
-          ui.slider({ label: 'Tick budget (ms)', value: budget, min: 1, max: 8, step: 0.5, width: -1, onChange: 'setBudget' }),
-          ui.row({ width: -1, justify: 'between', alignItems: 'center' },
-            ui.text({ text: 'Budget headroom', fontSize: 11, color: 'var(--etch-text-muted)' }),
-            ui.text({ text: pct + '%', fontSize: 11, mono: true, color: 'var(--etch-accent)' })
-          ),
-          ui.progress({ value: pct, min: 0, max: 100, width: -1, height: 8, radius: 'pill' })
-        ),
-        ui.card({ elevation: 'sm', padding: 10, gap: 6, width: -1, continuousCorners: true },
-          ui.text({ text: 'LATENCY GUARD', fontSize: 10, mono: true, color: 'var(--etch-text-muted)' }),
-          ui.math({ tex: '\\Delta t < 2\\,\\text{ms}', fontSize: 14 })
-        ),
-        ui.card({ elevation: 'sm', padding: 10, gap: 6, width: -1, continuousCorners: true },
-          ui.text({ text: 'LIVE ENGINE TELEMETRY', fontSize: 10, mono: true, color: 'var(--etch-text-muted)' }),
-          ui.slot({ name: 'telemetry', width: -1, height: 62, props: { mode: 'controls' } })
-        ),
-        ui.text({ text: 'Drag canvas · click portal tile · zero idle JS', fontSize: 11, color: 'var(--etch-text-muted)', wrap: true })
-      ]
-    : [
-        ui.card({ elevation: 'sm', padding: 10, gap: 8, width: -1, continuousCorners: true },
-          ui.text({ text: 'Confidence Formula', fontSize: 12, bold: true }),
-          ui.math({ tex: '\\frac{a+b}{\\sqrt{x_1^2+x_2^2}}', fontSize: 16 }),
-          ui.diagram({ source: 'flowchart LR\nJS[QuickJS] --> POD[POD]\nPOD --> GPU[Etch]', width: 210 })
-        ),
-        ui.card({ elevation: 'sm', padding: 10, gap: 6, width: -1, continuousCorners: true },
-          ui.text({ text: 'LIVE ENGINE TELEMETRY', fontSize: 10, mono: true, color: 'var(--etch-text-muted)' }),
-          ui.slot({ name: 'telemetry', width: -1, height: 62, props: { mode: 'formula' } })
-        )
-      ];
-  return ui.col({ width: -1, gap: 10 },
-    ui.tabs({ id: 'mode', items: ['Controls', 'Formula'], active: tab, onChange: 'setTab' }),
-    ...body
+  const selectedNode = s.node || 'portal';
+  const selectedRow = s.row !== undefined ? s.row : 2;
+  const checks = s.checks || 1;
+  const vibrancy = s.vibrancy !== false;
+  const liveSync = s.live !== false;
+  const tabular = s.tabular !== false;
+
+  const overviewPane = (
+    <>
+      <Card cls="w-full bg-elevated rounded-xl shadow-sm p-2.5 gap-2 border border-subtle squircle transition duration-150 ease-out hover:border-accent/40">
+        <SectionTitle title="PIPELINE METRICS" tag="0-tick sort" />
+        <Table
+          id="pipeline-table"
+          columns={PIPELINE_COLS}
+          rows={PIPELINE_ROWS}
+          headerHeight={28}
+          rowHeight={26}
+          cellPaddingX={6}
+          fontSize={11.5}
+          selectedRow={selectedRow}
+          onRowClick={e => { state.row = e.row; }}
+        />
+      </Card>
+
+      <Card cls="w-full bg-elevated rounded-xl shadow-sm p-2.5 gap-2 border border-subtle squircle transition duration-150 ease-out hover:bg-hover">
+        <SectionTitle title="FRAME HEADROOM" tag={budget.toFixed(1) + ' ms'} />
+        <Row cls="w-full items-center gap-3">
+          <Progress
+            id="headroom-ring"
+            variant="ring"
+            value={pct}
+            min={0}
+            max={100}
+            width={50}
+            height={50}
+            thickness={4.5}
+            showPercent
+          />
+          <Col cls="flex-1 gap-1.5 min-w-0">
+            <Row cls="w-full justify-between items-center">
+              <Text cls="text-xs font-medium text-primary">Tick budget</Text>
+              <Text cls="text-xs font-mono tabular-nums text-accent">{pct}%</Text>
+            </Row>
+            <Progress value={pct} min={0} max={100} cls="w-full h-2 rounded-full" />
+            <Slider
+              id="budget-slider"
+              value={budget}
+              min={1}
+              max={8}
+              step={0.5}
+              width="grow"
+              onChange={v => { state.budget = v; }}
+            />
+          </Col>
+        </Row>
+      </Card>
+
+      <Card cls="w-full bg-elevated rounded-xl shadow-sm p-2.5 gap-2 border border-subtle squircle">
+        <Row cls="w-full justify-between items-center">
+          <Text cls="text-2xs font-mono text-muted tracking-wide">LATENCY GUARD</Text>
+          <Math tex={'\\Delta t < 2\\,\\text{ms}'} fontSize={12.5} />
+        </Row>
+        <Slot name="live-badge" cls="w-full h-[52px]" props={{ tab, budget }} />
+      </Card>
+
+      <Row cls="w-full items-center gap-2">
+        <Button
+          id="run-check"
+          variant="primary"
+          cls="flex-1 h-8 rounded-lg text-xs transition duration-150 hover:scale-102 active:scale-98"
+          onClick={() => { state.checks = checks + 1; state.toastOpen = true; }}
+        >
+          Verify
+          <Badge cls="bg-white/20 text-white text-2xs px-1.5 py-0.5">{checks}</Badge>
+        </Button>
+        <Button
+          id="open-scene"
+          variant="default"
+          cls="h-8 rounded-lg text-xs transition duration-150 hover:bg-hover"
+          onClick={() => { state.tab = 1; }}
+        >
+          Scene
+        </Button>
+      </Row>
+    </>
+  );
+
+  const scenePane = (
+    <>
+      <Card cls="w-full bg-elevated rounded-xl shadow-sm p-2.5 gap-1.5 border border-subtle squircle">
+        <SectionTitle title="SCENE TREE" tag={selectedNode} />
+        <Tree id="scene-tree" showIndentGuide>
+          <TreeItem label="Cromma Workbench" defaultOpen selected={selectedNode === 'root'} onSelect={() => { state.node = 'root'; }}>
+            <TreeItem label="Aurora Shader" leaf selected={selectedNode === 'aurora'} onSelect={() => { state.node = 'aurora'; }} />
+            <TreeItem label="Portal Node @ 65%" defaultOpen selected={selectedNode === 'portal'} onSelect={() => { state.node = 'portal'; }}>
+              <TreeItem label="Frosted Vibrancy" leaf selected={selectedNode === 'frost'} onSelect={() => { state.node = 'frost'; }} />
+            </TreeItem>
+            <TreeItem label="Markdown Stream" leaf selected={selectedNode === 'doc'} onSelect={() => { state.node = 'doc'; }} />
+            <TreeItem label="ANSI Terminal" leaf selected={selectedNode === 'term'} onSelect={() => { state.node = 'term'; }} />
+            <TreeItem label="Inspector JSX" leaf selected={selectedNode === 'jsx'} onSelect={() => { state.node = 'jsx'; }} />
+          </TreeItem>
+        </Tree>
+      </Card>
+
+      <Accordion id="render-opts" title="Compositor Settings" defaultOpen cls="w-full">
+        <Switch label="Live stream sync" size="sm" checked={liveSync} onChange={v => { state.live = v; }} />
+        <Switch label="Optical vibrancy" size="sm" checked={vibrancy} onChange={v => { state.vibrancy = v; }} />
+        <Switch label="Tabular numerals" size="sm" checked={tabular} onChange={v => { state.tabular = v; }} />
+      </Accordion>
+
+      <Card cls="w-full bg-elevated rounded-xl shadow-sm p-2.5 gap-2 border border-subtle squircle">
+        <SectionTitle title="ASYNC PLACEHOLDER" tag="Skeleton" />
+        <Row cls="w-full items-center gap-2.5">
+          <Skeleton variant="circle" width={28} height={28} />
+          <Skeleton variant="text" lines={2} lineGap={6} />
+        </Row>
+      </Card>
+    </>
+  );
+
+  const consolePane = (
+    <>
+      <Terminal
+        id="jsx-term"
+        title="jsx-probe"
+        cols={34}
+        rows={6}
+        fontSize={11}
+        cls="w-full"
+        lines={[
+          '\x1b[32m$\x1b[0m inlay inspect --jsx --cls',
+          '\x1b[36m[jsx]\x1b[0m zero-Node transpile  \x1b[32mOK\x1b[0m',
+          '\x1b[35m[cls]\x1b[0m live theme tokens    \x1b[32mOK\x1b[0m',
+          '\x1b[33m[vm]\x1b[0m  idle JS ticks        \x1b[1m0\x1b[0m',
+          '\x1b[90m> ready for HMR reload...\x1b[0m'
+        ]}
+      />
+
+      <Card cls="w-full bg-elevated rounded-xl shadow-sm p-2.5 gap-1.5 border border-subtle squircle">
+        <SectionTitle title="NOTES" tag="Doc" />
+        <Doc
+          fontSize={12}
+          markdown={'### Inlay v)JS" INLAY_VERSION_STRING R"JS(\n- Zero-build **JSX** + utility `cls`\n- Native **Table**, **Tree**, **Terminal**\n- Automatic `transition` · **0** idle ticks'}
+        />
+      </Card>
+
+      <Row cls="w-full items-center gap-2">
+        <Button
+          id="show-toast"
+          variant="primary"
+          cls="flex-1 h-8 rounded-lg text-xs transition duration-150 hover:scale-102"
+          onClick={() => { state.toastOpen = true; }}
+        >
+          Show Toast
+        </Button>
+        <Button
+          id="hide-toast"
+          variant="default"
+          cls="h-8 rounded-lg text-xs transition duration-150 hover:bg-hover"
+          onClick={() => { state.toastOpen = false; }}
+        >
+          Dismiss
+        </Button>
+      </Row>
+    </>
+  );
+
+  return (
+    <Col cls="w-full h-full gap-2.5">
+      <Row cls="w-full items-center gap-2 bg-elevated rounded-xl p-2 border border-subtle squircle">
+        <Avatar name="Cromma AI" size="sm" status="online" />
+        <Col cls="flex-1 gap-0.5 min-w-0">
+          <Text cls="text-xs font-semibold text-primary truncate">Cromma AI</Text>
+          <Text cls="text-2xs font-mono text-muted truncate">Live Inspector</Text>
+        </Col>
+        <Badge variant="success" dot cls="text-2xs">v)JS" INLAY_VERSION_STRING R"JS(</Badge>
+        <Badge variant="accent" cls="text-2xs">JSX + HMR</Badge>
+      </Row>
+
+      <Tabs
+        id="mode"
+        cls="w-full"
+        fontSize={12}
+        items={['Overview', 'Scene', 'Console']}
+        active={tab}
+        onChange={i => { state.tab = i; }}
+      />
+
+      <Scroll id="inspector-body" cls="w-full h-full gap-2.5">
+        {tab === 0 ? overviewPane : tab === 1 ? scenePane : consolePane}
+      </Scroll>
+
+      <Toast
+        id="status-toast"
+        open={!!s.toastOpen}
+        variant="success"
+        position="bottom-right"
+        title="Workbench Verified"
+        description="Zero-Node JSX, Oklab cls tokens & 0 idle JS ticks."
+        actionLabel="Scene"
+        onAction={() => { state.tab = 1; state.toastOpen = false; }}
+        onClose={() => { state.toastOpen = false; }}
+      />
+    </Col>
   );
 }
+
 function onEvent(name, payload, s) {
   if (name === 'setTab') s.tab = payload;
-  if (name === 'setQuery') s.query = payload;
+  if (name === 'setBudget') s.budget = payload;
   if (name === 'setLive') s.live = payload;
   if (name === 'setVibrancy') s.vibrancy = payload;
-  if (name === 'setBudget') s.budget = payload;
 }
 )JS";
     ok &= inlay_surface_set_script(

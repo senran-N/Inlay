@@ -1,9 +1,86 @@
 #pragma once
 #include <inlay/inlay_c.h>
+#include <SDL3/SDL_stdinc.h>
+#include <cstdint>
 #include <cstring>
 
 inline bool inlay_is_dark_theme(const EtchTheme& theme) noexcept {
  return (uint32_t(theme.bg_canvas.r) * 299u + uint32_t(theme.bg_canvas.g) * 587u + uint32_t(theme.bg_canvas.b) * 114u) < 128000u;
+}
+
+template <typename T>
+inline bool inlay_grow_pod(T*& ptr, uint32_t& cap, uint32_t needed,
+                           uint32_t init_cap, uint32_t hard_cap) noexcept {
+ if (needed <= cap) return true;
+ if (needed > hard_cap) return false;
+ uint32_t next = cap ? cap : (init_cap ? init_cap : 16u);
+ if (next > hard_cap) next = hard_cap;
+ while (next < needed) {
+  next = (next > hard_cap / 2u) ? hard_cap : (next * 2u);
+ }
+ if (size_t(next) > SIZE_MAX / sizeof(T)) return false;
+ void* mem = SDL_realloc(ptr, size_t(next) * sizeof(T));
+ if (!mem) return false;
+ ptr = static_cast<T*>(mem);
+ cap = next;
+ return true;
+}
+
+inline uint32_t inlay_fnv1a_32(const void* data, size_t len,
+                               uint32_t seed = 2166136261u) noexcept {
+ uint32_t h = seed;
+ const auto* p = static_cast<const uint8_t*>(data);
+ for (size_t i = 0; i < len; ++i)
+  h = (h ^ uint32_t(p[i])) * 16777619u;
+ return h;
+}
+
+inline uint64_t inlay_fnv1a_64(const void* data, size_t len,
+                               uint64_t seed = 14695981039346656037ull) noexcept {
+ uint64_t h = seed;
+ const auto* p = static_cast<const uint8_t*>(data);
+ for (size_t i = 0; i < len; ++i)
+  h = (h ^ uint64_t(p[i])) * 1099511628211ull;
+ return h;
+}
+
+inline uint32_t inlay_utf8_next(const char* s, size_t len, size_t* io_pos) noexcept {
+ const size_t pos = *io_pos;
+ if (pos >= len) return 0u;
+ const uint8_t b0 = static_cast<uint8_t>(s[pos]);
+ if (b0 < 0x80u) {
+  *io_pos = pos + 1u;
+  return b0;
+ }
+ uint32_t n = 0u, cp = 0u, min_cp = 0u;
+ if (b0 >= 0xC2u && b0 <= 0xDFu) {
+  n = 2u; cp = b0 & 0x1Fu; min_cp = 0x80u;
+ } else if (b0 >= 0xE0u && b0 <= 0xEFu) {
+  n = 3u; cp = b0 & 0x0Fu; min_cp = 0x800u;
+ } else if (b0 >= 0xF0u && b0 <= 0xF4u) {
+  n = 4u; cp = b0 & 0x07u; min_cp = 0x10000u;
+ } else {
+  *io_pos = pos + 1u;
+  return 0xFFFDu;
+ }
+ if (pos + n > len) {
+  *io_pos = pos + 1u;
+  return 0xFFFDu;
+ }
+ for (uint32_t i = 1u; i < n; ++i) {
+  const uint8_t bx = static_cast<uint8_t>(s[pos + i]);
+  if ((bx & 0xC0u) != 0x80u) {
+   *io_pos = pos + 1u;
+   return 0xFFFDu;
+  }
+  cp = (cp << 6) | uint32_t(bx & 0x3Fu);
+ }
+ if (cp < min_cp || cp > 0x10FFFFu || (cp >= 0xD800u && cp <= 0xDFFFu)) {
+  *io_pos = pos + 1u;
+  return 0xFFFDu;
+ }
+ *io_pos = pos + n;
+ return cp;
 }
 
 template <typename T>

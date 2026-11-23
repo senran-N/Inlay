@@ -126,9 +126,11 @@ void mock_key(void *b, uint32_t key, bool down, uint16_t) {
 void mock_text(void *b, EtchStr text) {
   auto *m = static_cast<MockPortal *>(b);
   uint32_t added = 0;
-  for (uint32_t i = 0; i < text.length && added < 20; ++i)
-    if ((static_cast<unsigned char>(text.chars[i]) & 0xC0) != 0x80)
-      ++added;
+  size_t pos = 0;
+  while (pos < text.length && added < 20) {
+    (void)inlay_utf8_next(text.chars, text.length, &pos);
+    ++added;
+  }
   if (!added)
     return;
   m->characters += added;

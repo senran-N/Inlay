@@ -8,61 +8,29 @@ namespace {
 constexpr uint32_t max_bytes = 64u * 1024u * 1024u;
 
 bool reserve_source(InlayDoc* d, uint32_t needed) noexcept {
- if (needed <= d->source_capacity) return true;
- uint32_t cap = d->source_capacity ? d->source_capacity : 4096u;
- while (cap < needed) cap = cap < max_bytes / 2u ? cap * 2u : max_bytes;
- void* data = std::realloc(d->source, cap);
- if (!data) return false;
- d->source = static_cast<char*>(data);
- d->source_capacity = cap;
- return true;
+ return inlay_grow_pod(d->source, d->source_capacity, needed, 4096u, max_bytes);
 }
 
 bool reserve_blocks(InlayDoc* d, uint32_t needed) noexcept {
  if (needed <= d->block_capacity) return true;
- uint32_t cap = d->block_capacity ? d->block_capacity : 64u;
- while (cap < needed) cap *= 2u;
- auto* blks = static_cast<InlayBlock*>(std::realloc(d->blocks, size_t(cap) * sizeof(InlayBlock)));
- if (!blks) return false;
- d->blocks = blks;
- auto* meta = static_cast<InlayBlockMeta*>(std::realloc(d->block_meta, size_t(cap) * sizeof(InlayBlockMeta)));
- if (!meta) return false;
- d->block_meta = meta;
- d->block_capacity = cap;
+ uint32_t bcap = d->block_capacity;
+ if (!inlay_grow_pod(d->blocks, bcap, needed, 64u, max_bytes)) return false;
+ uint32_t mcap = d->block_capacity;
+ if (!inlay_grow_pod(d->block_meta, mcap, bcap, 64u, max_bytes)) return false;
+ d->block_capacity = mcap;
  return true;
 }
 
 bool reserve_ast(InlayDoc* d, uint32_t needed) noexcept {
- if (needed <= d->ast_node_capacity) return true;
- uint32_t cap = d->ast_node_capacity ? d->ast_node_capacity : 64u;
- while (cap < needed) cap *= 2u;
- auto* mem = static_cast<InlayAstNode*>(std::realloc(d->ast_nodes, size_t(cap) * sizeof(InlayAstNode)));
- if (!mem) return false;
- d->ast_nodes = mem;
- d->ast_node_capacity = cap;
- return true;
+ return inlay_grow_pod(d->ast_nodes, d->ast_node_capacity, needed, 64u, max_bytes);
 }
 
 bool reserve_list_items(InlayDoc* d, uint32_t needed) noexcept {
- if (needed <= d->list_item_capacity) return true;
- uint32_t cap = d->list_item_capacity ? d->list_item_capacity : 64u;
- while (cap < needed) cap *= 2u;
- auto* mem = static_cast<InlayListItemMeta*>(std::realloc(d->list_items, size_t(cap) * sizeof(InlayListItemMeta)));
- if (!mem) return false;
- d->list_items = mem;
- d->list_item_capacity = cap;
- return true;
+ return inlay_grow_pod(d->list_items, d->list_item_capacity, needed, 64u, max_bytes);
 }
 
 bool reserve_ast_text(InlayDoc* d, uint32_t needed) noexcept {
- if (needed <= d->ast_text_capacity) return true;
- uint32_t cap = d->ast_text_capacity ? d->ast_text_capacity : 1024u;
- while (cap < needed) cap *= 2u;
- auto* mem = static_cast<char*>(std::realloc(d->ast_text, cap));
- if (!mem) return false;
- d->ast_text = mem;
- d->ast_text_capacity = cap;
- return true;
+ return inlay_grow_pod(d->ast_text, d->ast_text_capacity, needed, 1024u, max_bytes);
 }
 
 uint32_t append_ast_text(InlayDoc* d, const char* s, uint32_t n) noexcept {
@@ -75,14 +43,7 @@ uint32_t append_ast_text(InlayDoc* d, const char* s, uint32_t n) noexcept {
 }
 
 bool reserve_ref_defs(InlayDoc* d, uint32_t needed) noexcept {
- if (needed <= d->ref_def_capacity) return true;
- uint32_t cap = d->ref_def_capacity ? d->ref_def_capacity : 16u;
- while (cap < needed) cap *= 2u;
- auto* mem = static_cast<InlayRefDef*>(std::realloc(d->ref_defs, size_t(cap) * sizeof(InlayRefDef)));
- if (!mem) return false;
- d->ref_defs = mem;
- d->ref_def_capacity = cap;
- return true;
+ return inlay_grow_pod(d->ref_defs, d->ref_def_capacity, needed, 16u, max_bytes);
 }
 
 bool starts(const char* text, uint32_t length, const char* prefix) noexcept {
@@ -421,13 +382,9 @@ struct MdBuilder {
 
  bool ensure_extra(uint32_t rel_idx) noexcept {
   if (rel_idx < extra_cap) return true;
-  uint32_t cap = extra_cap ? extra_cap * 2u : 64u;
-  while (cap <= rel_idx) cap *= 2u;
-  auto* mem = static_cast<AstExtra*>(std::realloc(extras, size_t(cap) * sizeof(AstExtra)));
-  if (!mem) { failed = true; return false; }
-  std::memset(mem + extra_cap, 0, size_t(cap - extra_cap) * sizeof(AstExtra));
-  extras = mem;
-  extra_cap = cap;
+  const uint32_t old_cap = extra_cap;
+  if (!inlay_grow_pod(extras, extra_cap, rel_idx + 1u, 64u, max_bytes)) { failed = true; return false; }
+  std::memset(extras + old_cap, 0, size_t(extra_cap - old_cap) * sizeof(AstExtra));
   return true;
  }
 
@@ -1318,7 +1275,7 @@ void run_md4c_segment(InlayDoc* d, uint32_t seg_start, uint32_t seg_end, bool at
  if (rc == 0 && !builder.failed && d->ast_node_count > builder.ast_base) {
   project_ast_node(&builder, int32_t(builder.ast_base), false, -1, nullptr);
  }
- std::free(builder.extras);
+ SDL_free(builder.extras);
 }
 
 bool has_blank_line_between(const char* src, uint32_t from, uint32_t to, uint32_t* out_after_blank) noexcept {
@@ -1714,14 +1671,14 @@ INLAY_API InlayDoc* inlay_doc_create(EtchContext* context, const InlayDocConfig*
  if (c.initial_source_bytes == 0u) c.initial_source_bytes = 4096u;
  if (c.initial_blocks == 0u) c.initial_blocks = 64u;
  if (c.initial_source_bytes < 4u || c.initial_source_bytes > max_bytes || c.initial_blocks > max_bytes) return nullptr;
- auto* d = static_cast<InlayDoc*>(std::calloc(1, sizeof(InlayDoc)));
+ auto* d = static_cast<InlayDoc*>(SDL_calloc(1, sizeof(InlayDoc)));
  if (!d) return nullptr;
  d->context = context;
  d->source_capacity = c.initial_source_bytes;
  d->block_capacity = c.initial_blocks;
- d->source = static_cast<char*>(std::malloc(d->source_capacity));
- d->blocks = static_cast<InlayBlock*>(std::malloc(size_t(d->block_capacity) * sizeof(InlayBlock)));
- d->block_meta = static_cast<InlayBlockMeta*>(std::calloc(d->block_capacity, sizeof(InlayBlockMeta)));
+ d->source = static_cast<char*>(SDL_malloc(d->source_capacity));
+ d->blocks = static_cast<InlayBlock*>(SDL_malloc(size_t(d->block_capacity) * sizeof(InlayBlock)));
+ d->block_meta = static_cast<InlayBlockMeta*>(SDL_calloc(d->block_capacity, sizeof(InlayBlockMeta)));
  if (!d->source || !d->blocks || !d->block_meta) {
   inlay_doc_destroy(d);
   return nullptr;
@@ -1733,31 +1690,31 @@ INLAY_API void inlay_doc_destroy(InlayDoc* d) {
  if (!d) return;
  for (uint32_t i = 0; i < d->view_count; ++i) {
   auto& view = d->views[i];
-  std::free(view.rows);
-  std::free(view.heights);
-  std::free(view.open);
-  std::free(view.code_wrap);
-  std::free(view.code_scroll_x);
-  std::free(view.diagram_full_scale);
-  std::free(view.copied_until_ms);
-  std::free(view.details);
-  std::free(view.table_cols);
-  std::free(view.plain_text);
-  std::free(view.vis_segs);
-  std::free(view.vis_row_ids);
-  std::free(view.vis_ctrl_ids);
-  std::free(view.vis_span_ids);
-  std::free(view.tokens);
+  SDL_free(view.rows);
+  SDL_free(view.heights);
+  SDL_free(view.open);
+  SDL_free(view.code_wrap);
+  SDL_free(view.code_scroll_x);
+  SDL_free(view.diagram_full_scale);
+  SDL_free(view.copied_until_ms);
+  SDL_free(view.details);
+  SDL_free(view.table_cols);
+  SDL_free(view.plain_text);
+  SDL_free(view.vis_segs);
+  SDL_free(view.vis_row_ids);
+  SDL_free(view.vis_ctrl_ids);
+  SDL_free(view.vis_span_ids);
+  SDL_free(view.tokens);
  }
- std::free(d->views);
- std::free(d->source);
- std::free(d->blocks);
- std::free(d->block_meta);
- std::free(d->ast_nodes);
- std::free(d->list_items);
- std::free(d->ast_text);
- std::free(d->ref_defs);
- std::free(d);
+ SDL_free(d->views);
+ SDL_free(d->source);
+ SDL_free(d->blocks);
+ SDL_free(d->block_meta);
+ SDL_free(d->ast_nodes);
+ SDL_free(d->list_items);
+ SDL_free(d->ast_text);
+ SDL_free(d->ref_defs);
+ SDL_free(d);
 }
 
 INLAY_API void inlay_doc_clear(InlayDoc* d) {
@@ -1800,16 +1757,35 @@ INLAY_API bool inlay_doc_append_utf8(InlayDoc* d, EtchStr chunk) {
  uint32_t valid = 0, newlines = 0;
  while (valid < total) {
   const uint8_t lead = byte(valid);
-  uint32_t n = 1, cp = lead;
-  if (lead >= 0xc2 && lead <= 0xdf) { n = 2; cp = lead & 31; }
-  else if (lead >= 0xe0 && lead <= 0xef) { n = 3; cp = lead & 15; }
-  else if (lead >= 0xf0 && lead <= 0xf4) { n = 4; cp = lead & 7; }
-  else if (lead >= 0x80 || lead == 0) return false;
-  for (uint32_t j = 1; j < n && valid + j < total; ++j) if ((byte(valid + j) & 0xc0) != 0x80) return false;
-  if (total - valid < n) break;
-  for (uint32_t j = 1; j < n; ++j) cp = (cp << 6) | (byte(valid + j) & 63);
-  if ((n == 3 && cp < 0x800) || (n == 4 && cp < 0x10000) || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff)) return false;
-  if (lead == '\n') ++newlines;
+  if (lead == 0u) return false;
+  if (lead < 0x80u) {
+   if (lead == '\n') ++newlines;
+   ++valid;
+   continue;
+  }
+  uint32_t n = 0u;
+  if (lead >= 0xC2u && lead <= 0xDFu) n = 2u;
+  else if (lead >= 0xE0u && lead <= 0xEFu) n = 3u;
+  else if (lead >= 0xF0u && lead <= 0xF4u) n = 4u;
+  else return false;
+  const uint32_t rem = total - valid;
+  if (rem < n) {
+   for (uint32_t j = 1u; j < rem; ++j) {
+    if ((byte(valid + j) & 0xC0u) != 0x80u) return false;
+   }
+   break;
+  }
+  char tmp[4];
+  const char* seq = nullptr;
+  if (valid >= d->utf8_carry_len) {
+   seq = chunk.chars + (valid - d->utf8_carry_len);
+  } else {
+   for (uint32_t j = 0u; j < n; ++j) tmp[j] = char(byte(valid + j));
+   seq = tmp;
+  }
+  size_t pos = 0;
+  (void)inlay_utf8_next(seq, n, &pos);
+  if (pos != n) return false;
   valid += n;
  }
  if (!reserve_source(d, d->source_size + valid) || !reserve_blocks(d, d->block_count + newlines + 4u)) return false;

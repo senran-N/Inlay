@@ -15,9 +15,17 @@ void render_cpp_slot(inlay::Surface*,uint32_t,float width_px,float height_px,Etc
 
 int main() {
  if(inlay::abi_version()!=INLAY_ABI_VERSION)return 1;
+ static_assert(INLAY_VERSION_MAJOR==0 && INLAY_VERSION_MINOR==13);
+ static_assert(INLAY_UI_DOC>INLAY_UI_SLOT && INLAY_UI_TERMINAL>INLAY_UI_DOC &&
+               INLAY_UI_VIRTUAL_LIST>INLAY_UI_TERMINAL && INLAY_UI_TABLE>INLAY_UI_VIRTUAL_LIST &&
+               INLAY_UI_TREE>INLAY_UI_TABLE && INLAY_UI_TREE_ITEM>INLAY_UI_TREE &&
+               INLAY_UI_MENU>INLAY_UI_TREE_ITEM && INLAY_UI_CONTEXT_MENU>INLAY_UI_MENU &&
+               INLAY_UI_AVATAR>INLAY_UI_CONTEXT_MENU && INLAY_UI_TOAST>INLAY_UI_AVATAR &&
+               INLAY_UI_ACCORDION>INLAY_UI_TOAST && INLAY_UI_SKELETON>INLAY_UI_ACCORDION);
  const inlay::PortalDesc portal=inlay_portal_desc_default();
  const inlay::SurfaceDesc surface=inlay_surface_desc_default();
  if(portal.struct_size!=sizeof(inlay::PortalDesc) || surface.struct_size!=sizeof(inlay::SurfaceDesc) ||
+    surface.disable_jsx ||
     !portal.width || !inlay_portal_mock_backend() || !inlay_portal_destroy(nullptr) ||
     !surface.max_nodes || !inlay_doc_config_default().initial_blocks ||
     inlay_math_desc_default().font_size_px<=0 || inlay_diagram_desc_default().rank_gap_px<=0)return 1;
@@ -62,15 +70,24 @@ int main() {
   const inlay::SlotRenderFn slot_fn=render_cpp_slot;
   ok &= inlay::surface_next_timer_ms(cpp_surf)==-1 &&
         inlay::surface_bind_slot(cpp_surf,ETCH_STR_LIT("cpp_slot"),slot_fn,&cpp_slot_called) &&
-        inlay_surface_set_script(cpp_surf,ETCH_STR_LIT("function render(){return ui.card({},ui.slot({name:'cpp_slot',width:100,height:32,props:{n:7}}));}"));
+        inlay_surface_set_script(cpp_surf,ETCH_STR_LIT("function render(){return <Card cls='p-2 gap-1'><Badge variant='success' dot>JSX</Badge><Slot name='cpp_slot' width={100} height={32} props={{n:7}} /></Card>;}"));
+  inlay::SurfaceDesc no_jsx_desc=inlay::surface_desc_default();
+  no_jsx_desc.disable_jsx=true;
+  if(inlay::Surface* no_jsx=inlay::create_surface(cpp_ctx,&no_jsx_desc)) {
+   ok &= !inlay_surface_set_script(no_jsx,ETCH_STR_LIT("function render(){return <Text>x</Text>;}")) &&
+         inlay_surface_set_script(no_jsx,ETCH_STR_LIT("function render(){return ui.text('ok');}"));
+   inlay_surface_destroy(no_jsx);
+  } else {
+   ok = false;
+  }
  }
  if(ok) {
   auto surf_view=inlay::surface_view_desc_default();
-  surf_view.id=etch::id("cpp-slot-view");surf_view.width_px=240.0f;surf_view.height_px=100.0f;
+  surf_view.id=etch::id("cpp-slot-view");surf_view.width_px=0.0f;surf_view.height_px=0.0f;
   inlay::doc_view_scroll_to_bottom(cpp_view.id,true);
   etch::begin_frame(cpp_ctx,{.viewport_w=320,.viewport_h=240});
   const inlay::DocResult r=inlay_doc_view(cpp_doc,&cpp_view);
-  if(cpp_surf)inlay_surface_view(cpp_surf,&surf_view);
+  if(cpp_surf)inlay::surface_view(cpp_surf,&surf_view);
   etch::end_frame(cpp_ctx);
   inlay::doc_view_select_all(cpp_doc,cpp_view.id);
   char buf[128]={};

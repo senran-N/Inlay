@@ -36,6 +36,21 @@ static void render_c99_slot(InlaySurface* surface,uint32_t element_id,float widt
 }
 int main(void) {
  if(inlay_abi_version()!=INLAY_ABI_VERSION)return 1;
+#if INLAY_VERSION_MAJOR != 0 || INLAY_VERSION_MINOR != 13
+#error "Unexpected Inlay version"
+#endif
+ /* Verify all v0.13.0 InlayUiKind enum values compile & remain distinct even with INLAY_ENABLE_SCRIPT=OFF */
+ {
+  const InlayUiKind v013_kinds[12]={
+   INLAY_UI_DOC, INLAY_UI_TERMINAL, INLAY_UI_VIRTUAL_LIST, INLAY_UI_TABLE,
+   INLAY_UI_TREE, INLAY_UI_TREE_ITEM, INLAY_UI_MENU, INLAY_UI_CONTEXT_MENU,
+   INLAY_UI_AVATAR, INLAY_UI_TOAST, INLAY_UI_ACCORDION, INLAY_UI_SKELETON
+  };
+  for(size_t i=0;i<12u;++i) {
+   if(v013_kinds[i]<=INLAY_UI_SLOT)return 1;
+   for(size_t j=i+1u;j<12u;++j)if(v013_kinds[i]==v013_kinds[j])return 1;
+  }
+ }
  EtchContextDesc c=etch_context_desc_default();c.headless=true;
  EtchContext* ctx=etch_create_context(&c);if(!ctx)return 1;
  /* Versioned C99 ABI struct_size checks: default, zero-init, partial prefix, corrupt tiny, oversized */
@@ -61,13 +76,21 @@ int main(void) {
  InlayDoc* doc=inlay_doc_create(ctx,NULL);if(!doc)return 1;
  const InlaySurfaceDesc surface=inlay_surface_desc_default();
  if(surface.struct_size!=(uint32_t)sizeof(InlaySurfaceDesc) ||
+    surface.disable_jsx ||
     surface.max_tick_ms<=0 || inlay_surface_stats(NULL).js_ticks || inlay_surface_next_timer_ms(NULL)!=-1 ||
     inlay_surface_set_script(NULL,ETCH_STR_LIT("")) || inlay_surface_bind_slot(NULL,ETCH_STR_LIT("slot"),render_c99_slot,NULL))return 1;
  InlaySurfaceDesc bad_surface=surface;bad_surface.struct_size=1u;
  if(inlay_surface_create(ctx,&bad_surface)!=NULL)return 1;
+ /* Legacy v0.12 struct_size prefix without disable_jsx remains ABI-compatible */
+ {
+  InlaySurfaceDesc legacy_surface=surface;
+  legacy_surface.struct_size=(uint32_t)offsetof(InlaySurfaceDesc,disable_jsx);
+  InlaySurface* legacy_s=inlay_surface_create(ctx,&legacy_surface);
+  if(legacy_s)inlay_surface_destroy(legacy_s);
+ }
  InlaySurface* scripted=inlay_surface_create(ctx,NULL);
  if(scripted){
-  if(!inlay_surface_set_state_json(scripted,ETCH_STR_LIT("{\"value\":3}")) || !inlay_surface_set_script(scripted,ETCH_STR_LIT("function render(s){return ui.scroll({},ui.input({value:String(s.value)}),ui.toggle({label:'Live',checked:true}),ui.progress({value:0.5}),ui.slider({value:0.2,min:0,max:1}),ui.badge('v0.9'),ui.divider({}),ui.image({alt:'pic'}));}")))return 1;
+  if(!inlay_surface_set_state_json(scripted,ETCH_STR_LIT("{\"value\":3}")) || !inlay_surface_set_script(scripted,ETCH_STR_LIT("function render(s){return ui.scroll({},ui.input({value:String(s.value)}),ui.toggle({label:'Live',checked:true}),ui.progress({value:0.5}),ui.slider({value:0.2,min:0,max:1}),ui.badge('v" INLAY_VERSION_STRING "'),ui.divider({}),ui.image({alt:'pic'}));}")))return 1;
   uint32_t count=0;
   const InlayUiNode* nodes=inlay_surface_nodes(scripted,&count);
   if(!nodes || count!=8 || nodes[0].kind!=INLAY_UI_SCROLL || nodes[1].kind!=INLAY_UI_INPUT ||
@@ -78,27 +101,42 @@ int main(void) {
      inlay_surface_bind_slot(scripted,ETCH_STR_LIT("c99"),NULL,NULL))return 1;
   bool slot_called=false;
   if(!inlay_surface_bind_slot(scripted,ETCH_STR_LIT("c99_slot"),render_c99_slot,&slot_called))return 1;
-  if(!inlay_surface_set_script(scripted,ETCH_STR_LIT("function render(){return ui.card({elevation:'sm'},ui.tabs({items:['A','B'],active:0}),ui.math({tex:'x^2'}),ui.slot({name:'c99_slot',width:120,height:32,props:{ok:1}}));}")))return 1;
+  if(!inlay_surface_set_script(scripted,ETCH_STR_LIT("function render(){return <Card cls='p-2 gap-2'><Tabs items={['A','B']} active={0} /><Math tex='x^2' /><Avatar name='C99' size='sm' /><Table columns={['K']} rows={[['V']]} /><Tree><TreeItem label='N' leaf /></Tree><Accordion title='A'><Skeleton variant='rect' width={40} height={10} /></Accordion><Slot name='c99_slot' width={120} height={32} props={{ok:1}} /></Card>;}")))return 1;
   nodes=inlay_surface_nodes(scripted,&count);
   if(!nodes || !count || nodes[0].kind!=INLAY_UI_CARD)return 1;
-  bool has_card=false,has_tabs=false,has_math=false,has_slot=false;
+  bool has_card=false,has_tabs=false,has_math=false,has_slot=false,has_avatar=false,has_table=false,has_tree=false,has_acc=false,has_skel=false;
   for(uint32_t i=0;i<count;++i){
    if(nodes[i].kind==INLAY_UI_CARD)has_card=true;
    else if(nodes[i].kind==INLAY_UI_TABS)has_tabs=true;
    else if(nodes[i].kind==INLAY_UI_MATH)has_math=true;
    else if(nodes[i].kind==INLAY_UI_SLOT)has_slot=true;
+   else if(nodes[i].kind==INLAY_UI_AVATAR)has_avatar=true;
+   else if(nodes[i].kind==INLAY_UI_TABLE)has_table=true;
+   else if(nodes[i].kind==INLAY_UI_TREE)has_tree=true;
+   else if(nodes[i].kind==INLAY_UI_ACCORDION)has_acc=true;
+   else if(nodes[i].kind==INLAY_UI_SKELETON)has_skel=true;
   }
-  if(!has_card || !has_tabs || !has_math || !has_slot)return 1;
+  if(!has_card || !has_tabs || !has_math || !has_slot || !has_avatar || !has_table || !has_tree || !has_acc || !has_skel)return 1;
   {
    EtchFrameDesc sf=etch_frame_desc_default();
    sf.viewport_w=320;sf.viewport_h=240;
    InlaySurfaceViewDesc sv=inlay_surface_view_desc_default();
-   sv.id=etch_id("c99-slot-view");sv.width_px=240.0f;sv.height_px=160.0f;
+   sv.id=etch_id("c99-slot-view");sv.width_px=0.0f;sv.height_px=0.0f;
    etch_begin_frame(ctx,&sf);
    inlay_surface_view(scripted,&sv);
    etch_end_frame(ctx);
   }
   if(!slot_called)return 1;
+  /* Verify disable_jsx flag on InlaySurfaceDesc */
+  {
+   InlaySurfaceDesc no_jsx_desc=inlay_surface_desc_default();
+   no_jsx_desc.disable_jsx=true;
+   InlaySurface* no_jsx=inlay_surface_create(ctx,&no_jsx_desc);
+   if(!no_jsx)return 1;
+   if(inlay_surface_set_script(no_jsx,ETCH_STR_LIT("function render(){return <Text>x</Text>;}")))return 1;
+   if(!inlay_surface_set_script(no_jsx,ETCH_STR_LIT("function render(){return ui.text('ok');}")))return 1;
+   inlay_surface_destroy(no_jsx);
+  }
   inlay_surface_destroy(scripted);
  }
  InlayPortalDesc portal_desc=inlay_portal_desc_default();

@@ -5,6 +5,7 @@
 #include <SDL3/SDL_iostream.h>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 namespace {
 // ASan instruments the allocator teardown after the VM deadline fires.
@@ -881,6 +882,1293 @@ function onEvent(name, payload, s) {
     inlay_surface_destroy(s);
     return ok;
 }
+
+uint32_t find_rect_fill_rgba(EtchContext *ctx, EtchRect bounds) {
+    for (uint32_t i = 0; i < etch_frame_prim_count(ctx); ++i) {
+        EtchPrim prim = {};
+        if (!etch_get_frame_prim(ctx, i, &prim))
+            continue;
+        if (std::fabs(prim.bounds.x - bounds.x) <= 1.5f &&
+            std::fabs(prim.bounds.y - bounds.y) <= 1.5f &&
+            std::fabs(prim.bounds.z - bounds.w) <= 1.5f &&
+            std::fabs(prim.bounds.w - bounds.h) <= 1.5f &&
+            prim.style.y != 0u) {
+            return prim.style.y;
+        }
+    }
+    return 0u;
+}
+
+const InlayUiNode *find_node_by_id(const InlayUiNode *nodes, uint32_t count, const char *name) {
+    const uint32_t target = etch_id(name);
+    for (uint32_t i = 0; i < count; ++i) {
+        if (nodes[i].id == target)
+            return &nodes[i];
+    }
+    return nullptr;
+}
+
+bool v013_jsx_transpiler(EtchContext *ctx, const InlaySurfaceDesc &desc) {
+    auto *s = inlay_surface_create(ctx, &desc);
+    if (!s)
+        return false;
+
+    bool ok = true;
+    auto frame = etch_frame_desc_default();
+    frame.viewport_w = 500;
+    frame.viewport_h = 400;
+    InlaySurfaceViewDesc view = inlay_surface_view_desc_default();
+    view.id = etch_id("v013-jsx");
+    view.width_px = 460;
+    view.height_px = 360;
+    const auto step = [&] {
+        etch_begin_frame(ctx, &frame);
+        inlay_surface_view(s, &view);
+        etch_end_frame(ctx);
+    };
+
+    // 1. Intrinsic tags, PascalCase & function components, fragments, self-closing <Spacer />,
+    //    spread override order, JSX inside template literals, comparisons & /regex/g, and Math.max + <Math>.
+    static const char jsx_full_script[] = R"JS(
+function CustomPill({ id, label, children }) {
+  return (
+    <row id={id} gap={4}>
+      <Badge variant="accent">{label}</Badge>
+      {children}
+    </row>
+  );
+}
+
+function render(s) {
+  const a = 2, b = 5, c = 9, d = 4;
+  const cmpOk = (a < b && c > d);
+  const reOk = /<div\s*>/g.test('<div>') && !/<span\s*>/g.test('<div>');
+  const mathSum = Math.max(1, 2) + Math.min(3, 4);
+  const spreadOverride = { width: 180, height: 24 };
+  const tmplTag = `kind:${(<Badge>ok</Badge>).tag}`;
+  return (
+    <Col id="jroot" width={420} gap={6}>
+      <card id="lower_card" padding={6}>
+        <>
+          <Text id="cmp_txt">{cmpOk && reOk ? 'CMP_RE_OK' : 'BAD'}</Text>
+          <Text id="mmax_txt">{String(mathSum)}</Text>
+          <Text id="tmpl_txt">{tmplTag}</Text>
+        </>
+      </card>
+      <row id="sp_row" width={260} height={24}>
+        <Box id="sp1" width={100} {...spreadOverride} bg="#224466" />
+        <Spacer id="self_sp" />
+      </row>
+      <Box id="sp2" {...spreadOverride} width={120} bg="#335577" />
+      <CustomPill id="cpill" label="Fn">
+        <Text id="cpill_child">Child</Text>
+      </CustomPill>
+      <Math id="mtex" tex="x^2 + y^2" fontSize={16} />
+    </Col>
+  );
+}
+)JS";
+    ok &= check(inlay_surface_set_script(
+                    s, {jsx_full_script, uint32_t(sizeof(jsx_full_script) - 1u), true}),
+                "v0.13 full JSX script loads");
+    if (inlay_surface_stats(s).has_error) {
+        const auto err = inlay_surface_error(s);
+        std::printf("v0.13 JSX error: %.*s\n", int(err.length), err.chars ? err.chars : "");
+    }
+    ok &= check(!inlay_surface_stats(s).has_error, "v0.13 full JSX script has no error");
+
+    uint32_t cnt = 0;
+    const auto *nodes = inlay_surface_nodes(s, &cnt);
+    const auto *cmp_n = find_node_by_id(nodes, cnt, "cmp_txt");
+    const auto *mmax_n = find_node_by_id(nodes, cnt, "mmax_txt");
+    const auto *tmpl_n = find_node_by_id(nodes, cnt, "tmpl_txt");
+    const auto *cpill_c = find_node_by_id(nodes, cnt, "cpill_child");
+    const auto *mtex_n = find_node_by_id(nodes, cnt, "mtex");
+    ok &= check(cmp_n && str_eq(cmp_n->text, "CMP_RE_OK"),
+                "JSX preserves comparisons (a < b && c > d) and /regex/g");
+    ok &= check(mmax_n && str_eq(mmax_n->text, "5") && mtex_n && mtex_n->kind == INLAY_UI_MATH,
+                "Math.max/min works alongside <Math> tag");
+    ok &= check(tmpl_n && str_eq(tmpl_n->text, "kind:badge"),
+                "nested JSX inside template literal transpiles cleanly");
+    ok &= check(cpill_c && str_eq(cpill_c->text, "Child"),
+                "custom JSX function component forwards children");
+    ok &= check(has_node_kind(nodes, cnt, INLAY_UI_CARD) &&
+                    has_node_kind(nodes, cnt, INLAY_UI_SPACER) &&
+                    has_node_kind(nodes, cnt, INLAY_UI_BADGE),
+                "lowercase <card>, self-closing <Spacer />, and <Badge> build native nodes");
+
+    step();
+    step();
+    const auto sp1_b = etch_element_bounds(find_surface_eid(nodes, cnt, view.id, "sp1"));
+    const auto sp2_b = etch_element_bounds(find_surface_eid(nodes, cnt, view.id, "sp2"));
+    ok &= check(std::fabs(sp1_b.w - 180.f) <= 0.5f && std::fabs(sp2_b.w - 120.f) <= 0.5f,
+                "JSX spread {...p} respects left-to-right override order");
+
+    // 2. 1-to-1 line number preservation in runtime error messages after multiline JSX.
+    static const char line_err_script[] =
+        "function render() {\n"
+        "  const hdr = (\n"
+        "    <Col>\n"
+        "      <Text>Line 4</Text>\n"
+        "    </Col>\n"
+        "  );\n"
+        "  throw new Error('line7_boom');\n"
+        "  return hdr;\n"
+        "}\n";
+    ok &= check(!inlay_surface_set_script(
+                    s, {line_err_script, uint32_t(sizeof(line_err_script) - 1u), true}),
+                "runtime error after multiline JSX fails");
+    const auto line_err = inlay_surface_error(s);
+    ok &= check(line_err.chars && std::strstr(line_err.chars, "line7_boom") != nullptr &&
+                    std::strstr(line_err.chars, ":7:") != nullptr,
+                "JSX transpiler preserves 1-to-1 line numbers in runtime error stack");
+
+    // 3. Fast-fail JSXSyntaxError on mismatched tags with accurate line number.
+    static const char mismatch_script[] =
+        "function render() {\n"
+        "  return (\n"
+        "    <Col>\n"
+        "      <Row>\n"
+        "        <Text>hi</Text>\n"
+        "      </Card>\n"
+        "    </Col>\n"
+        "  );\n"
+        "}\n";
+    ok &= check(!inlay_surface_set_script(
+                    s, {mismatch_script, uint32_t(sizeof(mismatch_script) - 1u), true}),
+                "mismatched JSX tags rejected");
+    const auto mm_err = inlay_surface_error(s);
+    ok &= check(mm_err.chars && std::strstr(mm_err.chars, "JSXSyntaxError") != nullptr &&
+                    std::strstr(mm_err.chars, ":6:") != nullptr,
+                "mismatched JSX tag reports JSXSyntaxError with exact line number");
+
+    // 4. disable_jsx = true bypasses transpiler cleanly.
+    InlaySurfaceDesc no_jsx_desc = desc;
+    no_jsx_desc.disable_jsx = true;
+    auto *no_jsx = inlay_surface_create(ctx, &no_jsx_desc);
+    ok &= check(no_jsx != nullptr, "create surface with disable_jsx=true");
+    if (no_jsx) {
+        ok &= check(inlay_surface_set_script(
+                        no_jsx, ETCH_STR_LIT("function render(){return h('text',{text:'plain'});}")),
+                    "disable_jsx=true runs plain JS");
+        ok &= check(!inlay_surface_set_script(
+                        no_jsx, ETCH_STR_LIT("function render(){return <Text>nope</Text>;}")),
+                    "disable_jsx=true rejects raw JSX");
+        const auto nj_err = inlay_surface_error(no_jsx);
+        ok &= check(nj_err.chars && std::strstr(nj_err.chars, "JSXSyntaxError") == nullptr,
+                    "disable_jsx=true bypasses JSX transpiler (QuickJS SyntaxError)");
+        inlay_surface_destroy(no_jsx);
+    }
+
+    inlay_surface_destroy(s);
+    return ok;
+}
+
+bool v013_cls_colors_and_themes(EtchContext *ctx, const InlaySurfaceDesc &desc) {
+    const EtchTheme dark_t = etch_theme_dark();
+    const EtchTheme light_t = etch_theme_light();
+    etch_set_theme(&dark_t, ctx);
+
+    auto *s = inlay_surface_create(ctx, &desc);
+    if (!s)
+        return false;
+
+    bool ok = true;
+    static const char cls_script[] = R"JS(
+function render() {
+  return (
+    <Col id="croot" cls="w-full gap-2 p-2">
+      <Box id="util_row" cls="flex-row gap-3 p-4 rounded-xl bg-surface shadow-md hover:bg-hover transition duration-150 ease-out" width={260}>
+        <Box id="u1" cls="w-10 h-8 bg-accent/15 rounded-md" />
+        <Box id="u2" cls="w-10 h-8 bg-[#334455] rounded-md" />
+      </Box>
+      <Box id="theme_box" cls="w-16 h-6 bg-surface rounded-md" />
+      <Box id="oklch_box" width={80} height={24} bg="oklch(0.7 0.15 240)" />
+      <Box id="rgb_box" width={80} height={24} bg="rgb(255 0 0 / 50%)" />
+      <Box id="override_box" cls="w-20 h-10 bg-[#112233]" width={150} bg="#445566" />
+    </Col>
+  );
+}
+)JS";
+    ok &= check(inlay_surface_set_script(
+                    s, {cls_script, uint32_t(sizeof(cls_script) - 1u), true}),
+                "v0.13 cls & color script loads");
+    ok &= check(!inlay_surface_stats(s).has_error, "v0.13 cls & color script has no error");
+
+    uint32_t cnt = 0;
+    const auto *nodes = inlay_surface_nodes(s, &cnt);
+    InlaySurfaceViewDesc view = inlay_surface_view_desc_default();
+    view.id = etch_id("v013-cls");
+    view.width_px = 400;
+    view.height_px = 300;
+    auto frame = etch_frame_desc_default();
+    frame.viewport_w = 400;
+    frame.viewport_h = 300;
+    frame.dt_seconds = 1.f / 60.f;
+    const auto step = [&] {
+        etch_begin_frame(ctx, &frame);
+        inlay_surface_view(s, &view);
+        etch_end_frame(ctx);
+    };
+
+    step();
+    step();
+
+    const auto row_b = etch_element_bounds(find_surface_eid(nodes, cnt, view.id, "util_row"));
+    const auto theme_b = etch_element_bounds(find_surface_eid(nodes, cnt, view.id, "theme_box"));
+    const auto u1_b = etch_element_bounds(find_surface_eid(nodes, cnt, view.id, "u1"));
+    const auto u2_b = etch_element_bounds(find_surface_eid(nodes, cnt, view.id, "u2"));
+    const auto oklch_b = etch_element_bounds(find_surface_eid(nodes, cnt, view.id, "oklch_box"));
+    const auto rgb_b = etch_element_bounds(find_surface_eid(nodes, cnt, view.id, "rgb_box"));
+    const auto ov_b = etch_element_bounds(find_surface_eid(nodes, cnt, view.id, "override_box"));
+
+    ok &= check(std::fabs(u1_b.x - (row_b.x + 16.f)) <= 1.f &&
+                    std::fabs(u1_b.y - (row_b.y + 16.f)) <= 1.f &&
+                    std::fabs(u2_b.x - (u1_b.x + u1_b.w + 12.f)) <= 1.f &&
+                    std::fabs(u1_b.y - u2_b.y) <= 1.f,
+                "cls flex-row gap-3 p-4 layout metrics accurate");
+
+    const uint32_t dark_surf_rgba = etch_color_pack_rgba8(dark_t.bg_surface);
+    ok &= check(has_rect_prim(ctx, row_b, dark_surf_rgba, 0, true) &&
+                    has_rect_prim(ctx, theme_b, dark_surf_rgba, 0, true),
+                "cls bg-surface + rounded-xl resolves live Dark theme token");
+
+    const uint8_t a15 = uint8_t((uint32_t(dark_t.accent.a) * 38u + 127u) / 255u);
+    const EtchColor expected_acc15 = etch_rgba8(dark_t.accent.r, dark_t.accent.g, dark_t.accent.b, a15);
+    ok &= check(has_rect_prim(ctx, u1_b, etch_color_pack_rgba8(expected_acc15), 0, true),
+                "cls bg-accent/15 scales token alpha accurately");
+
+    const EtchColor expected_oklch = etch_color_oklch(0.7f, 0.15f, 240.0f, 1.0f);
+    ok &= check(has_rect_prim(ctx, oklch_b, etch_color_pack_rgba8(expected_oklch), 0, false),
+                "oklch(0.7 0.15 240) resolves via Etch Oklch");
+
+    const EtchColor expected_rgb50 = etch_rgba8(255u, 0u, 0u, 128u);
+    ok &= check(has_rect_prim(ctx, rgb_b, etch_color_pack_rgba8(expected_rgb50), 0, false),
+                "rgb(255 0 0 / 50%) resolves modern CSS RGB alpha");
+
+    ok &= check(std::fabs(ov_b.w - 150.f) <= 0.5f && std::fabs(ov_b.h - 40.f) <= 0.5f &&
+                    has_rect_prim(ctx, ov_b, etch_color_pack_rgba8(etch_rgba8(0x44, 0x55, 0x66, 255)), 0, false),
+                "explicit props override cls width and bg while preserving cls height");
+
+    // Live theme switch Dark -> Light with ZERO JS ticks!
+    const uint64_t ticks_before_theme = inlay_surface_stats(s).js_ticks;
+    etch_set_theme(&light_t, ctx);
+    step();
+    const uint32_t light_surf_rgba = etch_color_pack_rgba8(light_t.bg_surface);
+    ok &= check(light_surf_rgba != dark_surf_rgba &&
+                    has_rect_prim(ctx, theme_b, light_surf_rgba, 0, true),
+                "bg-surface updates instantaneously on non-transitioned box in Light theme");
+    for (int i = 0; i < 30; ++i)
+        step();
+    ok &= check(inlay_surface_stats(s).js_ticks == ticks_before_theme,
+                "live Dark -> Light theme switch runs zero JS ticks");
+    ok &= check(has_rect_prim(ctx, row_b, light_surf_rgba, 0, true),
+                "transitioned bg-surface settles to Light theme without JS re-evaluation");
+
+    etch_set_theme(&dark_t, ctx);
+    inlay_surface_destroy(s);
+    return ok;
+}
+
+bool v013_transitions_zero_idle_ticks(EtchContext *ctx, const InlaySurfaceDesc &desc) {
+    auto *s = inlay_surface_create(ctx, &desc);
+    if (!s)
+        return false;
+
+    bool ok = true;
+    static const char trans_script[] = R"JS(
+function render(s) {
+  return (
+    <Col id="tr_root" width={300} gap={12} padding={12}>
+      <Box id="tbox" cls="w-32 h-12 bg-[#203040] hover:bg-[#cc4422] transition duration-150 ease-out" />
+      <Box id="tfbox" width={64} height={32} bg="#336699" scale={s.big ? 1.25 : 1.0} transition="transform 150ms ease-out" />
+    </Col>
+  );
+}
+function onEvent(name, v, s) {
+  if (name === 'setBig') s.big = !!v;
+}
+)JS";
+    ok &= check(inlay_surface_set_script(
+                    s, {trans_script, uint32_t(sizeof(trans_script) - 1u), true}),
+                "v0.13 transition script loads");
+    ok &= check(!inlay_surface_stats(s).has_error, "v0.13 transition script has no error");
+
+    uint32_t cnt = 0;
+    const auto *nodes = inlay_surface_nodes(s, &cnt);
+    InlaySurfaceViewDesc view = inlay_surface_view_desc_default();
+    view.id = etch_id("v013-trans");
+    view.width_px = 340;
+    view.height_px = 200;
+    auto frame = etch_frame_desc_default();
+    frame.viewport_w = 340;
+    frame.viewport_h = 200;
+    frame.dt_seconds = 1.f / 60.f;
+    const EtchVec2 default_ptr = frame.pointer_pos;
+    const auto step = [&] {
+        etch_begin_frame(ctx, &frame);
+        inlay_surface_view(s, &view);
+        etch_end_frame(ctx);
+    };
+
+    for (int i = 0; i < 6; ++i)
+        step();
+
+    const auto tbox_b = etch_element_bounds(find_surface_eid(nodes, cnt, view.id, "tbox"));
+    const uint32_t start_col = etch_color_pack_rgba8(etch_rgba8(0x20, 0x30, 0x40, 255));
+    const uint32_t target_col = etch_color_pack_rgba8(etch_rgba8(0xcc, 0x44, 0x22, 255));
+    ok &= check(find_rect_fill_rgba(ctx, tbox_b) == start_col, "transition box starts at base color");
+
+    // Hover over tbox -> smooth tween over 150ms with 0 JS ticks!
+    const uint64_t ticks_before_hover = inlay_surface_stats(s).js_ticks;
+    frame.pointer_pos = {tbox_b.x + tbox_b.w * 0.5f, tbox_b.y + tbox_b.h * 0.5f};
+    bool saw_intermediate = false;
+    for (int i = 0; i < 6; ++i) {
+        step();
+        const uint32_t cur = find_rect_fill_rgba(ctx, tbox_b);
+        if (cur != 0u && cur != start_col && cur != target_col)
+            saw_intermediate = true;
+    }
+    ok &= check(saw_intermediate, "hover transition interpolates intermediate Oklab color frames");
+
+    for (int i = 0; i < 36; ++i)
+        step();
+    ok &= check(find_rect_fill_rgba(ctx, tbox_b) == target_col,
+                "hover transition reaches exact target color");
+    ok &= check(!etch_needs_redraw(ctx), "settled hover transition reports needs_redraw == false");
+    ok &= check(inlay_surface_stats(s).js_ticks == ticks_before_hover,
+                "hover transition executes 0 JS ticks during animation and idle");
+    frame.pointer_pos = default_ptr;
+    for (int i = 0; i < 36; ++i)
+        step();
+
+    // Transform state change and smooth return to identity (does not snap!).
+    ok &= check(inlay_surface_dispatch(s, ETCH_STR_LIT("setBig"), ETCH_STR_LIT("true")),
+                "dispatch scale up");
+    for (int i = 0; i < 36; ++i)
+        step();
+    ok &= check(!etch_needs_redraw(ctx), "scaled-up transform settles cleanly");
+
+    const uint64_t ticks_before_ret = inlay_surface_stats(s).js_ticks;
+    ok &= check(inlay_surface_dispatch(s, ETCH_STR_LIT("setBig"), ETCH_STR_LIT("false")),
+                "dispatch return to identity transform");
+    step();
+    step();
+    ok &= check(etch_needs_redraw(ctx),
+                "returning transform to identity animates smoothly instead of snapping");
+    for (int i = 0; i < 36; ++i)
+        step();
+    ok &= check(!etch_needs_redraw(ctx), "identity return transition settles to needs_redraw == false");
+    ok &= check(inlay_surface_stats(s).js_ticks == ticks_before_ret + 1u,
+                "transform return transition executes 0 extra JS ticks during animation and idle");
+
+    inlay_surface_destroy(s);
+    return ok;
+}
+
+bool v013_bugfix_regressions(EtchContext *ctx, const InlaySurfaceDesc &desc) {
+    auto *s = inlay_surface_create(ctx, &desc);
+    if (!s)
+        return false;
+
+    bool ok = true;
+    static const char reg_script[] = R"JS(
+function render(s) {
+  const deep = [[[ui.text({ id: 'deep3', text: 'Deep3' })]]];
+  return (
+    <Col id="rroot" width={400} gap={8} padding={8}>
+      <Row gap={8}>
+        <Box id="neg_sc" width={40} height={24} bg="#4488cc" scale={-2} opacity={0.6} translate={[4, 2]} />
+        <Box id="zero_sc" width={40} height={24} bg="#8844cc" scale={0} opacity={0.7} />
+      </Row>
+      <Row gap={8}>
+        <Card id="click_card" width={100} height={34} padding={6} onClick={() => { state.cardClicks = (state.cardClicks || 0) + 1; }}>
+          <Text>Card</Text>
+        </Card>
+        <Box id="click_box" width={100} height={34} padding={6} bg="#223344" onClick={() => { state.boxClicks = (state.boxClicks || 0) + 1; }}>
+          <Text>Box</Text>
+        </Box>
+      </Row>
+      <Row gap={8}>
+        <Button id="prim_btn" variant="primary" bg="#10b981" color="#111111" width={90} height={32}>Prim</Button>
+        <Button id="dang_btn" variant="danger" bg="#991b1b" color="#fef08a" width={90} height={32}>Dang</Button>
+        <Button id="dis_btn" variant="primary" bg="#ff00ff" elevation="sm" disabled width={90} height={32} onClick={() => { state.disClicks = (state.disClicks || 0) + 1; }}>Off</Button>
+      </Row>
+      <Button id="mbtn" onClick={() => { state.mbtnClicks = (state.mbtnClicks || 0) + 1; }}>
+        <Badge id="mbdg" variant="danger">3</Badge> Alerts
+      </Button>
+      {deep}
+      {ui.box(null, s.ins ? ui.text('Ins') : null, ui.text({ id: 'np_a', text: 'NullPropsA' }), ui.text('NullPropsB'))}
+    </Col>
+  );
+}
+function onEvent(name, v, s) {
+  if (name === 'ins') s.ins = !!v;
+}
+)JS";
+    ok &= check(inlay_surface_set_script(
+                    s, {reg_script, uint32_t(sizeof(reg_script) - 1u), true}),
+                "v0.13 bugfix regression script loads");
+    if (inlay_surface_stats(s).has_error) {
+        const auto err = inlay_surface_error(s);
+        std::printf("v0.13 bugfix error: %.*s\n", int(err.length), err.chars ? err.chars : "");
+    }
+    ok &= check(!inlay_surface_stats(s).has_error, "v0.13 bugfix script has no error");
+
+    uint32_t cnt = 0;
+    const auto *nodes = inlay_surface_nodes(s, &cnt);
+    const auto *deep3_n = find_node_by_id(nodes, cnt, "deep3");
+    const auto *npa_n = find_node_by_id(nodes, cnt, "np_a");
+    ok &= check(deep3_n && str_eq(deep3_n->text, "Deep3"),
+                "depth-3 nested child arrays flatten cleanly");
+    uint32_t npb_id_before = 0u;
+    for (uint32_t i = 0; i < cnt; ++i) {
+        if (str_eq(nodes[i].text, "NullPropsB"))
+            npb_id_before = nodes[i].id;
+    }
+    ok &= check(npa_n != nullptr && npb_id_before != 0u,
+                "ui.box(null, child...) builds children cleanly");
+
+    InlaySurfaceViewDesc view = inlay_surface_view_desc_default();
+    view.id = etch_id("v013-bugfix");
+    view.width_px = 440;
+    view.height_px = 380;
+    auto frame = etch_frame_desc_default();
+    frame.viewport_w = 440;
+    frame.viewport_h = 380;
+    const EtchVec2 default_ptr = frame.pointer_pos;
+    const auto step = [&] {
+        etch_begin_frame(ctx, &frame);
+        inlay_surface_view(s, &view);
+        etch_end_frame(ctx);
+    };
+    const auto click_at = [&](EtchRect r) {
+        frame.pointer_pos = {r.x + r.w * 0.5f, r.y + r.h * 0.5f};
+        frame.pointer_down = true;
+        step();
+        frame.pointer_down = false;
+        step();
+        frame.pointer_pos = default_ptr;
+        step();
+    };
+
+    step();
+    step();
+
+    // Bug 1: negative & zero scale boxes render without wiping layer/opacity.
+    const auto neg_b = etch_element_bounds(find_surface_eid(nodes, cnt, view.id, "neg_sc"));
+    const auto zero_b = etch_element_bounds(find_surface_eid(nodes, cnt, view.id, "zero_sc"));
+    ok &= check(neg_b.w > 0.f && zero_b.w > 0.f && etch_frame_prim_count(ctx) > 0u,
+                "negative and zero scale clamp cleanly without breaking layer/opacity");
+
+    // Bug 3: primary/danger custom bg & color + disabled rich button.
+    const auto theme = etch_get_theme(ctx);
+    const auto prim_b = etch_element_bounds(find_surface_eid(nodes, cnt, view.id, "prim_btn"));
+    const auto dang_b = etch_element_bounds(find_surface_eid(nodes, cnt, view.id, "dang_btn"));
+    const auto dis_b = etch_element_bounds(find_surface_eid(nodes, cnt, view.id, "dis_btn"));
+    ok &= check(has_rect_prim(ctx, prim_b, etch_color_pack_rgba8(etch_rgba8(0x10, 0xb9, 0x81, 255)), 0, false) &&
+                    has_text_prim(ctx, prim_b, etch_color_pack_rgba8(etch_rgba8(0x11, 0x11, 0x11, 255))),
+                "primary button honors custom bg and text color");
+    ok &= check(has_rect_prim(ctx, dang_b, etch_color_pack_rgba8(etch_rgba8(0x99, 0x1b, 0x1b, 255)), 0, false) &&
+                    has_text_prim(ctx, dang_b, etch_color_pack_rgba8(etch_rgba8(0xfe, 0xf0, 0x8a, 255))),
+                "danger button honors custom bg and text color");
+    ok &= check(has_rect_prim(ctx, dis_b, etch_color_pack_rgba8(theme.surface_disabled), 0, false) &&
+                    !has_rect_prim(ctx, dis_b, etch_color_pack_rgba8(etch_rgba8(0xff, 0x00, 0xff, 255)), 0, false),
+                "disabled rich button uses surface_disabled instead of custom bg");
+
+    // Bug 4: multi-child button renders child <Badge> inside button bounds.
+    const auto mbtn_b = etch_element_bounds(find_surface_eid(nodes, cnt, view.id, "mbtn"));
+    const auto mbdg_b = etch_element_bounds(find_surface_eid(nodes, cnt, view.id, "mbdg"));
+    ok &= check(mbtn_b.w > mbdg_b.w && mbdg_b.w > 10.f && mbdg_b.h > 10.f &&
+                    mbdg_b.x >= mbtn_b.x && mbdg_b.x + mbdg_b.w <= mbtn_b.x + mbtn_b.w + 1.f,
+                "multi-child <Button><Badge>3</Badge> Alerts</Button> lays out badge child");
+
+    // Bug 2 & 3 & 4 clicks: card, box, multi-child button fire; disabled button does NOT.
+    const auto card_b = etch_element_bounds(find_surface_eid(nodes, cnt, view.id, "click_card"));
+    const auto box_b = etch_element_bounds(find_surface_eid(nodes, cnt, view.id, "click_box"));
+    click_at(card_b);
+    click_at(box_b);
+    click_at(dis_b);
+    click_at(mbtn_b);
+    const auto st = inlay_surface_state_json(s);
+    ok &= check(st.chars && std::strstr(st.chars, "\"cardClicks\":1") != nullptr &&
+                    std::strstr(st.chars, "\"boxClicks\":1") != nullptr &&
+                    std::strstr(st.chars, "\"mbtnClicks\":1") != nullptr &&
+                    std::strstr(st.chars, "disClicks") == nullptr,
+                "ui.card, ui.box, multi-child button dispatch onClick while disabled button ignores clicks");
+
+    // Bug 5: sibling ID stability in ui.box(null, ...) across conditional mount.
+    ok &= check(inlay_surface_dispatch(s, ETCH_STR_LIT("ins"), ETCH_STR_LIT("true")),
+                "insert conditional sibling in ui.box(null, ...)");
+    nodes = inlay_surface_nodes(s, &cnt);
+    uint32_t npb_id_after = 0u;
+    for (uint32_t i = 0; i < cnt; ++i) {
+        if (str_eq(nodes[i].text, "NullPropsB"))
+            npb_id_after = nodes[i].id;
+    }
+    ok &= check(npb_id_after == npb_id_before,
+                "ui.box(null, ...) preserves stable sibling IDs across conditional mount");
+
+    // Bug 8: 0-sized inlay_surface_view grows to fill parent container!
+    InlaySurfaceViewDesc grow_view = inlay_surface_view_desc_default();
+    grow_view.id = etch_id("v013-grow-surface");
+    grow_view.width_px = 0.0f;
+    grow_view.height_px = 0.0f;
+    auto gframe = etch_frame_desc_default();
+    gframe.viewport_w = 500;
+    gframe.viewport_h = 400;
+    for (int i = 0; i < 2; ++i) {
+        etch_begin_frame(ctx, &gframe);
+        auto pbox = etch_box_desc_default();
+        pbox.axis = ETCH_AXIS_COL;
+        pbox.width = etch_sizing_fixed(420.f);
+        pbox.height = etch_sizing_fixed(260.f);
+        etch_begin_box(&pbox);
+        inlay_surface_view(s, &grow_view);
+        etch_end_box();
+        etch_end_frame(ctx);
+    }
+    const auto grow_b = etch_element_bounds(grow_view.id);
+    ok &= check(std::fabs(grow_b.w - 420.f) <= 1.f && std::fabs(grow_b.h - 260.f) <= 1.f,
+                "0-sized inlay_surface_view grows to fill parent container");
+
+    inlay_surface_destroy(s);
+    return ok;
+}
+
+bool v013_extended_widgets_and_etch028(EtchContext *ctx, const InlaySurfaceDesc &desc) {
+    InlaySurfaceDesc big_desc = desc;
+    big_desc.max_text_bytes = 512u * 1024u;
+    big_desc.max_nodes = 8192u;
+    auto *s = inlay_surface_create(ctx, &big_desc);
+    if (!s)
+        return false;
+
+    bool ok = true;
+    auto frame = etch_frame_desc_default();
+    frame.viewport_w = 720;
+    frame.viewport_h = 900;
+    frame.dt_seconds = 1.f / 60.f;
+    const EtchVec2 default_ptr = frame.pointer_pos;
+    InlaySurfaceViewDesc view = inlay_surface_view_desc_default();
+    view.id = etch_id("v013-ext");
+    view.width_px = 680;
+    view.height_px = 860;
+    const auto step = [&] {
+        etch_begin_frame(ctx, &frame);
+        inlay_surface_view(s, &view);
+        etch_end_frame(ctx);
+    };
+    const auto click_pt = [&](float x, float y) {
+        frame.pointer_pos = {x, y};
+        frame.pointer_down = true;
+        step();
+        frame.pointer_down = false;
+        step();
+        frame.pointer_pos = default_ptr;
+        step();
+    };
+
+    // Phase A: Doc (streaming + link click), Terminal (ANSI 256/truecolor + CJK + >8KiB lines growth),
+    //          Table (numeric sort 0-JS-tick + row click), Tree/TreeItem, Menu/ContextMenu,
+    //          Avatar, Toast (presence enter/exit), Accordion, Skeleton, Progress (ring/indet),
+    //          Badge (variant/dot), Switch, blendMode, alphaMask, OpenType tabularNums/noLiga.
+    static const char ext_script[] = R"JS(
+const BIG_LINES = Array.from({ length: 240 }, (_, i) =>
+  `L${i} \x1b[38;2;52;211;153m\x1b[38;5;208m中文测试\x1b[0m 0123456789ABCDEF0123456789`
+);
+function render(s) {
+  return (
+    <Col id="eroot" width={640} gap={8} padding={8}>
+      <Text id="before_term">BeforeTerm</Text>
+      <Doc
+        id="udoc"
+        width={300}
+        blockPadding={4}
+        fontSize={16}
+        markdown={'[OpenInlayDocs](https://inlay.dev)' + (s.docExtra || '')}
+        onLinkClick={e => { state.linkUrl = e.url; }}
+      />
+      <Table
+        id="utbl"
+        width={280}
+        headerHeight={32}
+        rowHeight={30}
+        columns={[
+          { key: 'name', title: 'Name' },
+          { key: 'val', title: 'Value', numeric: true }
+        ]}
+        rows={[
+          { name: 'Beta',  val: '20ms'  },
+          { name: 'Alpha', val: '100ms' },
+          { name: 'Gamma', val: '9ms'   }
+        ]}
+        onRowClick={e => { state.clickedRow = e.row; }}
+      />
+      <Row cls="items-center" gap={10}>
+        <Avatar id="uav" name="Ada Lovelace" size="md" status="online" ring />
+        <Badge id="ubdg_s" variant="success" dot>Healthy</Badge>
+        <Badge id="ubdg_d" variant="danger" dot />
+        <Progress id="upring" variant="ring" value={72} min={0} max={100} width={48} height={48} thickness={5} showPercent />
+        <Progress id="upind" indeterminate width={100} height={8} />
+        <Switch id="usw" label="Mode" size="sm" checked={!!s.sw} onChange={v => { state.sw = v; }} />
+      </Row>
+      <Row gap={10}>
+        <Tree id="utree" width={180}>
+          <TreeItem id="ti_root" label="Root" defaultOpen>
+            <TreeItem id="ti_leaf" label="LeafNode" leaf onSelect={e => { state.treeSel = e.label; }} />
+          </TreeItem>
+        </Tree>
+        <Accordion id="uacc" title="Details" defaultOpen={false} onToggle={e => { state.accOpen = e.open; }}>
+          <Text>Accordion Body</Text>
+        </Accordion>
+      </Row>
+      <Row gap={10}>
+        <Menu
+          id="umnu"
+          label="Actions"
+          items={[
+            { label: 'Copy', shortcut: 'Ctrl+C', value: 'copy' },
+            { separator: true },
+            { label: 'Delete', danger: true, value: 'del' }
+          ]}
+          onSelect={e => { state.menuSel = e.value; }}
+        />
+        <ContextMenu id="uctx" items={['Inspect', 'Reload']}>
+          <Box id="uctx_box" width={90} height={28} bg="#1e293b"><Text>Target</Text></Box>
+        </ContextMenu>
+        <Skeleton id="usk_r" variant="rect" width={80} height={16} animated={false} />
+        <Skeleton id="usk_c" variant="circle" width={28} height={28} animated={false} />
+        <Skeleton id="usk_t" variant="text" lines={3} width={90} animated={false} />
+      </Row>
+      <Row gap={8}>
+        <Box id="ubm_m" width={40} height={20} bg="#3b82f6" blendMode="multiply" />
+        <Box id="ubm_s" width={40} height={20} bg="#10b981" blendMode="screen" />
+        <Box id="ubm_a" width={40} height={20} bg="#f59e0b" blendMode="additive" />
+        <Box id="uam_f" width={60} height={20} bg="#6366f1" alphaMask="fade-bottom" />
+        <Box id="uam_sp" width={60} height={20} bg="#ec4899" alphaMask="spotlight" />
+        <Text id="uot" tabularNums noLiga cls="tabular-nums no-liga">0123 fi fl</Text>
+      </Row>
+      <Terminal id="uterm" title="ansi" cols={42} rows={4} fontSize={11} lines={BIG_LINES} />
+      <Toast
+        id="utoast"
+        open={!!s.toastOpen}
+        variant="success"
+        title="Saved"
+        description="Toast body"
+        actionLabel="Undo"
+        onClose={() => { state.toastOpen = false; }}
+      />
+    </Col>
+  );
+}
+function onEvent(name, v, s) {
+  if (name === 'docAppend') s.docExtra = v;
+  if (name === 'toast') s.toastOpen = !!v;
+}
+)JS";
+    ok &= check(inlay_surface_set_script(
+                    s, {ext_script, uint32_t(sizeof(ext_script) - 1u), true}),
+                "v0.13 extended widgets + Etch 0.28 props script loads");
+    if (inlay_surface_stats(s).has_error) {
+        const auto err = inlay_surface_error(s);
+        std::printf("v0.13 ext error: %.*s\n", int(err.length), err.chars ? err.chars : "");
+    }
+    ok &= check(!inlay_surface_stats(s).has_error, "v0.13 extended widgets script has no error");
+
+    uint32_t cnt = 0;
+    const auto *nodes = inlay_surface_nodes(s, &cnt);
+    ok &= check(has_node_kind(nodes, cnt, INLAY_UI_DOC) &&
+                    has_node_kind(nodes, cnt, INLAY_UI_TERMINAL) &&
+                    has_node_kind(nodes, cnt, INLAY_UI_TABLE) &&
+                    has_node_kind(nodes, cnt, INLAY_UI_TREE) &&
+                    has_node_kind(nodes, cnt, INLAY_UI_TREE_ITEM) &&
+                    has_node_kind(nodes, cnt, INLAY_UI_MENU) &&
+                    has_node_kind(nodes, cnt, INLAY_UI_CONTEXT_MENU) &&
+                    has_node_kind(nodes, cnt, INLAY_UI_AVATAR) &&
+                    has_node_kind(nodes, cnt, INLAY_UI_TOAST) &&
+                    has_node_kind(nodes, cnt, INLAY_UI_ACCORDION) &&
+                    has_node_kind(nodes, cnt, INLAY_UI_SKELETON),
+                "all extended widget node kinds present");
+
+    // Verify dynamic s->text growth (> 8 KiB terminal lines) rebased earlier node text cleanly!
+    const auto *before_term_n = find_node_by_id(nodes, cnt, "before_term");
+    ok &= check(before_term_n && str_eq(before_term_n->text, "BeforeTerm"),
+                "terminal >8KiB lines growth preserves and rebases earlier node text");
+
+    step();
+    step();
+
+    // Check widget bounds: Avatar, dot-only Badge, Ring Progress, Skeletons, Terminal.
+    const auto uav_b = etch_element_bounds(find_surface_eid(nodes, cnt, view.id, "uav"));
+    const auto bdg_d_b = etch_element_bounds(find_surface_eid(nodes, cnt, view.id, "ubdg_d"));
+    const auto ring_b = etch_element_bounds(find_surface_eid(nodes, cnt, view.id, "upring"));
+    const auto skr_b = etch_element_bounds(find_surface_eid(nodes, cnt, view.id, "usk_r"));
+    const auto skc_b = etch_element_bounds(find_surface_eid(nodes, cnt, view.id, "usk_c"));
+    const auto skt_b = etch_element_bounds(find_surface_eid(nodes, cnt, view.id, "usk_t"));
+    const auto term_b = etch_element_bounds(find_surface_eid(nodes, cnt, view.id, "uterm"));
+    ok &= check(std::fabs(uav_b.w - 32.f) <= 0.5f && std::fabs(uav_b.h - 32.f) <= 0.5f,
+                "ui.avatar md renders 32x32");
+    ok &= check(std::fabs(bdg_d_b.w - 8.f) <= 0.5f && std::fabs(bdg_d_b.h - 8.f) <= 0.5f,
+                "dot-only ui.badge renders 8x8");
+    ok &= check(std::fabs(ring_b.w - 48.f) <= 0.5f && std::fabs(ring_b.h - 48.f) <= 0.5f,
+                "ui.progress ring renders 48x48");
+    ok &= check(std::fabs(skr_b.w - 80.f) <= 0.5f && std::fabs(skc_b.w - 28.f) <= 0.5f &&
+                    skt_b.h > 30.f && term_b.w > 100.f && term_b.h > 40.f,
+                "ui.skeleton (rect/circle/text) and ui.terminal render with valid bounds");
+
+    // ui.doc link click + streaming prefix append.
+    const auto udoc_b = etch_element_bounds(find_surface_eid(nodes, cnt, view.id, "udoc"));
+    const float doc_h1 = udoc_b.h;
+    click_pt(udoc_b.x + 24.f, udoc_b.y + 12.f);
+    auto st_json = inlay_surface_state_json(s);
+    ok &= check(st_json.chars && std::strstr(st_json.chars, "https://inlay.dev") != nullptr,
+                "ui.doc link click dispatches onLinkClick with URL");
+    ok &= check(inlay_surface_dispatch(
+                    s, ETCH_STR_LIT("docAppend"),
+                    ETCH_STR_LIT("\"\\n\\nStreamed paragraph appended via prefix fast-path.\"")),
+                "ui.doc streaming prefix append");
+    step();
+    step();
+    nodes = inlay_surface_nodes(s, &cnt);
+    const auto udoc_b2 = etch_element_bounds(find_surface_eid(nodes, cnt, view.id, "udoc"));
+    ok &= check(udoc_b2.h > doc_h1 + 10.f, "ui.doc streaming prefix append grows rendered height");
+
+    // ui.table: click numeric Value header -> 0 JS ticks + numeric descending puts 100ms (orig row 1) first!
+    // Note: in Etch begin_table, utbl's element_id is the body virtual list below the 32px header.
+    const auto tbl_b = etch_element_bounds(find_surface_eid(nodes, cnt, view.id, "utbl"));
+    const uint64_t ticks_before_sort = inlay_surface_stats(s).js_ticks;
+    click_pt(tbl_b.x + tbl_b.w * 0.72f, tbl_b.y - 16.f);
+    ok &= check(inlay_surface_stats(s).js_ticks == ticks_before_sort,
+                "ui.table native column sort runs 0 JS ticks");
+    click_pt(tbl_b.x + 60.f, tbl_b.y + 15.f);
+    st_json = inlay_surface_state_json(s);
+    ok &= check(st_json.chars && std::strstr(st_json.chars, "\"clickedRow\":1") != nullptr,
+                "ui.table numeric sort orders 100ms > 20ms > 9ms and maps row click to orig row 1");
+
+    // ui.switch toggle via a11y press.
+    const uint32_t usw_eid = find_surface_eid(nodes, cnt, view.id, "usw");
+    ok &= check(etch_perform_a11y_action(usw_eid, ETCH_A11Y_ACT_PRESS, 0, {}, ctx, nullptr),
+                "activate ui.switch");
+    step();
+    step();
+    st_json = inlay_surface_state_json(s);
+    ok &= check(st_json.chars && std::strstr(st_json.chars, "\"sw\":true") != nullptr,
+                "ui.switch updates state to true");
+
+    // ui.treeItem click fires onSelect (click past depth-1 16px indent + 16px chevron spacer onto label).
+    nodes = inlay_surface_nodes(s, &cnt);
+    const auto leaf_b = etch_element_bounds(find_surface_eid(nodes, cnt, view.id, "ti_leaf"));
+    click_pt(leaf_b.x + 60.f, leaf_b.y + leaf_b.h * 0.5f);
+    st_json = inlay_surface_state_json(s);
+    ok &= check(st_json.chars && std::strstr(st_json.chars, "\"treeSel\":\"LeafNode\"") != nullptr,
+                "ui.treeItem click fires onSelect");
+
+    // ui.accordion header click toggles open and fires onToggle.
+    nodes = inlay_surface_nodes(s, &cnt);
+    const uint32_t acc_eid = find_surface_eid(nodes, cnt, view.id, "uacc");
+    const auto acc_hdr_b = etch_element_bounds(etch_id_index(acc_eid, 0xC011u));
+    click_pt(acc_hdr_b.x + 24.f, acc_hdr_b.y + acc_hdr_b.h * 0.5f);
+    st_json = inlay_surface_state_json(s);
+    ok &= check(st_json.chars && std::strstr(st_json.chars, "\"accOpen\":true") != nullptr,
+                "ui.accordion toggle opens and dispatches onToggle");
+
+    // ui.menu trigger press opens popup cleanly and Escape dismisses it.
+    nodes = inlay_surface_nodes(s, &cnt);
+    const uint32_t mnu_eid = find_surface_eid(nodes, cnt, view.id, "umnu");
+    const uint32_t mnu_trig = etch_id_index(mnu_eid, 0xE101u);
+    const uint32_t mnu_pop = etch_id_index(mnu_eid, 0xE102u);
+    ok &= check(etch_perform_a11y_action(mnu_trig, ETCH_A11Y_ACT_PRESS, 0, {}, ctx, nullptr),
+                "press ui.menu trigger");
+    step();
+    bool menu_opened = false;
+    etch_begin_frame(ctx, &frame);
+    inlay_surface_view(s, &view);
+    menu_opened = etch_is_popup_open(mnu_pop);
+    etch_end_frame(ctx);
+    ok &= check(menu_opened, "ui.menu opens popup cleanly");
+    frame.key_pressed_code = SDLK_ESCAPE;
+    step();
+    frame.key_pressed_code = 0u;
+    bool menu_closed = false;
+    etch_begin_frame(ctx, &frame);
+    inlay_surface_view(s, &view);
+    menu_closed = !etch_is_popup_open(mnu_pop);
+    etch_end_frame(ctx);
+    ok &= check(menu_closed, "ui.menu closes popup on Escape");
+
+    // ui.toast presence enter & exit settles cleanly with 0 extra JS ticks.
+    ok &= check(inlay_surface_dispatch(s, ETCH_STR_LIT("toast"), ETCH_STR_LIT("true")),
+                "open ui.toast");
+    for (int i = 0; i < 36; ++i)
+        step();
+    ok &= check(!inlay_surface_stats(s).has_error && etch_frame_prim_count(ctx) > 0u,
+                "ui.toast presence enter renders cleanly");
+    const uint64_t ticks_before_toast_exit = inlay_surface_stats(s).js_ticks;
+    ok &= check(inlay_surface_dispatch(s, ETCH_STR_LIT("toast"), ETCH_STR_LIT("false")),
+                "close ui.toast");
+    for (int i = 0; i < 48; ++i)
+        step();
+    ok &= check(inlay_surface_stats(s).js_ticks == ticks_before_toast_exit + 1u,
+                "ui.toast presence exit runs 0 extra JS ticks");
+
+    // Phase B: ui.virtualList — 10,000-item data mode + 10,000-item windowed renderItem mode (O(visible) calls!).
+    ok &= check(inlay_surface_set_state_json(s, ETCH_STR_LIT("{}")), "reset state for virtualList");
+    static const char vlist_data_script[] = R"JS(
+const ITEMS_10K = Array.from({ length: 10000 }, (_, i) => 'Item ' + i);
+function render() {
+  return (
+    <VirtualList
+      id="vdata"
+      items={ITEMS_10K}
+      itemHeight={28}
+      width={320}
+      height={200}
+    />
+  );
+}
+)JS";
+    ok &= check(inlay_surface_set_script(
+                    s, {vlist_data_script, uint32_t(sizeof(vlist_data_script) - 1u), true}),
+                "ui.virtualList 10,000-item data mode loads");
+    nodes = inlay_surface_nodes(s, &cnt);
+    ok &= check(has_node_kind(nodes, cnt, INLAY_UI_VIRTUAL_LIST) && !inlay_surface_stats(s).has_error,
+                "ui.virtualList 10,000-item data mode builds node");
+    step();
+    step();
+    const uint64_t vdata_ticks = inlay_surface_stats(s).js_ticks;
+    for (int i = 0; i < 6; ++i)
+        step();
+    ok &= check(inlay_surface_stats(s).js_ticks == vdata_ticks,
+                "ui.virtualList 10,000-item data mode runs 0 idle JS ticks");
+
+    static const char vlist_win_script[] = R"JS(
+function render(s) {
+  s.calls = 0;
+  return (
+    <VirtualList
+      id="vwin"
+      count={10000}
+      itemHeight={28}
+      width={320}
+      height={200}
+      renderItem={i => {
+        s.calls = (s.calls || 0) + 1;
+        return <Text key={'r' + i}>{'Row ' + i}</Text>;
+      }}
+    />
+  );
+}
+)JS";
+    ok &= check(inlay_surface_set_script(
+                    s, {vlist_win_script, uint32_t(sizeof(vlist_win_script) - 1u), true}),
+                "ui.virtualList 10,000-item windowed renderItem mode loads");
+    step();
+    step();
+    const auto vwin_json = inlay_surface_state_json(s);
+    int render_calls = 0;
+    if (vwin_json.chars) {
+        if (const char *p = std::strstr(vwin_json.chars, "\"calls\":"))
+            render_calls = std::atoi(p + 8);
+    }
+    ok &= check(render_calls > 0 && render_calls <= 64,
+                "ui.virtualList renderItem invokes O(visible) callbacks, not 10,000");
+    const uint64_t vwin_ticks = inlay_surface_stats(s).js_ticks;
+    for (int i = 0; i < 6; ++i)
+        step();
+    ok &= check(inlay_surface_stats(s).js_ticks == vwin_ticks,
+                "ui.virtualList renderItem mode runs 0 idle JS ticks");
+
+    inlay_surface_destroy(s);
+    return ok;
+}
+
+bool v013_review_defect_regressions(EtchContext *ctx, const InlaySurfaceDesc &desc) {
+    InlaySurfaceDesc big_desc = desc;
+    big_desc.max_text_bytes = 512u * 1024u;
+    big_desc.max_nodes = 4096u;
+    auto *s = inlay_surface_create(ctx, &big_desc);
+    if (!s)
+        return false;
+
+    bool ok = true;
+    auto frame = etch_frame_desc_default();
+    frame.viewport_w = 720;
+    frame.viewport_h = 900;
+    frame.dt_seconds = 1.f / 60.f;
+    const EtchVec2 default_ptr = frame.pointer_pos;
+    InlaySurfaceViewDesc view = inlay_surface_view_desc_default();
+    view.id = etch_id("v013-review");
+    view.width_px = 680;
+    view.height_px = 860;
+    const auto step = [&] {
+        etch_begin_frame(ctx, &frame);
+        inlay_surface_view(s, &view);
+        etch_end_frame(ctx);
+    };
+    const auto click_pt = [&](float x, float y) {
+        frame.pointer_pos = {x, y};
+        frame.pointer_down = true;
+        step();
+        frame.pointer_down = false;
+        step();
+        frame.pointer_pos = default_ptr;
+        step();
+    };
+    const auto has_text = [](const InlayUiNode *nodes, uint32_t cnt, const char *lit) {
+        for (uint32_t i = 0; i < cnt; ++i) {
+            if (str_eq(nodes[i].text, lit))
+                return true;
+        }
+        return false;
+    };
+
+    // 1. P0: >64 KiB JSON payload safety (no heap overflow) & control-char escaping (no truncation).
+    static const char p0_script[] = R"JS(
+const BIG_LBL = 'x'.repeat(70000);
+const CTRL_LBL = '\x01\x02\x03\x1f"\\'.repeat(80);
+function render() {
+  return (
+    <Tree id="p0tree" width={300}>
+      <TreeItem id="ti_big" label={BIG_LBL} leaf onSelect={e => { state.bigLen = e.label.length; }} />
+      <TreeItem id="ti_ctrl" label={CTRL_LBL} leaf onSelect={e => { state.ctrlLen = e.label.length; }} />
+    </Tree>
+  );
+}
+)JS";
+    ok &= check(inlay_surface_set_script(s, {p0_script, uint32_t(sizeof(p0_script) - 1u), true}),
+                "P0 oversized/control-char script loads");
+    step();
+    step();
+    uint32_t cnt = 0;
+    const auto *nodes = inlay_surface_nodes(s, &cnt);
+    const auto big_b = etch_element_bounds(find_surface_eid(nodes, cnt, view.id, "ti_big"));
+    const auto ctrl_b = etch_element_bounds(find_surface_eid(nodes, cnt, view.id, "ti_ctrl"));
+    click_pt(big_b.x + 24.f, big_b.y + big_b.h * 0.5f);
+    auto st_json = inlay_surface_state_json(s);
+    ok &= check(!inlay_surface_stats(s).has_error &&
+                    (!st_json.chars || std::strstr(st_json.chars, "bigLen") == nullptr),
+                "P0 >64KiB widget event payload safely rejected without crash or error");
+    click_pt(ctrl_b.x + 24.f, ctrl_b.y + ctrl_b.h * 0.5f);
+    st_json = inlay_surface_state_json(s);
+    ok &= check(!inlay_surface_stats(s).has_error && st_json.chars &&
+                    std::strstr(st_json.chars, "\"ctrlLen\":480") != nullptr,
+                "P0 control-char-heavy JSON string escapes completely without truncation");
+
+    // 2. P1: Two unkeyed side-by-side VirtualList(renderItem) never collide + static-child VirtualList has 0 scroll rebuilds.
+    ok &= check(inlay_surface_set_state_json(s, ETCH_STR_LIT("{}")), "reset state for vlist collision check");
+    static const char vl_script[] = R"JS(
+function render() {
+  return (
+    <Row id="vl_row" width={640} gap={8}>
+      <Box id="vl_pane_a" width={200} height={160}>
+        <VirtualList count={1000} itemHeight={28} width={200} height={140}
+          renderItem={i => <Text key={'a' + i}>{'A_' + i}</Text>} />
+      </Box>
+      <Box id="vl_pane_b" width={200} height={160}>
+        <VirtualList count={1000} itemHeight={28} width={200} height={140}
+          renderItem={i => <Text key={'b' + i}>{'B_' + i}</Text>} />
+      </Box>
+      <Box id="vl_pane_s" width={200} height={160}>
+        <VirtualList count={1000} itemHeight={28} width={200} height={140}>
+          <Text>StaticRow0</Text>
+        </VirtualList>
+      </Box>
+    </Row>
+  );
+}
+)JS";
+    ok &= check(inlay_surface_set_script(s, {vl_script, uint32_t(sizeof(vl_script) - 1u), true}),
+                "P1 dual unkeyed VirtualList script loads");
+    step();
+    step();
+    nodes = inlay_surface_nodes(s, &cnt);
+    const auto *pane_a_n = find_node_by_id(nodes, cnt, "vl_pane_a");
+    const auto *pane_s_n = find_node_by_id(nodes, cnt, "vl_pane_s");
+    const uint32_t pane_a_eid = find_surface_eid(nodes, cnt, view.id, "vl_pane_a");
+    const uint32_t pane_s_eid = find_surface_eid(nodes, cnt, view.id, "vl_pane_s");
+    const uint32_t vl_a_eid = (pane_a_n && pane_a_n->first_child != UINT32_MAX)
+        ? etch_id_index(pane_a_eid, nodes[pane_a_n->first_child].id)
+        : 0u;
+    const uint32_t vl_s_eid = (pane_s_n && pane_s_n->first_child != UINT32_MAX)
+        ? etch_id_index(pane_s_eid, nodes[pane_s_n->first_child].id)
+        : 0u;
+    ok &= check(vl_a_eid != 0u && vl_s_eid != 0u && has_text(nodes, cnt, "A_0") && has_text(nodes, cnt, "B_0"),
+                "P1 both unkeyed VirtualLists render row 0 initially");
+    etch_begin_frame(ctx, &frame);
+    etch_set_virtual_list_scroll_offset(vl_a_eid, 2800.0, true);
+    inlay_surface_view(s, &view);
+    etch_end_frame(ctx);
+    step();
+    step();
+    nodes = inlay_surface_nodes(s, &cnt);
+    ok &= check(has_text(nodes, cnt, "A_100") && has_text(nodes, cnt, "B_0"),
+                "P1 scrolling unkeyed VirtualList A refills A_100 while unkeyed VirtualList B stays at B_0");
+    const uint64_t vl_idle_ticks = inlay_surface_stats(s).js_ticks;
+    for (int i = 0; i < 6; ++i)
+        step();
+    ok &= check(inlay_surface_stats(s).js_ticks == vl_idle_ticks,
+                "P1 two unkeyed VirtualLists at different offsets run 0 idle JS ticks");
+    etch_begin_frame(ctx, &frame);
+    etch_set_virtual_list_scroll_offset(vl_s_eid, 2800.0, true);
+    inlay_surface_view(s, &view);
+    etch_end_frame(ctx);
+    step();
+    step();
+    ok &= check(inlay_surface_stats(s).js_ticks == vl_idle_ticks,
+                "P1 scrolling static-children VirtualList triggers 0 spurious JS rebuilds");
+
+    // 3. P1: Sparse JS array watchdog safety (`const a = []; a[0x7FFFFFFF] = 'x'`).
+    auto *wd = inlay_surface_create(ctx, nullptr);
+    ok &= check(wd != nullptr, "watchdog surface for sparse array checks");
+    if (wd) {
+        const double freq = double(SDL_GetPerformanceFrequency());
+        const auto run_bounded = [&](const char *src, bool must_fail, double limit_ms, const char *label) {
+            const uint64_t t0 = SDL_GetPerformanceCounter();
+            const bool loaded = inlay_surface_set_script(wd, {src, uint32_t(std::strlen(src)), true});
+            const double ms = double(SDL_GetPerformanceCounter() - t0) * 1000.0 / freq;
+            ok &= check((!must_fail || !loaded) && ms < limit_ms, label);
+        };
+        run_bounded("const a=[];a[0x7FFFFFFF]='x';function render(){return <Text>{a}</Text>;}",
+                    true, native_conversion_limit_ms, "P1 sparse array in <Text> bounded & rejected");
+        run_bounded("const a=[];a[0x7FFFFFFF]='x';function render(){return <Terminal lines={a} />;}",
+                    true, native_conversion_limit_ms, "P1 sparse array in <Terminal lines> bounded & rejected");
+        run_bounded("const a=[];a[0x7FFFFFFF]='x';function render(){return <VirtualList items={a} />;}",
+                    false, native_conversion_limit_ms * 3.0, "P1 sparse array in <VirtualList items> bounded by watchdog");
+        run_bounded("const a=[];a[0x7FFFFFFF]='x';function render(){return <Table columns={['A']} rows={a} />;}",
+                    false, native_conversion_limit_ms * 3.0, "P1 sparse array in <Table rows> bounded by watchdog");
+        inlay_surface_destroy(wd);
+    }
+
+    // 4. P1: Controlled Table sortColumn switching from non-sortable col 0 -> sortable col 1.
+    ok &= check(inlay_surface_set_state_json(s, ETCH_STR_LIT("{\"sc\":0,\"sd\":false}")),
+                "init controlled table sort state");
+    static const char ctbl_script[] = R"JS(
+function render(s) {
+  return (
+    <Table
+      id="ctbl"
+      width={280}
+      headerHeight={32}
+      rowHeight={30}
+      sortColumn={s.sc}
+      sortDesc={!!s.sd}
+      columns={[
+        { key: 'a', title: 'A', sortable: false },
+        { key: 'v', title: 'V', numeric: true, sortable: true }
+      ]}
+      rows={[
+        { a: 'R0', v: '50' },
+        { a: 'R1', v: '10' },
+        { a: 'R2', v: '90' }
+      ]}
+      onRowClick={e => { state.row = e.row; }}
+    />
+  );
+}
+function onEvent(n, v, s) {
+  if (n === 'sort') { s.sc = v.c; s.sd = !!v.d; }
+}
+)JS";
+    ok &= check(inlay_surface_set_script(s, {ctbl_script, uint32_t(sizeof(ctbl_script) - 1u), true}),
+                "P1 controlled table script loads");
+    step();
+    step();
+    const uint64_t tbl_idle0 = inlay_surface_stats(s).js_ticks;
+    for (int i = 0; i < 4; ++i)
+        step();
+    ok &= check(inlay_surface_stats(s).js_ticks == tbl_idle0,
+                "P1 controlled table on non-sortable col 0 runs 0 idle JS ticks");
+    ok &= check(inlay_surface_dispatch(s, ETCH_STR_LIT("sort"), ETCH_STR_LIT("{\"c\":1,\"d\":true}")),
+                "P1 switch controlled table sortColumn 0 -> 1 desc");
+    step();
+    step();
+    nodes = inlay_surface_nodes(s, &cnt);
+    const auto ctbl_b = etch_element_bounds(find_surface_eid(nodes, cnt, view.id, "ctbl"));
+    click_pt(ctbl_b.x + 60.f, ctbl_b.y + 15.f);
+    st_json = inlay_surface_state_json(s);
+    ok &= check(st_json.chars && std::strstr(st_json.chars, "\"row\":2") != nullptr,
+                "P1 controlled sortColumn switch from non-sortable col 0 to sortable col 1 sorts 90 first (orig row 2)");
+
+    // 5. P1: 16 concurrent <Skeleton animate /> nodes animate cleanly without collision freeze.
+    static const char sk16_script[] = R"JS(
+function render() {
+  const items = [];
+  for (let i = 0; i < 16; ++i) {
+    items.push(
+      <Skeleton key={'sk' + i} id={'sk' + i} variant="rect" width={60} height={12}
+                bg="#101820" shimmerColor="#f0f8ff" animate />
+    );
+  }
+  return <Col id="sk_root" width={120} gap={4}>{items}</Col>;
+}
+)JS";
+    ok &= check(inlay_surface_set_script(s, {sk16_script, uint32_t(sizeof(sk16_script) - 1u), true}),
+                "P1 16 concurrent animated skeletons script loads");
+    const uint64_t sk_ticks0 = inlay_surface_stats(s).js_ticks;
+    for (int i = 0; i < 25; ++i)
+        step();
+    ok &= check(inlay_surface_stats(s).js_ticks == sk_ticks0,
+                "P1 16 animated skeletons run 0 idle JS ticks");
+    nodes = inlay_surface_nodes(s, &cnt);
+    const uint32_t sk_base_rgba = etch_color_pack_rgba8(etch_rgba8(0x10u, 0x18u, 0x20u, 0xFFu));
+    uint32_t animated_ok = 0u;
+    for (int i = 0; i < 16; ++i) {
+        char id_buf[16] = {};
+        std::snprintf(id_buf, sizeof(id_buf), "sk%d", i);
+        const auto b = etch_element_bounds(find_surface_eid(nodes, cnt, view.id, id_buf));
+        const uint32_t col = find_rect_fill_rgba(ctx, b);
+        if (col != 0u && col != sk_base_rgba)
+            ++animated_ok;
+    }
+    ok &= check(animated_ok == 16u,
+                "P1 all 16 concurrent <Skeleton animate /> nodes pulse without collision freeze");
+
+    // 6. P2: <Comp children="explicit" />, cls="flex-1" inside <Col> & <Row>,
+    //        Button/Avatar events, Menu controlled open={false}, Toast exit disable,
+    //        ColorTween duration-0 snap, and non-HMR JSX syntax error state preservation.
+    ok &= check(inlay_surface_set_state_json(s, ETCH_STR_LIT("{\"topen\":true,\"cstep\":0}")),
+                "init P2 state");
+    static const char p2_script[] = R"JS(
+function Comp(props) {
+  return <Text id="comp_out">{props.children}</Text>;
+}
+function render(s) {
+  const step = s.cstep || 0;
+  const cbg = step === 0 ? '#112233' : (step === 1 ? '#ee2222' : (step === 2 ? '#22ee22' : '#112233'));
+  const ccls = step === 2 ? 'transition duration-0' : 'transition duration-200';
+  return (
+    <Col id="p2root" width={400} gap={6}>
+      <Comp children="explicit" />
+      <Col id="col_flex" width={200} height={260}>
+        <Box width={200} height={60} bg="#223344" />
+        <Box id="col_grow" cls="w-full flex-1" bg="#334455" />
+      </Col>
+      <Row id="row_flex" width={300} height={40}>
+        <Box width={80} height={40} bg="#223344" />
+        <Box id="row_grow" cls="h-full flex-1" bg="#445566" />
+      </Row>
+      <Row gap={8}>
+        <Button id="p2btn" onHover={h => { state.btnHov = h; }} onFocus={f => { state.btnFoc = f; }}>Btn</Button>
+        <Avatar id="p2av" name="Linus Torvalds" onHover={h => { state.avHov = h; }} onRightClick={() => { state.avRc = true; }} />
+        <Menu id="p2mnu" open={false} label="Locked" items={['One']} onOpenChange={v => { state.mnuReq = v; }} />
+      </Row>
+      <Box id="ctw" width={60} height={20} bg={cbg} cls={ccls} />
+      <Toast id="p2toast" open={!!s.topen} title="Hi" actionLabel="Undo"
+             onAction={() => { state.toastAct = true; }} />
+    </Col>
+  );
+}
+function onEvent(n, v, s) {
+  if (n === 'topen') s.topen = !!v;
+  if (n === 'cstep') s.cstep = v;
+  if (n === 'keep') s.kept = v;
+}
+)JS";
+    ok &= check(inlay_surface_set_script(s, {p2_script, uint32_t(sizeof(p2_script) - 1u), true}),
+                "P2 polish regressions script loads");
+    step();
+    step();
+    nodes = inlay_surface_nodes(s, &cnt);
+    const auto *comp_n = find_node_by_id(nodes, cnt, "comp_out");
+    ok &= check(comp_n && str_eq(comp_n->text, "explicit"),
+                "P2 <Comp children=\"explicit\" /> preserves explicit props.children");
+    const auto col_g_b = etch_element_bounds(find_surface_eid(nodes, cnt, view.id, "col_grow"));
+    const auto row_g_b = etch_element_bounds(find_surface_eid(nodes, cnt, view.id, "row_grow"));
+    ok &= check(std::fabs(col_g_b.h - 200.f) <= 1.f && std::fabs(row_g_b.w - 220.f) <= 1.f,
+                "P2 cls=\"flex-1\" grows vertically inside <Col> and horizontally inside <Row>");
+
+    // Button onHover/onFocus & Avatar onHover/onRightClick
+    const uint32_t btn_eid = find_surface_eid(nodes, cnt, view.id, "p2btn");
+    const auto btn_b = etch_element_bounds(btn_eid);
+    frame.pointer_pos = {btn_b.x + btn_b.w * 0.5f, btn_b.y + btn_b.h * 0.5f};
+    step();
+    step();
+    ok &= check(etch_perform_a11y_action(btn_eid, ETCH_A11Y_ACT_FOCUS, 0, {}, ctx, nullptr),
+                "P2 focus button via a11y");
+    step();
+    step();
+    frame.pointer_pos = default_ptr;
+    step();
+    st_json = inlay_surface_state_json(s);
+    ok &= check(st_json.chars && std::strstr(st_json.chars, "\"btnHov\":") != nullptr &&
+                    std::strstr(st_json.chars, "\"btnFoc\":true") != nullptr,
+                "P2 Button dispatches onHover and onFocus");
+
+    nodes = inlay_surface_nodes(s, &cnt);
+    const auto av_b = etch_element_bounds(find_surface_eid(nodes, cnt, view.id, "p2av"));
+    frame.pointer_pos = {av_b.x + av_b.w * 0.5f, av_b.y + av_b.h * 0.5f};
+    frame.right_pointer_down = true;
+    step();
+    frame.right_pointer_down = false;
+    step();
+    frame.pointer_pos = default_ptr;
+    step();
+    st_json = inlay_surface_state_json(s);
+    ok &= check(st_json.chars && std::strstr(st_json.chars, "\"avHov\":") != nullptr &&
+                    std::strstr(st_json.chars, "\"avRc\":true") != nullptr,
+                "P2 Avatar dispatches onHover and onRightClick");
+
+    // Menu controlled open={false} -> zero 1-frame popup flicker + emits onOpenChange(true)
+    nodes = inlay_surface_nodes(s, &cnt);
+    const uint32_t mnu_eid = find_surface_eid(nodes, cnt, view.id, "p2mnu");
+    const uint32_t mnu_trig = etch_id_index(mnu_eid, 0xE101u);
+    const uint32_t mnu_pop = etch_id_index(mnu_eid, 0xE102u);
+    ok &= check(etch_perform_a11y_action(mnu_trig, ETCH_A11Y_ACT_PRESS, 0, {}, ctx, nullptr),
+                "P2 press controlled closed Menu trigger");
+    bool flicker_open = true;
+    etch_begin_frame(ctx, &frame);
+    inlay_surface_view(s, &view);
+    flicker_open = etch_is_popup_open(mnu_pop);
+    etch_end_frame(ctx);
+    st_json = inlay_surface_state_json(s);
+    ok &= check(!flicker_open && st_json.chars && std::strstr(st_json.chars, "\"mnuReq\":true") != nullptr,
+                "P2 controlled Menu open={false} has zero 1-frame flicker and emits onOpenChange");
+
+    // Toast action button disabled during exit fade-out
+    for (int i = 0; i < 20; ++i)
+        step();
+    nodes = inlay_surface_nodes(s, &cnt);
+    const uint32_t toast_eid = find_surface_eid(nodes, cnt, view.id, "p2toast");
+    const auto toast_act_b = etch_element_bounds(etch_id_index(toast_eid, 0x70A1u));
+    ok &= check(inlay_surface_dispatch(s, ETCH_STR_LIT("topen"), ETCH_STR_LIT("false")),
+                "P2 begin Toast exit fade-out");
+    step();
+    click_pt(toast_act_b.x + toast_act_b.w * 0.5f, toast_act_b.y + toast_act_b.h * 0.5f);
+    st_json = inlay_surface_state_json(s);
+    ok &= check(st_json.chars && std::strstr(st_json.chars, "\"toastAct\":true") == nullptr,
+                "P2 Toast action button disabled during exit fade-out");
+
+    // ColorTweenSlot duration == 0 snaps slot cleanly before next timed transition
+    ok &= check(inlay_surface_dispatch(s, ETCH_STR_LIT("cstep"), ETCH_STR_LIT("1")), "cstep 1 (#ee2222)");
+    for (int i = 0; i < 20; ++i)
+        step();
+    ok &= check(inlay_surface_dispatch(s, ETCH_STR_LIT("cstep"), ETCH_STR_LIT("2")), "cstep 2 (duration-0 #22ee22)");
+    step();
+    ok &= check(inlay_surface_dispatch(s, ETCH_STR_LIT("cstep"), ETCH_STR_LIT("3")), "cstep 3 (duration-200 #112233)");
+    step();
+    nodes = inlay_surface_nodes(s, &cnt);
+    const auto ctw_b = etch_element_bounds(find_surface_eid(nodes, cnt, view.id, "ctw"));
+    const uint32_t ctw_col = find_rect_fill_rgba(ctx, ctw_b);
+    const uint8_t ctw_g = static_cast<uint8_t>((ctw_col >> 8) & 0xFFu);
+    const uint8_t ctw_r = static_cast<uint8_t>(ctw_col & 0xFFu);
+    ok &= check(ctw_g > ctw_r + 80u,
+                "P2 ColorTween duration-0 updates slot so next transition starts from snapped green, not stale red");
+
+    // Non-HMR set_script preserves state across JSX syntax error
+    ok &= check(inlay_surface_dispatch(s, ETCH_STR_LIT("keep"), ETCH_STR_LIT("77")),
+                "P2 mutate non-HMR state before JSX syntax error");
+    ok &= check(!inlay_surface_set_script(s, ETCH_STR_LIT("function render(){return <Box><Text></Box>;}")),
+                "P2 broken JSX rejected");
+    ok &= check(inlay_surface_set_script(s, ETCH_STR_LIT("function render(s){return <Text>{String(s.kept)}</Text>;}")),
+                "P2 valid JSX reloads cleanly");
+    st_json = inlay_surface_state_json(s);
+    ok &= check(st_json.chars && std::strstr(st_json.chars, "\"kept\":77") != nullptr,
+                "P2 non-HMR set_script preserves prior state after JSX syntax error");
+
+    inlay_surface_destroy(s);
+    return ok;
+}
 } // namespace
 int main(int argc, char **argv) {
     auto config = etch_context_desc_default();
@@ -901,6 +2189,12 @@ int main(int argc, char **argv) {
     ok &= expanded_surface_primitives(context, functional_desc);
     ok &= i2_reactive_reconciler_upgrades(context, functional_desc);
     ok &= v012_expressive_surface_and_bridges(context, functional_desc);
+    ok &= v013_jsx_transpiler(context, functional_desc);
+    ok &= v013_cls_colors_and_themes(context, functional_desc);
+    ok &= v013_transitions_zero_idle_ticks(context, functional_desc);
+    ok &= v013_bugfix_regressions(context, functional_desc);
+    ok &= v013_extended_widgets_and_etch028(context, functional_desc);
+    ok &= v013_review_defect_regressions(context, functional_desc);
     const auto script = ETCH_STR_LIT(
         "function render(s){return "
         "h('box',{axis:'column',gap:8,padding:12,bg:'var(--etch-bg-elevated)',radius:'panel',"

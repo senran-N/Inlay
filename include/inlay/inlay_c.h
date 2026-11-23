@@ -5,7 +5,7 @@
 #include <stdint.h>
 #include <etch/etch_c.h>
 #define INLAY_VERSION_MAJOR 0
-#define INLAY_VERSION_MINOR 12
+#define INLAY_VERSION_MINOR 13
 #define INLAY_VERSION_PATCH 0
 #define INLAY_STRING_DETAIL(x) #x
 #define INLAY_STRING(x) INLAY_STRING_DETAIL(x)
@@ -245,19 +245,23 @@ typedef struct InlaySurfaceDesc {
  size_t memory_limit_bytes,max_stack_bytes;
  float max_tick_ms;
  uint32_t max_nodes,max_text_bytes;
+ bool disable_jsx; /* When false (default), scripts with JSX syntax auto-transpile cleanly. */
 } InlaySurfaceDesc;
 typedef enum InlayUiKind {
  INLAY_UI_BOX, INLAY_UI_TEXT, INLAY_UI_BUTTON, INLAY_UI_INPUT, INLAY_UI_TOGGLE,
  INLAY_UI_SCROLL, INLAY_UI_PROGRESS, INLAY_UI_SLIDER, INLAY_UI_BADGE, INLAY_UI_DIVIDER, INLAY_UI_IMAGE,
  INLAY_UI_CARD, INLAY_UI_SPACER, INLAY_UI_CHECKBOX, INLAY_UI_TABS, INLAY_UI_COMBOBOX,
  INLAY_UI_MODAL, INLAY_UI_POPOVER, INLAY_UI_TOOLTIP, INLAY_UI_SPLIT,
- INLAY_UI_MATH, INLAY_UI_DIAGRAM, INLAY_UI_SLOT
+ INLAY_UI_MATH, INLAY_UI_DIAGRAM, INLAY_UI_SLOT,
+ INLAY_UI_DOC, INLAY_UI_TERMINAL, INLAY_UI_VIRTUAL_LIST, INLAY_UI_TABLE,
+ INLAY_UI_TREE, INLAY_UI_TREE_ITEM, INLAY_UI_MENU, INLAY_UI_CONTEXT_MENU,
+ INLAY_UI_AVATAR, INLAY_UI_TOAST, INLAY_UI_ACCORDION, INLAY_UI_SKELETON
 } InlayUiKind;
 typedef struct InlayUiNode {InlayUiKind kind;uint32_t id,first_child,next_sibling;EtchStr text;} InlayUiNode;
 typedef struct InlaySurfaceViewDesc {
  uint32_t struct_size;
  uint32_t id;
- float width_px,height_px;
+ float width_px,height_px; /* <= 0 grows to fill parent container (etch_sizing_grow). */
 } InlaySurfaceViewDesc;
 /* last_reload_ms measures engine reload; total includes filesystem read latency. */
 typedef struct InlaySurfaceStats {uint64_t js_ticks,reloads;uint32_t node_count;double last_tick_ms,last_reload_ms,last_reload_total_ms;bool has_error;} InlaySurfaceStats;
@@ -280,6 +284,8 @@ INLAY_API bool inlay_surface_bind_slot(InlaySurface*,EtchStr name,InlaySlotRende
 INLAY_API bool inlay_surface_dispatch(InlaySurface*,EtchStr name,EtchStr payload_json);
 INLAY_API bool inlay_surface_enable_hmr(InlaySurface*,const char* script_path);
 INLAY_API bool inlay_surface_poll_hmr(InlaySurface*);
+/* Renders the reactive surface inside the active Etch frame. width_px <= 0 or
+   height_px <= 0 grows to fill the parent container (etch_sizing_grow) on that axis. */
 INLAY_API void inlay_surface_view(InlaySurface*,const InlaySurfaceViewDesc*);
 /* Milliseconds until the next scheduled JS timer expires, 0 if due now, or -1 if none. */
 INLAY_API int32_t inlay_surface_next_timer_ms(const InlaySurface*);

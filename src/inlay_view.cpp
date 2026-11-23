@@ -276,13 +276,7 @@ constexpr float collapsed_height = -1.f;
 constexpr uint32_t inline_open = 1u << 10, inline_close = 1u << 11;
 
 bool append_inline(InlayMeasure* m, InlayInline token) noexcept {
- if (m->token_count == m->token_capacity) {
-  const uint32_t cap = m->token_capacity ? m->token_capacity * 2u : 64u;
-  auto* memory = std::realloc(m->tokens, size_t(cap) * sizeof(InlayInline));
-  if (!memory) return false;
-  m->tokens = static_cast<InlayInline*>(memory);
-  m->token_capacity = cap;
- }
+ if (!inlay_grow_pod(m->tokens, m->token_capacity, m->token_count + 1u, 64u, 16u * 1024u * 1024u)) return false;
  m->tokens[m->token_count++] = token;
  return true;
 }
@@ -802,13 +796,7 @@ uint32_t table_text_copy(const char* src, uint32_t len, char* dst) noexcept {
 // ---------- Unified Document Plain-Text & Selection Helpers ----------
 
 bool push_u32(uint32_t** arr, uint32_t* count, uint32_t* cap, uint32_t val) noexcept {
- if (*count == *cap) {
-  const uint32_t ncap = *cap ? *cap * 2u : 64u;
-  auto* mem = static_cast<uint32_t*>(std::realloc(*arr, size_t(ncap) * sizeof(uint32_t)));
-  if (!mem) return false;
-  *arr = mem;
-  *cap = ncap;
- }
+ if (!inlay_grow_pod(*arr, *cap, *count + 1u, 64u, 16u * 1024u * 1024u)) return false;
  (*arr)[(*count)++] = val;
  return true;
 }
@@ -821,13 +809,7 @@ bool id_in_list(const uint32_t* arr, uint32_t count, uint32_t id) noexcept {
 
 void record_vis_seg(InlayMeasure* m, const InlaySelSegment& seg) noexcept {
  if (!seg.element_id || !seg.doc_len) return;
- if (m->vis_seg_count == m->vis_seg_cap) {
-  const uint32_t ncap = m->vis_seg_cap ? m->vis_seg_cap * 2u : 64u;
-  auto* mem = static_cast<InlaySelSegment*>(std::realloc(m->vis_segs, size_t(ncap) * sizeof(InlaySelSegment)));
-  if (!mem) return;
-  m->vis_segs = mem;
-  m->vis_seg_cap = ncap;
- }
+ if (!inlay_grow_pod(m->vis_segs, m->vis_seg_cap, m->vis_seg_count + 1u, 64u, 16u * 1024u * 1024u)) return;
  m->vis_segs[m->vis_seg_count++] = seg;
 }
 
@@ -857,10 +839,9 @@ uint32_t utf8_clamp(const char* s, uint32_t len, uint32_t pos) noexcept {
 }
 
 uint32_t utf8_next(const char* s, uint32_t len, uint32_t pos) noexcept {
- if (pos >= len) return len;
- ++pos;
- while (pos < len && (uint8_t(s[pos]) & 0xC0u) == 0x80u) ++pos;
- return pos;
+ size_t p = pos;
+ (void)inlay_utf8_next(s, len, &p);
+ return uint32_t(p);
 }
 
 uint32_t hit_test_seg_byte(const InlayMeasure* m, const InlaySelSegment& seg, EtchRect r, EtchVec2 ptr) noexcept {
@@ -974,14 +955,7 @@ uint32_t hit_test_doc_offset(const InlayMeasure* m, EtchVec2 ptr) noexcept {
 
 bool append_plain_bytes(InlayMeasure* m, const char* s, uint32_t n) noexcept {
  if (!n) return true;
- if (m->plain_len + n > m->plain_cap) {
-  uint32_t cap = m->plain_cap ? m->plain_cap : 1024u;
-  while (cap < m->plain_len + n) cap *= 2u;
-  auto* mem = static_cast<char*>(std::realloc(m->plain_text, cap));
-  if (!mem) return false;
-  m->plain_text = mem;
-  m->plain_cap = cap;
- }
+ if (!inlay_grow_pod(m->plain_text, m->plain_cap, m->plain_len + n, 1024u, 64u * 1024u * 1024u)) return false;
  std::memcpy(m->plain_text + m->plain_len, s, n);
  m->plain_len += n;
  return true;
@@ -1823,7 +1797,7 @@ void code_line(InlayMeasure* m, EtchStr line, EtchStr language, uint32_t id, flo
     continue;
    }
    const char c = line.chars[pos];
-   if (uint8_t(c) >= 0x80u) { ++pos; while (pos < line.length && (uint8_t(line.chars[pos]) & 0xc0u) == 0x80u) ++pos; }
+   if (uint8_t(c) >= 0x80u) { size_t p = pos; (void)inlay_utf8_next(line.chars, line.length, &p); pos = uint32_t(p); }
    else if ((c == '/' && pos + 1u < line.length && line.chars[pos + 1u] == '/') ||
             (c == '-' && pos + 1u < line.length && line.chars[pos + 1u] == '-' && (pos + 2u == line.length || line.chars[pos + 2u] == ' ' || line.chars[pos + 2u] == '-'))) {
     pos = line.length;
@@ -2056,13 +2030,7 @@ float get_table_col_widths(InlayMeasure* measure, EtchStr source, const InlayRow
   }
  }
  const float total_w = compute_table_col_widths(measure, source, info, columns, width, font, style, view, out_widths);
- if (measure->table_cols_count == measure->table_cols_capacity) {
-  const uint32_t cap = measure->table_cols_capacity ? measure->table_cols_capacity * 2u : 16u;
-  auto* mem = static_cast<InlayTableCols*>(std::realloc(measure->table_cols, size_t(cap) * sizeof(InlayTableCols)));
-  if (!mem) return total_w;
-  measure->table_cols = mem;
-  measure->table_cols_capacity = cap;
- }
+ if (!inlay_grow_pod(measure->table_cols, measure->table_cols_capacity, measure->table_cols_count + 1u, 16u, 1024u * 1024u)) return total_w;
  auto& entry = measure->table_cols[measure->table_cols_count++];
  entry.header_row = info.table_header;
  entry.columns = columns;
@@ -2529,30 +2497,20 @@ uint32_t find_list_item_for_offset(const InlayDoc* doc, uint32_t block_idx, uint
 
 bool prepare_view(InlayDoc* doc, InlayMeasure* measure, const InlayDocViewDesc& view, float row_width, bool reflow) {
  if (doc->block_count > measure->open_capacity) {
-  uint32_t cap = measure->open_capacity ? measure->open_capacity : 64u;
-  while (cap < doc->block_count) cap *= 2u;
-  auto* ranges = static_cast<InlayDetails*>(std::realloc(measure->details, size_t(cap) * sizeof(InlayDetails)));
-  if (!ranges) return false;
-  measure->details = ranges;
-  auto* data = static_cast<bool*>(std::realloc(measure->open, cap * sizeof(bool)));
-  if (!data) return false;
-  measure->open = data;
-  auto* wraps = static_cast<bool*>(std::realloc(measure->code_wrap, cap * sizeof(bool)));
-  if (!wraps) return false;
-  measure->code_wrap = wraps;
-  auto* scx = static_cast<float*>(std::realloc(measure->code_scroll_x, size_t(cap) * sizeof(float)));
-  if (!scx) return false;
-  measure->code_scroll_x = scx;
-  auto* dfull = static_cast<bool*>(std::realloc(measure->diagram_full_scale, cap * sizeof(bool)));
-  if (!dfull) return false;
-  measure->diagram_full_scale = dfull;
-  auto* cflash = static_cast<uint64_t*>(std::realloc(measure->copied_until_ms, size_t(cap) * sizeof(uint64_t)));
-  if (!cflash) return false;
-  measure->copied_until_ms = cflash;
-  for (uint32_t i = measure->open_capacity; i < cap; ++i) {
-   data[i] = true; wraps[i] = false; scx[i] = 0.f; dfull[i] = false; cflash[i] = 0u;
+  constexpr uint32_t kMaxBlocks = 64u * 1024u * 1024u;
+  const uint32_t old_cap = measure->open_capacity;
+  uint32_t c0 = old_cap, c1 = old_cap, c2 = old_cap, c3 = old_cap, c4 = old_cap, c5 = old_cap;
+  if (!inlay_grow_pod(measure->details, c0, doc->block_count, 64u, kMaxBlocks) ||
+      !inlay_grow_pod(measure->open, c1, c0, 64u, kMaxBlocks) ||
+      !inlay_grow_pod(measure->code_wrap, c2, c0, 64u, kMaxBlocks) ||
+      !inlay_grow_pod(measure->code_scroll_x, c3, c0, 64u, kMaxBlocks) ||
+      !inlay_grow_pod(measure->diagram_full_scale, c4, c0, 64u, kMaxBlocks) ||
+      !inlay_grow_pod(measure->copied_until_ms, c5, c0, 64u, kMaxBlocks)) return false;
+  for (uint32_t i = old_cap; i < c5; ++i) {
+   measure->open[i] = true; measure->code_wrap[i] = false; measure->code_scroll_x[i] = 0.f;
+   measure->diagram_full_scale[i] = false; measure->copied_until_ms[i] = 0u;
   }
-  measure->open_capacity = cap;
+  measure->open_capacity = c5;
  }
  if (measure->width == 0) {
   for (uint32_t i = 0; i < measure->open_capacity; ++i) {
@@ -2599,20 +2557,12 @@ bool prepare_view(InlayDoc* doc, InlayMeasure* measure, const InlayDocViewDesc& 
   } while (pos < end);
  }
  if (needed > measure->capacity) {
-  uint32_t cap = measure->capacity ? measure->capacity : 64u;
-  while (cap < needed) cap *= 2u;
-  auto* rows = static_cast<InlayRow*>(std::malloc(size_t(cap) * sizeof(InlayRow)));
-  auto* heights = static_cast<float*>(std::calloc(cap, sizeof(float)));
-  if (!rows || !heights) { std::free(rows); std::free(heights); return false; }
-  if (measure->count) {
-   std::memcpy(rows, measure->rows, size_t(measure->count) * sizeof(InlayRow));
-   std::memcpy(heights, measure->heights, size_t(measure->count) * sizeof(float));
-  }
-  std::free(measure->rows);
-  std::free(measure->heights);
-  measure->rows = rows;
-  measure->heights = heights;
-  measure->capacity = cap;
+  const uint32_t old_cap = measure->capacity;
+  uint32_t rcap = old_cap, hcap = old_cap;
+  if (!inlay_grow_pod(measure->rows, rcap, needed, 64u, 16u * 1024u * 1024u) ||
+      !inlay_grow_pod(measure->heights, hcap, rcap, 64u, 16u * 1024u * 1024u)) return false;
+  std::memset(measure->heights + old_cap, 0, size_t(hcap - old_cap) * sizeof(float));
+  measure->capacity = hcap;
  }
  uint32_t row = 0;
  for (uint32_t block = 0; block < doc->block_count; ++block) {
@@ -2742,13 +2692,10 @@ InlayMeasure* find_view(const InlayDoc* doc, uint32_t view_id) noexcept {
 
 InlayMeasure* find_or_add_view(InlayDoc* doc, uint32_t view_id) noexcept {
  if (auto* existing = find_view(doc, view_id)) return existing;
- if (doc->view_count == doc->view_capacity) {
-  const uint32_t cap = doc->view_capacity ? doc->view_capacity * 2u : 4u;
-  auto* mem = static_cast<InlayMeasure*>(std::realloc(doc->views, size_t(cap) * sizeof(InlayMeasure)));
-  if (!mem) return nullptr;
-  std::memset(mem + doc->view_capacity, 0, size_t(cap - doc->view_capacity) * sizeof(InlayMeasure));
-  doc->views = mem;
-  doc->view_capacity = cap;
+ const uint32_t old_cap = doc->view_capacity;
+ if (!inlay_grow_pod(doc->views, doc->view_capacity, doc->view_count + 1u, 4u, 4096u)) return nullptr;
+ if (doc->view_capacity > old_cap) {
+  std::memset(doc->views + old_cap, 0, size_t(doc->view_capacity - old_cap) * sizeof(InlayMeasure));
  }
  auto* slot = &doc->views[doc->view_count++];
  *slot = {};

@@ -110,4 +110,8 @@ inline int32_t surface_next_timer_ms(const Surface* s) noexcept {
 inline bool surface_bind_slot(Surface* s, EtchStr name, SlotRenderFn fn, void* user_data=nullptr) noexcept {
  return inlay_surface_bind_slot(s, name, fn, user_data);
 }
+/* width_px <= 0 or height_px <= 0 grows to fill the parent container (etch_sizing_grow). */
+inline void surface_view(Surface* s, const SurfaceViewDesc* desc) noexcept {
+ inlay_surface_view(s, desc);
+}
 }
