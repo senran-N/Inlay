@@ -198,6 +198,7 @@ typedef struct InlayMathResult {
 INLAY_API InlayMathDesc inlay_math_desc_default(void);
 INLAY_API InlayMathResult inlay_draw_math(EtchStr tex,const InlayMathDesc* desc);
 INLAY_API InlayMathResult inlay_measure_math(EtchStr tex,float font_size_px);
+INLAY_API uint32_t inlay_math_export_svg(EtchStr tex,const InlayMathDesc* desc,char* out_buf,uint32_t cap);
 typedef enum InlayDiagramDiagnosticKind {
  INLAY_DIAGRAM_UNSUPPORTED_DIRECTIVE, INLAY_DIAGRAM_UNSUPPORTED_KIND,
  INLAY_DIAGRAM_INVALID_DIRECTION, INLAY_DIAGRAM_INVALID_SYNTAX
@@ -236,6 +237,7 @@ typedef struct InlayDiagramResult {
 INLAY_API InlayDiagramDesc inlay_diagram_desc_default(void);
 INLAY_API InlayDiagramResult inlay_diagram_layout(EtchStr source,const InlayDiagramDesc* desc);
 INLAY_API InlayDiagramResult inlay_diagram_view(EtchStr source,const InlayDiagramDesc* desc);
+INLAY_API uint32_t inlay_diagram_export_svg(EtchStr source,const InlayDiagramDesc* desc,char* out_buf,uint32_t cap);
 INLAY_API InlayDocConfig inlay_doc_config_default(void);
 INLAY_API InlayDocStyle inlay_doc_style_default(void);
 INLAY_API InlayDocViewDesc inlay_doc_view_desc_default(void);
@@ -290,6 +292,10 @@ INLAY_API void inlay_doc_view_clear_selection(InlayDoc* doc,uint32_t view_id);
 INLAY_API uint32_t inlay_doc_view_copy_plain_text(const InlayDoc* doc,uint32_t view_id,char* out_buf,uint32_t cap);
 /* Copies selected range as balanced Markdown into out_buf (NUL-terminated if cap > 0). Returns required length excluding NUL. */
 INLAY_API uint32_t inlay_doc_view_copy_markdown(const InlayDoc* doc,uint32_t view_id,char* out_buf,uint32_t cap);
+/* Exports semantic HTML5 for the full document into out_buf (NUL-terminated if cap > 0). Returns required length excluding NUL. */
+INLAY_API uint32_t inlay_doc_export_html(const InlayDoc* doc,char* out_buf,uint32_t cap);
+/* Reports Mermaid cross-frame layout cache statistics for a document. */
+INLAY_API void inlay_doc_diagram_cache_stats(const InlayDoc* doc,uint32_t* out_entries,uint64_t* out_hits,uint64_t* out_misses);
 
 typedef struct InlaySurface InlaySurface;
 typedef struct InlaySurfaceDesc {
@@ -307,7 +313,7 @@ typedef enum InlayUiKind {
  INLAY_UI_MATH, INLAY_UI_DIAGRAM, INLAY_UI_SLOT,
  INLAY_UI_DOC, INLAY_UI_TERMINAL, INLAY_UI_VIRTUAL_LIST, INLAY_UI_TABLE,
  INLAY_UI_TREE, INLAY_UI_TREE_ITEM, INLAY_UI_MENU, INLAY_UI_CONTEXT_MENU,
- INLAY_UI_AVATAR, INLAY_UI_TOAST, INLAY_UI_ACCORDION, INLAY_UI_SKELETON, INLAY_UI_CODE_EDITOR
+ INLAY_UI_AVATAR, INLAY_UI_TOAST, INLAY_UI_ACCORDION, INLAY_UI_SKELETON, INLAY_UI_CODE_EDITOR, INLAY_UI_FORM
 } InlayUiKind;
 typedef struct InlayUiNode {InlayUiKind kind;uint32_t id,first_child,next_sibling;EtchStr text;} InlayUiNode;
 typedef struct InlaySurfaceViewDesc {
@@ -340,6 +346,41 @@ typedef struct InlayAsyncActionEvent {
    Invoked during inlay_surface_view inside the slot's Etch layout box. Must not
    destroy or recursively dispatch the surface. */
 typedef void (*InlaySlotRenderFn)(InlaySurface*,uint32_t element_id,float width_px,float height_px,EtchStr props_json,void* user_data);
+typedef bool (*InlaySlotMeasureFn)(InlaySurface*,uint32_t element_id,float available_w,float available_h,EtchStr props_json,EtchVec2* out_size,void* user_data);
+
+typedef enum InlayActionPermission {
+ INLAY_ACTION_READ = 0,
+ INLAY_ACTION_WRITE = 1,
+ INLAY_ACTION_DESTRUCTIVE = 2
+} InlayActionPermission;
+typedef struct InlayActionPolicy {
+ uint32_t struct_size;
+ InlayActionPermission permission;
+ bool require_approval;
+ EtchStr required_keys_csv; /* Comma-separated JSON keys required in object payload, or empty. */
+} InlayActionPolicy;
+typedef bool (*InlayActionAuditFn)(InlaySurface*,EtchStr action_name,InlayActionPermission permission,
+ bool requires_approval,EtchStr payload_json,void* user_data);
+INLAY_API InlayActionPolicy inlay_action_policy_default(void);
+
+/* Reusable host-owned row/tree data source for VirtualList & Tree (0 full-JSON marshaling). */
+typedef struct InlayModel InlayModel;
+typedef struct InlayModelRow {
+ uint64_t row_id;
+ uint32_t depth;
+ bool has_children;
+ bool expanded;
+ EtchStr label;
+ EtchStr detail;
+ EtchStr badge;
+} InlayModelRow;
+typedef bool (*InlayModelReadFn)(uint32_t index,InlayModelRow* out_row,void* user_data);
+INLAY_API InlayModel* inlay_model_create(InlayModelReadFn read_fn,void* user_data);
+INLAY_API void inlay_model_destroy(InlayModel*);
+INLAY_API void inlay_model_set_count(InlayModel*,uint32_t count);
+INLAY_API void inlay_model_notify_change(InlayModel*,uint32_t first_row,uint32_t count);
+INLAY_API uint32_t inlay_model_count(const InlayModel*);
+INLAY_API uint64_t inlay_model_revision(const InlayModel*);
 INLAY_API InlaySurfaceDesc inlay_surface_desc_default(void);
 INLAY_API InlaySurfaceViewDesc inlay_surface_view_desc_default(void);
 INLAY_API InlaySurface* inlay_surface_create(EtchContext*,const InlaySurfaceDesc*);
@@ -358,6 +399,13 @@ INLAY_API bool inlay_surface_complete_async_action(InlaySurface*,uint32_t reques
 /* Close permanently and drain pending cancel events before destroying the surface. */
 INLAY_API void inlay_surface_close_async_actions(InlaySurface*);
 INLAY_API bool inlay_surface_bind_slot(InlaySurface*,EtchStr name,InlaySlotRenderFn,void* user_data);
+INLAY_API bool inlay_surface_bind_slot_ex(InlaySurface*,EtchStr name,InlaySlotRenderFn,InlaySlotMeasureFn,
+ EtchA11yRole a11y_role,EtchStr a11y_label,void* user_data);
+INLAY_API bool inlay_surface_set_action_policy(InlaySurface*,EtchStr name,const InlayActionPolicy* policy);
+INLAY_API void inlay_surface_set_action_audit_hook(InlaySurface*,InlayActionAuditFn fn,void* user_data);
+INLAY_API bool inlay_surface_bind_model(InlaySurface*,EtchStr name,InlayModel*);
+INLAY_API uint64_t inlay_surface_memo_reused_nodes(const InlaySurface*);
+INLAY_API uint32_t inlay_surface_export_dts(const InlaySurface*,char* out_buf,uint32_t cap);
 /* ui.doc({document: name}) borrows a document from the same Etch context.
    Pass NULL to unbind. Unbind before destroying a document on a live surface. */
 INLAY_API bool inlay_surface_bind_document(InlaySurface*,EtchStr name,InlayDoc*);
@@ -408,6 +456,95 @@ INLAY_API uint32_t inlay_inbox_pending(InlayInbox*);
    Join producers and stop the consumer before destroying the inbox. */
 INLAY_API void inlay_inbox_close(InlayInbox*);
 INLAY_API void inlay_inbox_destroy(InlayInbox*);
+/* Drains up to max_messages from inbox and dispatches UTF-8 JSON payloads to surface. */
+INLAY_API uint32_t inlay_inbox_drain_to_surface(InlayInbox*,InlaySurface*,uint32_t max_messages);
+
+/* Structured AI conversation & tool-result stream with stable 64-bit IDs and resumable cursor. */
+typedef struct InlayStream InlayStream;
+typedef enum InlayStreamRole {
+ INLAY_STREAM_ROLE_USER = 0,
+ INLAY_STREAM_ROLE_ASSISTANT = 1,
+ INLAY_STREAM_ROLE_TOOL = 2,
+ INLAY_STREAM_ROLE_SYSTEM = 3
+} InlayStreamRole;
+typedef enum InlayStreamItemKind {
+ INLAY_STREAM_ITEM_MARKDOWN = 0,
+ INLAY_STREAM_ITEM_TOOL_CALL = 1,
+ INLAY_STREAM_ITEM_TOOL_RESULT = 2,
+ INLAY_STREAM_ITEM_CITATION = 3,
+ INLAY_STREAM_ITEM_ATTACHMENT = 4,
+ INLAY_STREAM_ITEM_PROGRESS = 5
+} InlayStreamItemKind;
+typedef enum InlayStreamStatus {
+ INLAY_STREAM_STATUS_PENDING = 0,
+ INLAY_STREAM_STATUS_RUNNING = 1,
+ INLAY_STREAM_STATUS_DONE = 2,
+ INLAY_STREAM_STATUS_ERROR = 3,
+ INLAY_STREAM_STATUS_CANCELLED = 4
+} InlayStreamStatus;
+typedef struct InlayStreamItem {
+ uint64_t id;
+ uint64_t message_id;
+ InlayStreamRole role;
+ InlayStreamItemKind kind;
+ InlayStreamStatus status;
+ float progress;
+ uint64_t revision;
+ EtchStr title;
+ EtchStr body;
+ EtchStr metadata_json;
+} InlayStreamItem;
+INLAY_API InlayStream* inlay_stream_create(void);
+INLAY_API void inlay_stream_destroy(InlayStream*);
+INLAY_API bool inlay_stream_upsert(InlayStream*,const InlayStreamItem* item);
+INLAY_API bool inlay_stream_append_body(InlayStream*,uint64_t id,EtchStr delta_utf8);
+INLAY_API bool inlay_stream_remove(InlayStream*,uint64_t id);
+INLAY_API uint32_t inlay_stream_count(const InlayStream*);
+INLAY_API bool inlay_stream_get_by_id(const InlayStream*,uint64_t id,InlayStreamItem* out_item);
+INLAY_API bool inlay_stream_at(const InlayStream*,uint32_t index,InlayStreamItem* out_item);
+INLAY_API uint64_t inlay_stream_cursor(const InlayStream*);
+INLAY_API uint32_t inlay_stream_export_json(const InlayStream*,char* out_buf,uint32_t cap);
+INLAY_API bool inlay_stream_import_json(InlayStream*,EtchStr json);
+
+/* Verifiable Generative UI declarative JSON schema validator & safe surface renderer. */
+typedef struct InlayGenUiValidation {
+ bool valid;
+ uint32_t node_count;
+ uint32_t error_node_index;
+ uint32_t error_offset;
+ char error_message[256];
+} InlayGenUiValidation;
+INLAY_API bool inlay_genui_validate_json(EtchStr spec_json,uint32_t schema_version,InlayGenUiValidation* out);
+INLAY_API bool inlay_genui_render_to_surface(InlaySurface*,EtchStr spec_json,uint32_t schema_version,InlayGenUiValidation* out);
+INLAY_API uint32_t inlay_genui_list_actions(EtchStr spec_json,char* out_buf,uint32_t cap);
+
+/* Design Tokens Format (DTCG JSON) import/export mapped directly to EtchTheme. */
+INLAY_API bool inlay_tokens_import_theme(EtchStr dtcg_json,bool dark_mode,EtchTheme* out_theme);
+INLAY_API uint32_t inlay_tokens_export_theme(const EtchTheme* theme,char* out_buf,uint32_t cap);
+
+/* Non-blocking async image loader with bounded LRU cache, cancellation & UI-thread upload. */
+typedef struct InlayImageLoader InlayImageLoader;
+typedef enum InlayImageLoadStatus {
+ INLAY_IMAGE_STATUS_IDLE = 0,
+ INLAY_IMAGE_STATUS_LOADING = 1,
+ INLAY_IMAGE_STATUS_READY = 2,
+ INLAY_IMAGE_STATUS_ERROR = 3
+} InlayImageLoadStatus;
+typedef struct InlayImageLoaderDesc {
+ uint32_t struct_size;
+ uint32_t max_entries;
+ size_t max_vram_bytes;
+} InlayImageLoaderDesc;
+INLAY_API InlayImageLoaderDesc inlay_image_loader_desc_default(void);
+INLAY_API InlayImageLoader* inlay_image_loader_create(EtchContext*,const InlayImageLoaderDesc*);
+INLAY_API void inlay_image_loader_destroy(InlayImageLoader*);
+INLAY_API bool inlay_image_loader_request_file(InlayImageLoader*,EtchStr key,const char* path,bool srgb);
+INLAY_API bool inlay_image_loader_request_memory(InlayImageLoader*,EtchStr key,const void* data,size_t size_bytes,bool srgb);
+INLAY_API void inlay_image_loader_cancel(InlayImageLoader*,EtchStr key);
+INLAY_API uint32_t inlay_image_loader_poll(InlayImageLoader*,uint32_t max_uploads);
+INLAY_API InlayImageLoadStatus inlay_image_loader_status(const InlayImageLoader*,EtchStr key);
+INLAY_API uint32_t inlay_image_loader_epoch(const InlayImageLoader*);
+INLAY_API bool inlay_image_loader_resolve(EtchStr src,InlayImageResult* out,void* loader_user_data);
 
 /* Windowless portal. Backends own returned pixel spans until the next callback;
    all callbacks run synchronously on the host UI thread. Context outlives portal.
@@ -477,6 +614,37 @@ INLAY_API void inlay_portal_set_input_enabled(InlayPortal*,bool enabled);
 INLAY_API bool inlay_portal_has_focus(const InlayPortal*);
 /* Deterministic mock animation clock. No wall-clock polling or idle animation. */
 INLAY_API bool inlay_portal_mock_advance(InlayPortal*,uint32_t phase);
+
+/* Portal navigation policy, origin allowlist, history & bidirectional host<->web message bridge. */
+typedef enum InlayPortalNavDecision {
+ INLAY_PORTAL_NAV_ALLOW = 0,
+ INLAY_PORTAL_NAV_BLOCK = 1,
+ INLAY_PORTAL_NAV_OPEN_EXTERNAL = 2
+} InlayPortalNavDecision;
+typedef InlayPortalNavDecision (*InlayPortalNavFn)(InlayPortal*,EtchStr url,bool is_new_window,void* user_data);
+typedef void (*InlayPortalMessageFn)(InlayPortal*,EtchStr message_json,void* user_data);
+typedef bool (*InlayPortalPermissionFn)(InlayPortal*,EtchStr origin,EtchStr permission_kind,void* user_data);
+typedef struct InlayPortalPolicy {
+ uint32_t struct_size;
+ EtchStr allowed_origins_csv; /* Empty allows all origins; otherwise comma-separated scheme://host[:port]. */
+ bool allow_external_links;
+ bool allow_new_windows;
+ InlayPortalNavFn on_navigate;
+ InlayPortalMessageFn on_message;
+ InlayPortalPermissionFn on_permission;
+ void* user_data;
+} InlayPortalPolicy;
+INLAY_API InlayPortalPolicy inlay_portal_policy_default(void);
+INLAY_API void inlay_portal_set_policy(InlayPortal*,const InlayPortalPolicy* policy);
+INLAY_API bool inlay_portal_post_message(InlayPortal*,EtchStr message_json);
+INLAY_API uint32_t inlay_portal_poll_message(InlayPortal*,char* out_buf,uint32_t cap);
+INLAY_API bool inlay_portal_go_back(InlayPortal*);
+INLAY_API bool inlay_portal_go_forward(InlayPortal*);
+INLAY_API bool inlay_portal_reload(InlayPortal*);
+INLAY_API bool inlay_portal_can_go_back(const InlayPortal*);
+INLAY_API bool inlay_portal_can_go_forward(const InlayPortal*);
+INLAY_API EtchStr inlay_portal_current_url(const InlayPortal*);
+INLAY_API bool inlay_portal_end_frame_sync(InlayPortal*,bool host_input_enabled);
 /* Optional Windows native UNDERLAY backend. The host supplies a dedicated HWND
    BELOW its alpha-composited Etch surface, with the same client origin, and owns
    message pumping, native keyboard and IME dispatch. Create and destroy the

@@ -1,4 +1,67 @@
 #include "inlay_ui_internal.h"
+#include <cstring>
+
+// ============================================================================
+// Reusable Host Row/Tree Model (Available Both With & Without Script Engine)
+// ============================================================================
+
+struct InlayModel {
+    InlayModelReadFn read_fn;
+    void* user_data;
+    uint32_t count;
+    uint64_t revision;
+};
+
+bool inlay_ui_model_read(const InlayModel* model, uint32_t index, InlayModelRow* out_row) noexcept {
+    if (!model || !model->read_fn || !out_row || index >= model->count) return false;
+    *out_row = {};
+    return model->read_fn(index, out_row, model->user_data);
+}
+
+extern "C" {
+INLAY_API InlayModel* inlay_model_create(InlayModelReadFn read_fn, void* user_data) {
+    if (!read_fn) return nullptr;
+    auto* m = static_cast<InlayModel*>(SDL_calloc(1u, sizeof(InlayModel)));
+    if (!m) return nullptr;
+    m->read_fn = read_fn;
+    m->user_data = user_data;
+    m->count = 0u;
+    m->revision = 1u;
+    return m;
+}
+
+INLAY_API void inlay_model_destroy(InlayModel* model) {
+    SDL_free(model);
+}
+
+INLAY_API void inlay_model_set_count(InlayModel* model, uint32_t count) {
+    if (!model) return;
+    if (model->count != count) {
+        model->count = count;
+        ++model->revision;
+        if (EtchContext* ctx = etch_current_context()) {
+            etch_request_redraw(ctx);
+        }
+    }
+}
+
+INLAY_API void inlay_model_notify_change(InlayModel* model, uint32_t, uint32_t) {
+    if (!model) return;
+    ++model->revision;
+    if (EtchContext* ctx = etch_current_context()) {
+        etch_request_redraw(ctx);
+    }
+}
+
+INLAY_API uint32_t inlay_model_count(const InlayModel* model) {
+    return model ? model->count : 0u;
+}
+
+INLAY_API uint64_t inlay_model_revision(const InlayModel* model) {
+    return model ? model->revision : 0u;
+}
+} // extern "C"
+
 #if defined(INLAY_ENABLE_SCRIPT) && INLAY_ENABLE_SCRIPT
 #include <SDL3/SDL_filesystem.h>
 #include <SDL3/SDL_iostream.h>
@@ -7,8 +70,9 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <type_traits>
+
+void inlay_ui_note_responsive_cls(InlaySurface* s) noexcept;
 
 namespace {
 
@@ -19,6 +83,10 @@ constexpr uint32_t kMaxScriptBytes = 1024u * 1024u;
 constexpr double kHmrViewPollIntervalMs = 80.0;
 constexpr uint32_t kAsyncActionCapacity = 32u;
 constexpr size_t kAsyncPayloadLimit = 65536u;
+constexpr uint32_t kMemoCacheCap = 128u;
+constexpr uint32_t kMaxMemoSubtreeNodes = 256u;
+constexpr uint32_t kMaxMemoSubtreeText = 8192u;
+constexpr uint32_t kMaxFormStates = 16u;
 
 enum BadgeVariant : uint8_t {
     BadgeDefault   = 0,
@@ -32,7 +100,7 @@ enum BadgeVariant : uint8_t {
     BadgeOutline   = 8
 };
 
-enum CoreExtraFlags : uint16_t {
+enum CoreExtraFlags : uint32_t {
     CefNone                = 0u,
     CefTextSelectable      = 1u << 0,
     CefProgressAnimated    = 1u << 1,
@@ -46,12 +114,19 @@ enum CoreExtraFlags : uint16_t {
     CefInputPassword       = 1u << 9,
     CefInputMultiline      = 1u << 10,
     CefInputReadOnly       = 1u << 11,
-    CefInputWordWrap       = 1u << 12
+    CefInputWordWrap       = 1u << 12,
+    CefInputRequired       = 1u << 13,
+    CefStopPropagation     = 1u << 14,
+    CefButtonSubmit        = 1u << 15,
+    CefEditorHasGhost      = 1u << 16,
+    CefEditorHasSearch     = 1u << 17,
+    CefInputHasMinLen      = 1u << 18,
+    CefInputHasMaxLen      = 1u << 19
 };
 
 // Sparse per-node extra spec allocated lazily only for core widgets using extended props.
 struct CoreNodeExtra {
-    uint16_t flags;         // CoreExtraFlags
+    uint32_t flags;         // CoreExtraFlags
     uint16_t tabs_disabled; // Bitmask of disabled tab items (up to 16)
     uint8_t badge_variant;  // BadgeVariant
     TextSlice dbl_action;
@@ -61,10 +136,15 @@ struct CoreNodeExtra {
     TextSlice password_text;
     TextSlice submit_action;
     uint32_t submit_handler;
-    ColorRef color_a;       // Text selection_color OR Switch off_color
-    ColorRef color_b;       // Switch thumb_color
-    float aux_f0;           // Switch track_width OR Progress ring thickness
-    float aux_f1;           // Switch track_height
+    TextSlice field_name;     // Input field name, Form resetKey, or CodeEditor ghostText
+    TextSlice field_error;    // Input error text, Form onInvalid action, or CodeEditor searchQuery
+    uint32_t invalid_handler; // Form onInvalid handler (INLAY_UI_NONE if none)
+    uint32_t min_length;      // Input minLength
+    uint32_t max_length;      // Input maxLength
+    ColorRef color_a;         // Text selection_color OR Switch off_color
+    ColorRef color_b;         // Switch thumb_color
+    float aux_f0;             // Switch track_width OR Progress ring thickness
+    float aux_f1;             // Switch track_height
 };
 
 struct SplitSyncEntry {
@@ -87,6 +167,59 @@ struct HoverTrackEntry {
     bool hovered;
     bool focused;
     uint64_t last_used_frame;
+};
+
+struct ActionPolicyEntry {
+    char name[64];
+    InlayActionPermission permission;
+    bool require_approval;
+    char required_keys_csv[128];
+};
+
+struct MemoNativeEntry {
+    uint32_t memo_key;
+    uint32_t memo_rev;
+    uint32_t last_used;
+    uint32_t node_count;
+    uint32_t cold_count;
+    uint32_t extra_count;
+    uint32_t text_len;
+    uint8_t bp_bucket;
+    bool root_explicit_id;
+    bool has_responsive;
+    uint8_t pad_;
+    uint8_t* blob;
+};
+
+struct FormStateEntry {
+    uint32_t element_id;
+    uint64_t reset_key_hash;
+    bool show_errors;
+    uint64_t last_used_frame;
+};
+
+struct ActiveFormField {
+    uint32_t element_id;
+    EtchStr name;
+    EtchStr value;
+    bool valid;
+};
+
+struct ActiveFormCtx {
+    uint32_t form_elem_id;
+    bool show_errors;
+    bool submit_requested;
+    ActiveFormField* fields;
+    uint32_t field_count;
+    uint32_t field_cap;
+};
+
+enum EventConsumeBits : uint8_t {
+    ConsumeNone     = 0u,
+    ConsumeClick    = 1u << 0,
+    ConsumeDblClick = 1u << 1,
+    ConsumeRClick   = 1u << 2,
+    ConsumeEscape   = 1u << 3
 };
 
 enum class AsyncActionPhase : uint8_t { Empty, Queued, Started, Cancelled };
@@ -125,6 +258,27 @@ struct SurfaceStorage {
     uint32_t next_async_action;
     bool async_actions_closed;
     char* reload_error;
+    // #14 Action permissions & audit hook
+    ActionPolicyEntry* action_policies;
+    uint32_t action_policy_count;
+    uint32_t action_policy_cap;
+    InlayActionAuditFn audit_fn;
+    void* audit_user;
+    // #50 Native subtree cache for memo()
+    MemoNativeEntry memo_cache[kMemoCacheCap];
+    uint32_t memo_cache_clock;
+    JSAtom atom_memo_key;
+    JSAtom atom_memo_rev;
+    // #54 Form validation state
+    FormStateEntry form_states[kMaxFormStates];
+    uint32_t form_state_count;
+    ActiveFormCtx* active_form;
+    // #52 Responsive breakpoint tracking
+    uint32_t responsive_cls_hits;
+    bool uses_responsive_cls;
+    bool has_view_width;
+    // #59 Subtree-scoped event consumption
+    uint8_t child_consumed_mask;
 };
 static_assert(std::is_standard_layout_v<SurfaceStorage>);
 static_assert(offsetof(SurfaceStorage, pub) == 0);
@@ -195,6 +349,7 @@ CoreNodeExtra* ensure_core_extra(InlaySurface* s, uint32_t node_index) {
     cx.dbl_handler = INLAY_UI_NONE;
     cx.rclick_handler = INLAY_UI_NONE;
     cx.submit_handler = INLAY_UI_NONE;
+    cx.invalid_handler = INLAY_UI_NONE;
     e->node_extra_idx[node_index] = idx;
     return &cx;
 }
@@ -204,6 +359,7 @@ bool is_container_kind(InlayUiKind kind) noexcept {
         case INLAY_UI_BOX:
         case INLAY_UI_SCROLL:
         case INLAY_UI_CARD:
+        case INLAY_UI_FORM:
         case INLAY_UI_SPACER:
         case INLAY_UI_MODAL:
         case INLAY_UI_POPOVER:
@@ -294,10 +450,18 @@ void clear_handlers(InlaySurface* s) {
     s->handler_count = 0u;
 }
 
-bool ensure_node_capacity(InlaySurface* s) {
-    if (s->node_count < s->node_capacity) return true;
-    if (s->node_capacity >= s->desc.max_nodes) return false;
-    uint32_t cap = s->node_capacity ? s->node_capacity * 2u : 256u;
+bool ensure_node_capacity_for(InlaySurface* s, uint32_t extra) {
+    if (extra > s->desc.max_nodes || s->node_count > s->desc.max_nodes - extra) return false;
+    const uint32_t need = s->node_count + extra;
+    if (need <= s->node_capacity) return true;
+    uint32_t cap = s->node_capacity ? s->node_capacity : 256u;
+    while (cap < need) {
+        if (cap > s->desc.max_nodes / 2u) {
+            cap = s->desc.max_nodes;
+            break;
+        }
+        cap *= 2u;
+    }
     if (cap > s->desc.max_nodes) cap = s->desc.max_nodes;
     auto* nn = static_cast<InlayUiNode*>(SDL_realloc(s->nodes, size_t(cap) * sizeof(InlayUiNode)));
     if (!nn) return false;
@@ -311,6 +475,10 @@ bool ensure_node_capacity(InlaySurface* s) {
     e->node_extra_idx = nx;
     s->node_capacity = cap;
     return true;
+}
+
+bool ensure_node_capacity(InlaySurface* s) {
+    return ensure_node_capacity_for(s, 1u);
 }
 
 // Rebase all raw EtchStr pointers into s->text after s->text grows/moves.
@@ -1545,9 +1713,9 @@ void parse_style(InlaySurface* s, JSValueConst props, InlayUiKind kind,
                  NodeStyle& st, uint32_t node_index, bool default_col_hint) {
     inlay_ui_init_node_style(st);
     const bool default_col = default_col_hint ||
-        kind == INLAY_UI_SCROLL || kind == INLAY_UI_CARD || kind == INLAY_UI_POPOVER ||
-        kind == INLAY_UI_TREE || kind == INLAY_UI_ACCORDION || kind == INLAY_UI_DOC ||
-        kind == INLAY_UI_TERMINAL;
+        kind == INLAY_UI_SCROLL || kind == INLAY_UI_CARD || kind == INLAY_UI_FORM ||
+        kind == INLAY_UI_POPOVER || kind == INLAY_UI_TREE || kind == INLAY_UI_ACCORDION ||
+        kind == INLAY_UI_DOC || kind == INLAY_UI_TERMINAL;
     if (default_col) st.flags |= NfColumn;
     // Pre-apply explicit `axis` before `cls` so axis-dependent utilities (`items-*`, `gap-y-*`) resolve accurately.
     peek_str_prop(s, props, "axis", [&](const char* c, size_t n) noexcept {
@@ -1570,7 +1738,7 @@ void parse_style(InlaySurface* s, JSValueConst props, InlayUiKind kind,
     if (JS_HasException(s->js)) return;
     if ((kind == INLAY_UI_TEXT || kind == INLAY_UI_BOX) && has_only_class_style(s->js, props)) return;
 
-    // 2. Shared opacity, transforms, compositing & transitions
+    // 2. Shared opacity, transforms, compositing, transitions & event scoping
     float op = st.opacity;
     if (inlay_ui_opt_number_prop(s, props, "opacity", &op)) {
         st.opacity = std::fmin(1.f, std::fmax(0.f, op));
@@ -1578,6 +1746,9 @@ void parse_style(InlaySurface* s, JSValueConst props, InlayUiKind kind,
     }
     parse_transform_props(s, props, st);
     parse_compositing_and_transition_props(s, props, st);
+    if (inlay_ui_bool_prop(s, props, "stopPropagation")) {
+        if (auto* cx = ensure_core_extra(s, node_index)) cx->flags |= CefStopPropagation;
+    }
 
     parse_color_prop(s, props, "color", &st.color);
     if (JS_HasException(s->js)) return;
@@ -1811,7 +1982,7 @@ void parse_style(InlaySurface* s, JSValueConst props, InlayUiKind kind,
     });
 
     // Visual craft, state overrides & layout props for containers, buttons, widgets, and extended widgets
-    if (kind == INLAY_UI_BOX || kind == INLAY_UI_CARD || kind == INLAY_UI_SCROLL ||
+    if (kind == INLAY_UI_BOX || kind == INLAY_UI_CARD || kind == INLAY_UI_FORM || kind == INLAY_UI_SCROLL ||
         kind == INLAY_UI_POPOVER || kind == INLAY_UI_BADGE || kind == INLAY_UI_BUTTON ||
         kind == INLAY_UI_SLOT || kind == INLAY_UI_TABS || kind == INLAY_UI_MATH ||
         kind == INLAY_UI_DIAGRAM || kind == INLAY_UI_IMAGE || kind == INLAY_UI_MODAL ||
@@ -2040,14 +2211,60 @@ void parse_style(InlaySurface* s, JSValueConst props, InlayUiKind kind,
             else st.button_variant = uint8_t(ETCH_BUTTON_DEFAULT);
             return true;
         });
+        peek_str_prop(s, props, "type", [&](const char* c, size_t n) {
+            if (inlay_ui_str_eq(c, n, "submit")) {
+                if (auto* cx = ensure_core_extra(s, node_index)) cx->flags |= CefButtonSubmit;
+                return true;
+            }
+            return false;
+        });
         parse_clickable_events(s, props, st, node_index);
+    } else if (kind == INLAY_UI_FORM) {
+        if (!inlay_ui_parse_event_prop(s, props, "onSubmit", &st.action, &st.handler)) {
+            inlay_ui_parse_event_prop(s, props, "action", &st.action, &st.handler);
+        }
+        const TextSlice reset_key = !JS_HasException(s->js) ? inlay_ui_string_slice_prop(s, props, "resetKey") : TextSlice{};
+        TextSlice inv_action = {};
+        uint32_t inv_handler = INLAY_UI_NONE;
+        if (!JS_HasException(s->js)) {
+            inlay_ui_parse_event_prop(s, props, "onInvalid", &inv_action, &inv_handler);
+        }
+        if (reset_key.len > 0u || has_event(inv_action, inv_handler)) {
+            if (auto* cx = ensure_core_extra(s, node_index)) {
+                cx->field_name = reset_key;
+                cx->field_error = inv_action;
+                cx->invalid_handler = inv_handler;
+            }
+        }
     } else if (kind == INLAY_UI_CODE_EDITOR) {
         inlay_ui_parse_event_prop(s, props, "onChange", &st.action, &st.handler);
-        uint16_t flags = CefNone;
+        uint32_t flags = CefNone;
         if (inlay_ui_bool_prop(s, props, "readOnly")) flags |= CefInputReadOnly;
         if (inlay_ui_bool_prop(s, props, "wordWrap")) flags |= CefInputWordWrap;
+        TextSlice ghost_sl = {};
+        if (!JS_HasException(s->js)) {
+            const JSValue gv = JS_GetPropertyStr(s->js, props, "ghostText");
+            if (!JS_IsUndefined(gv) && !JS_IsNull(gv)) {
+                flags |= CefEditorHasGhost;
+                ghost_sl = inlay_ui_copy_text_slice(s, gv);
+            }
+            JS_FreeValue(s->js, gv);
+        }
+        TextSlice search_sl = {};
+        if (!JS_HasException(s->js)) {
+            const JSValue sv = JS_GetPropertyStr(s->js, props, "searchQuery");
+            if (!JS_IsUndefined(sv) && !JS_IsNull(sv)) {
+                flags |= CefEditorHasSearch;
+                search_sl = inlay_ui_copy_text_slice(s, sv);
+            }
+            JS_FreeValue(s->js, sv);
+        }
         if (flags) {
-            if (auto* options = ensure_core_extra(s, node_index)) options->flags |= flags;
+            if (auto* options = ensure_core_extra(s, node_index)) {
+                options->flags |= flags;
+                options->field_name = ghost_sl;
+                options->field_error = search_sl;
+            }
         }
     } else if (kind == INLAY_UI_INPUT) {
         if (!inlay_ui_parse_event_prop(s, props, "onChange", &st.action, &st.handler)) {
@@ -2058,20 +2275,35 @@ void parse_style(InlaySurface* s, JSValueConst props, InlayUiKind kind,
             password |= inlay_ui_str_eq(c, n, "password");
             return true;
         });
-        uint16_t flags = password ? CefInputPassword : CefNone;
+        uint32_t flags = password ? CefInputPassword : CefNone;
         if (inlay_ui_bool_prop(s, props, "multiline") && !password) flags |= CefInputMultiline;
         if (inlay_ui_bool_prop(s, props, "readOnly")) flags |= CefInputReadOnly;
         if (inlay_ui_bool_prop(s, props, "wordWrap")) flags |= CefInputWordWrap;
+        if (inlay_ui_bool_prop(s, props, "required")) flags |= CefInputRequired;
         TextSlice submit_action = {};
         uint32_t submit_handler = INLAY_UI_NONE;
         if (!JS_HasException(s->js)) {
             inlay_ui_parse_event_prop(s, props, "onSubmit", &submit_action, &submit_handler);
         }
-        if (flags || has_event(submit_action, submit_handler)) {
+        const TextSlice fname = !JS_HasException(s->js) ? inlay_ui_string_slice_prop(s, props, "name") : TextSlice{};
+        const TextSlice ferr = !JS_HasException(s->js) ? inlay_ui_string_slice_prop(s, props, "error") : TextSlice{};
+        uint32_t min_len = 0u;
+        uint32_t max_len = 0u;
+        if (!JS_HasException(s->js) && inlay_ui_opt_uint_prop(s, props, "minLength", 65536u, &min_len)) {
+            flags |= CefInputHasMinLen;
+        }
+        if (!JS_HasException(s->js) && inlay_ui_opt_uint_prop(s, props, "maxLength", 65536u, &max_len)) {
+            flags |= CefInputHasMaxLen;
+        }
+        if (flags || has_event(submit_action, submit_handler) || fname.len > 0u || ferr.len > 0u) {
             if (auto* cx = ensure_core_extra(s, node_index)) {
                 cx->flags |= flags;
                 cx->submit_action = submit_action;
                 cx->submit_handler = submit_handler;
+                cx->field_name = fname;
+                cx->field_error = ferr;
+                cx->min_length = min_len;
+                cx->max_length = max_len;
             }
         }
     } else if (kind == INLAY_UI_TOGGLE || kind == INLAY_UI_CHECKBOX) {
@@ -2279,6 +2511,7 @@ bool parse_tag_kind(const char* chars, size_t len, InlayUiKind* out, bool* out_d
     if (inlay_ui_str_eq(chars, len, "divider")) { *out = INLAY_UI_DIVIDER; return true; }
     if (inlay_ui_str_eq(chars, len, "image")) { *out = INLAY_UI_IMAGE; return true; }
     if (inlay_ui_str_eq(chars, len, "card")) { *out = INLAY_UI_CARD; return true; }
+    if (inlay_ui_str_eq(chars, len, "form")) { *out = INLAY_UI_FORM; *out_default_col = true; return true; }
     if (inlay_ui_str_eq(chars, len, "spacer")) { *out = INLAY_UI_SPACER; return true; }
     if (inlay_ui_str_eq(chars, len, "checkbox")) { *out = INLAY_UI_CHECKBOX; return true; }
     if (inlay_ui_str_eq(chars, len, "tabs")) { *out = INLAY_UI_TABS; return true; }
@@ -2445,16 +2678,384 @@ void coalesce_inline_text_children(InlaySurface* s, uint32_t parent_index) {
     }
 }
 
+uint8_t responsive_width_bucket(float w) noexcept {
+    if (w >= 1280.f) return 7u;
+    if (w >= 1024.f) return 6u;
+    if (w >= 840.f)  return 5u;
+    if (w >= 768.f)  return 4u;
+    if (w >= 560.f)  return 3u;
+    if (w >= 480.f)  return 2u;
+    if (w >= 360.f)  return 1u;
+    return 0u;
+}
+
+uint8_t current_bp_bucket(const InlaySurface* s) noexcept {
+    const uint8_t vp = responsive_width_bucket(s->last_view_width_px);
+    const float cw = s->current_container_width_px > 0.f ? s->current_container_width_px : s->last_view_width_px;
+    const uint8_t ct = responsive_width_bucket(cw);
+    return static_cast<uint8_t>((vp & 7u) | ((ct & 7u) << 3));
+}
+
+inline size_t memo_align8(size_t v) noexcept {
+    return (v + 7u) & ~size_t(7u);
+}
+
+inline bool memo_slice_in_range(TextSlice sl, uint32_t text_start, uint32_t text_end) noexcept {
+    return sl.len == 0u || (sl.off >= text_start && sl.off <= text_end && sl.len <= text_end - sl.off);
+}
+
+inline TextSlice memo_rel_slice(TextSlice sl, uint32_t text_start) noexcept {
+    return sl.len ? TextSlice{sl.off - text_start, sl.len} : TextSlice{};
+}
+
+inline TextSlice memo_abs_slice(TextSlice sl, uint32_t base_text) noexcept {
+    return sl.len ? TextSlice{sl.off + base_text, sl.len} : TextSlice{};
+}
+
+void clear_memo_cache(InlaySurface* s) noexcept {
+    if (!s) return;
+    auto* e = ext(s);
+    for (uint32_t i = 0u; i < kMemoCacheCap; ++i) {
+        SDL_free(e->memo_cache[i].blob);
+        e->memo_cache[i] = {};
+    }
+    e->memo_cache_clock = 0u;
+}
+
+struct MemoBlobOffsets {
+    size_t nodes;
+    size_t node_texts;
+    size_t styles;
+    size_t extra_idx;
+    size_t colds;
+    size_t extras;
+    size_t text;
+    size_t total;
+};
+
+MemoBlobOffsets compute_memo_blob_offsets(uint32_t node_count, uint32_t cold_count,
+                                          uint32_t extra_count, uint32_t text_len) noexcept {
+    MemoBlobOffsets o = {};
+    o.nodes = 0u;
+    o.node_texts = memo_align8(o.nodes + size_t(node_count) * sizeof(InlayUiNode));
+    o.styles = memo_align8(o.node_texts + size_t(node_count) * sizeof(TextSlice));
+    o.extra_idx = memo_align8(o.styles + size_t(node_count) * sizeof(NodeStyle));
+    o.colds = memo_align8(o.extra_idx + size_t(node_count) * sizeof(uint32_t));
+    o.extras = memo_align8(o.colds + size_t(cold_count) * sizeof(ColdVisualStyle));
+    o.text = memo_align8(o.extras + size_t(extra_count) * sizeof(CoreNodeExtra));
+    o.total = o.text + size_t(text_len);
+    return o;
+}
+
+uint32_t splice_memo_native(InlaySurface* s, uint32_t memo_key, uint32_t memo_rev, uint32_t sibling_slot) {
+    auto* e = ext(s);
+    const uint8_t bp = current_bp_bucket(s);
+    MemoNativeEntry* hit = nullptr;
+    for (uint32_t i = 0u; i < kMemoCacheCap; ++i) {
+        auto& ent = e->memo_cache[i];
+        if (ent.blob && ent.memo_key == memo_key && ent.memo_rev == memo_rev && ent.bp_bucket == bp) {
+            hit = &ent;
+            break;
+        }
+    }
+    if (!hit || hit->node_count == 0u) return INLAY_UI_NONE;
+
+    if (!ensure_node_capacity_for(s, hit->node_count)) {
+        JS_ThrowInternalError(s->js, "UI node/depth capacity exceeded");
+        return INLAY_UI_NONE;
+    }
+    if (hit->text_len > 0u && !ensure_text_space(s, hit->text_len)) {
+        return INLAY_UI_NONE;
+    }
+
+    uint32_t base_cold = 0u;
+    if (hit->cold_count > 0u) {
+        base_cold = inlay_ui_alloc_pool(s, s->cold_visuals, s->cold_visual_count,
+                                        s->cold_visual_cap, hit->cold_count, s->desc.max_nodes);
+        if (base_cold == INLAY_UI_NONE) return INLAY_UI_NONE;
+    }
+    uint32_t base_extra = 0u;
+    if (hit->extra_count > 0u) {
+        base_extra = inlay_ui_alloc_pool(s, e->core_extras, e->core_extra_count,
+                                         e->core_extra_cap, hit->extra_count, s->desc.max_nodes);
+        if (base_extra == INLAY_UI_NONE) {
+            s->cold_visual_count -= hit->cold_count;
+            return INLAY_UI_NONE;
+        }
+    }
+
+    const MemoBlobOffsets o = compute_memo_blob_offsets(hit->node_count, hit->cold_count,
+                                                        hit->extra_count, hit->text_len);
+    const uint8_t* blob = hit->blob;
+    const auto* src_nodes = reinterpret_cast<const InlayUiNode*>(blob + o.nodes);
+    const auto* src_ntext = reinterpret_cast<const TextSlice*>(blob + o.node_texts);
+    const auto* src_styles = reinterpret_cast<const NodeStyle*>(blob + o.styles);
+    const auto* src_xidx = reinterpret_cast<const uint32_t*>(blob + o.extra_idx);
+    const auto* src_colds = reinterpret_cast<const ColdVisualStyle*>(blob + o.colds);
+    const auto* src_extras = reinterpret_cast<const CoreNodeExtra*>(blob + o.extras);
+    const char* src_text = reinterpret_cast<const char*>(blob + o.text);
+
+    const uint32_t base_node = s->node_count;
+    const uint32_t base_text = s->text_used;
+    if (hit->text_len > 0u) {
+        std::memcpy(s->text + base_text, src_text, hit->text_len);
+        s->text_used += hit->text_len;
+    }
+
+    for (uint32_t i = 0u; i < hit->cold_count; ++i) {
+        ColdVisualStyle c = src_colds[i];
+        c.placeholder = memo_abs_slice(c.placeholder, base_text);
+        c.src = memo_abs_slice(c.src, base_text);
+        c.on_hover_action = memo_abs_slice(c.on_hover_action, base_text);
+        c.on_focus_action = memo_abs_slice(c.on_focus_action, base_text);
+        s->cold_visuals[base_cold + i] = c;
+    }
+
+    for (uint32_t i = 0u; i < hit->extra_count; ++i) {
+        CoreNodeExtra cx = src_extras[i];
+        cx.dbl_action = memo_abs_slice(cx.dbl_action, base_text);
+        cx.rclick_action = memo_abs_slice(cx.rclick_action, base_text);
+        cx.password_text = memo_abs_slice(cx.password_text, base_text);
+        cx.submit_action = memo_abs_slice(cx.submit_action, base_text);
+        cx.field_name = memo_abs_slice(cx.field_name, base_text);
+        cx.field_error = memo_abs_slice(cx.field_error, base_text);
+        e->core_extras[base_extra + i] = cx;
+    }
+
+    for (uint32_t i = 0u; i < hit->node_count; ++i) {
+        InlayUiNode nd = src_nodes[i];
+        if (nd.first_child != INLAY_UI_NONE) nd.first_child += base_node;
+        if (nd.next_sibling != INLAY_UI_NONE) nd.next_sibling += base_node;
+        const TextSlice nt = src_ntext[i];
+        nd.text = nt.len ? EtchStr{s->text + base_text + nt.off, nt.len, false} : EtchStr{};
+        s->nodes[base_node + i] = nd;
+
+        NodeStyle st = src_styles[i];
+        if (st.cold_idx != INLAY_UI_NONE) st.cold_idx += base_cold;
+        st.action = memo_abs_slice(st.action, base_text);
+        s->styles[base_node + i] = st;
+
+        const uint32_t xi = src_xidx[i];
+        e->node_extra_idx[base_node + i] = (xi != INLAY_UI_NONE) ? (xi + base_extra) : INLAY_UI_NONE;
+    }
+
+    s->nodes[base_node].next_sibling = INLAY_UI_NONE;
+    if (!hit->root_explicit_id) {
+        s->nodes[base_node].id = hash_slot_id(sibling_slot, s->nodes[base_node].kind);
+    }
+    s->node_count += hit->node_count;
+    if (hit->has_responsive) {
+        inlay_ui_note_responsive_cls(s);
+    }
+    hit->last_used = ++e->memo_cache_clock;
+    s->memo_reused_nodes += hit->node_count;
+    return base_node;
+}
+
+void store_memo_native(InlaySurface* s, uint32_t memo_key, uint32_t memo_rev,
+                       uint32_t node_start, uint32_t cold_start, uint32_t extra_start,
+                       uint32_t text_start, uint32_t handler_start, uint32_t shadow_start,
+                       uint32_t grad_start, uint32_t item_start, uint32_t resp_hits_start,
+                       bool root_explicit_id) noexcept {
+    if (JS_HasException(s->js)) return;
+    auto* e = ext(s);
+    if (s->node_count <= node_start) return;
+    const uint32_t node_count = s->node_count - node_start;
+    const uint32_t cold_count = s->cold_visual_count - cold_start;
+    const uint32_t extra_count = e->core_extra_count - extra_start;
+    const uint32_t text_len = s->text_used - text_start;
+    if (node_count > kMaxMemoSubtreeNodes || text_len > kMaxMemoSubtreeText) return;
+    if (s->handler_count != handler_start || s->shadow_pool_count != shadow_start ||
+        s->gradient_pool_count != grad_start || s->item_pool_count != item_start) {
+        return;
+    }
+
+    const uint32_t text_end = s->text_used;
+    const char* text_lo = s->text ? (s->text + text_start) : nullptr;
+    const char* text_hi = s->text ? (s->text + text_end) : nullptr;
+    for (uint32_t i = 0u; i < node_count; ++i) {
+        const uint32_t ni = node_start + i;
+        const auto& nd = s->nodes[ni];
+        const auto& st = s->styles[ni];
+        if (inlay_ui_is_ext_widget(nd.kind) || nd.kind == INLAY_UI_FORM) return;
+        if (st.ext_idx != INLAY_UI_NONE || st.handler != INLAY_UI_NONE) return;
+        if (nd.first_child != INLAY_UI_NONE && (nd.first_child < node_start || nd.first_child >= s->node_count)) return;
+        if (i > 0u && nd.next_sibling != INLAY_UI_NONE &&
+            (nd.next_sibling < node_start || nd.next_sibling >= s->node_count)) return;
+        if (nd.text.length > 0u) {
+            if (!text_lo || !nd.text.chars || nd.text.chars < text_lo ||
+                size_t(text_hi - nd.text.chars) < nd.text.length) return;
+        }
+        if (!memo_slice_in_range(st.action, text_start, text_end)) return;
+        if (st.cold_idx != INLAY_UI_NONE) {
+            if (st.cold_idx < cold_start || st.cold_idx >= s->cold_visual_count) return;
+            const auto& c = s->cold_visuals[st.cold_idx];
+            if (c.on_hover_handler != INLAY_UI_NONE || c.on_focus_handler != INLAY_UI_NONE) return;
+            if (c.shadow_count > 0u || c.gradient_idx != INLAY_UI_NONE) return;
+            if (!memo_slice_in_range(c.placeholder, text_start, text_end) ||
+                !memo_slice_in_range(c.src, text_start, text_end) ||
+                !memo_slice_in_range(c.on_hover_action, text_start, text_end) ||
+                !memo_slice_in_range(c.on_focus_action, text_start, text_end)) {
+                return;
+            }
+        }
+        const uint32_t xi = e->node_extra_idx[ni];
+        if (xi != INLAY_UI_NONE) {
+            if (xi < extra_start || xi >= e->core_extra_count) return;
+            const auto& cx = e->core_extras[xi];
+            if (cx.dbl_handler != INLAY_UI_NONE || cx.rclick_handler != INLAY_UI_NONE ||
+                cx.submit_handler != INLAY_UI_NONE || cx.invalid_handler != INLAY_UI_NONE) {
+                return;
+            }
+            if (!memo_slice_in_range(cx.dbl_action, text_start, text_end) ||
+                !memo_slice_in_range(cx.rclick_action, text_start, text_end) ||
+                !memo_slice_in_range(cx.password_text, text_start, text_end) ||
+                !memo_slice_in_range(cx.submit_action, text_start, text_end) ||
+                !memo_slice_in_range(cx.field_name, text_start, text_end) ||
+                !memo_slice_in_range(cx.field_error, text_start, text_end)) {
+                return;
+            }
+        }
+    }
+
+    const MemoBlobOffsets o = compute_memo_blob_offsets(node_count, cold_count, extra_count, text_len);
+    auto* blob = static_cast<uint8_t*>(SDL_malloc(o.total));
+    if (!blob) return;
+
+    auto* dst_nodes = reinterpret_cast<InlayUiNode*>(blob + o.nodes);
+    auto* dst_ntext = reinterpret_cast<TextSlice*>(blob + o.node_texts);
+    auto* dst_styles = reinterpret_cast<NodeStyle*>(blob + o.styles);
+    auto* dst_xidx = reinterpret_cast<uint32_t*>(blob + o.extra_idx);
+    auto* dst_colds = reinterpret_cast<ColdVisualStyle*>(blob + o.colds);
+    auto* dst_extras = reinterpret_cast<CoreNodeExtra*>(blob + o.extras);
+    char* dst_text = reinterpret_cast<char*>(blob + o.text);
+
+    if (text_len > 0u) {
+        std::memcpy(dst_text, s->text + text_start, text_len);
+    }
+    for (uint32_t i = 0u; i < cold_count; ++i) {
+        ColdVisualStyle c = s->cold_visuals[cold_start + i];
+        c.placeholder = memo_rel_slice(c.placeholder, text_start);
+        c.src = memo_rel_slice(c.src, text_start);
+        c.on_hover_action = memo_rel_slice(c.on_hover_action, text_start);
+        c.on_focus_action = memo_rel_slice(c.on_focus_action, text_start);
+        dst_colds[i] = c;
+    }
+    for (uint32_t i = 0u; i < extra_count; ++i) {
+        CoreNodeExtra cx = e->core_extras[extra_start + i];
+        cx.dbl_action = memo_rel_slice(cx.dbl_action, text_start);
+        cx.rclick_action = memo_rel_slice(cx.rclick_action, text_start);
+        cx.password_text = memo_rel_slice(cx.password_text, text_start);
+        cx.submit_action = memo_rel_slice(cx.submit_action, text_start);
+        cx.field_name = memo_rel_slice(cx.field_name, text_start);
+        cx.field_error = memo_rel_slice(cx.field_error, text_start);
+        dst_extras[i] = cx;
+    }
+    for (uint32_t i = 0u; i < node_count; ++i) {
+        const uint32_t ni = node_start + i;
+        InlayUiNode nd = s->nodes[ni];
+        if (nd.first_child != INLAY_UI_NONE) nd.first_child -= node_start;
+        if (i == 0u) nd.next_sibling = INLAY_UI_NONE;
+        else if (nd.next_sibling != INLAY_UI_NONE) nd.next_sibling -= node_start;
+        dst_ntext[i] = nd.text.length > 0u
+            ? TextSlice{static_cast<uint32_t>(nd.text.chars - text_lo), nd.text.length}
+            : TextSlice{};
+        nd.text = {};
+        dst_nodes[i] = nd;
+
+        NodeStyle st = s->styles[ni];
+        if (st.cold_idx != INLAY_UI_NONE) st.cold_idx -= cold_start;
+        st.action = memo_rel_slice(st.action, text_start);
+        dst_styles[i] = st;
+
+        const uint32_t xi = e->node_extra_idx[ni];
+        dst_xidx[i] = (xi != INLAY_UI_NONE) ? (xi - extra_start) : INLAY_UI_NONE;
+    }
+
+    // Reuse slot with matching memo_key, or empty slot, or LRU victim.
+    MemoNativeEntry* slot = nullptr;
+    uint32_t victim = 0u;
+    for (uint32_t i = 0u; i < kMemoCacheCap; ++i) {
+        if (e->memo_cache[i].blob && e->memo_cache[i].memo_key == memo_key) {
+            slot = &e->memo_cache[i];
+            break;
+        }
+        if (!e->memo_cache[i].blob && !slot) {
+            slot = &e->memo_cache[i];
+        }
+        if (e->memo_cache[i].last_used < e->memo_cache[victim].last_used) {
+            victim = i;
+        }
+    }
+    if (!slot) slot = &e->memo_cache[victim];
+    SDL_free(slot->blob);
+    *slot = {
+        memo_key,
+        memo_rev,
+        ++e->memo_cache_clock,
+        node_count,
+        cold_count,
+        extra_count,
+        text_len,
+        current_bp_bucket(s),
+        root_explicit_id,
+        e->responsive_cls_hits > resp_hits_start,
+        0u,
+        blob
+    };
+}
+
 uint32_t build_node(InlaySurface* s, JSValueConst value, uint32_t depth, uint32_t sibling_slot, uint32_t parent_path) {
     if (interrupt(s->js, s)) {
         JS_ThrowInternalError(s->js, "UI conversion deadline exceeded");
         return INLAY_UI_NONE;
     }
     if (JS_IsNull(value) || JS_IsUndefined(value) || JS_IsBool(value)) return INLAY_UI_NONE;
-    if (depth > 64u || s->node_count == s->desc.max_nodes || !ensure_node_capacity(s)) {
+    if (depth > 64u) {
         JS_ThrowInternalError(s->js, "UI node/depth capacity exceeded");
         return INLAY_UI_NONE;
     }
+
+    // #50 Native subtree fast-path splice for memoized VNodes (skips JS props & cls parsing).
+    uint32_t memo_key = 0u;
+    uint32_t memo_rev = 0u;
+    bool has_memo = false;
+    if (JS_IsObject(value) && !JS_IsArray(value)) {
+        const auto* stg = ext(s);
+        if (stg->atom_memo_key != JS_ATOM_NULL && stg->atom_memo_rev != JS_ATOM_NULL) {
+            const JSValue mk = JS_GetProperty(s->js, value, stg->atom_memo_key);
+            if (JS_IsNumber(mk)) {
+                const JSValue mr = JS_GetProperty(s->js, value, stg->atom_memo_rev);
+                if (JS_IsNumber(mr) &&
+                    JS_ToUint32(s->js, &memo_key, mk) == 0 &&
+                    JS_ToUint32(s->js, &memo_rev, mr) == 0 &&
+                    memo_key > 0u && memo_rev > 0u) {
+                    has_memo = true;
+                }
+                JS_FreeValue(s->js, mr);
+            }
+            JS_FreeValue(s->js, mk);
+        }
+        if (has_memo) {
+            const uint32_t spliced = splice_memo_native(s, memo_key, memo_rev, sibling_slot);
+            if (spliced != INLAY_UI_NONE) return spliced;
+            if (JS_HasException(s->js)) return INLAY_UI_NONE;
+        }
+    }
+
+    if (s->node_count == s->desc.max_nodes || !ensure_node_capacity(s)) {
+        JS_ThrowInternalError(s->js, "UI node/depth capacity exceeded");
+        return INLAY_UI_NONE;
+    }
+
+    const uint32_t memo_cold_start = s->cold_visual_count;
+    const uint32_t memo_extra_start = ext(s)->core_extra_count;
+    const uint32_t memo_text_start = s->text_used;
+    const uint32_t memo_handler_start = s->handler_count;
+    const uint32_t memo_shadow_start = s->shadow_pool_count;
+    const uint32_t memo_grad_start = s->gradient_pool_count;
+    const uint32_t memo_item_start = s->item_pool_count;
+    const uint32_t memo_resp_start = ext(s)->responsive_cls_hits;
 
     // Handle top-level Fragment / Array transparently by wrapping in a fit/grow column box.
     if (JS_IsArray(value)) {
@@ -2498,8 +3099,10 @@ uint32_t build_node(InlaySurface* s, JSValueConst value, uint32_t depth, uint32_
     }
 
     // Assign stable node ID and root-relative path ID BEFORE parsing extended widgets.
-    if (!hash_string_prop(s, props, "id", 2166136261u, &s->nodes[index].id) &&
-        !hash_string_prop(s, props, "key", 0x811c9dc5u ^ 0x6b65793au, &s->nodes[index].id)) {
+    const bool explicit_id =
+        hash_string_prop(s, props, "id", 2166136261u, &s->nodes[index].id) ||
+        hash_string_prop(s, props, "key", 0x811c9dc5u ^ 0x6b65793au, &s->nodes[index].id);
+    if (!explicit_id) {
         s->nodes[index].id = hash_slot_id(sibling_slot, kind);
     }
     const uint32_t path_id = etch_id_index(parent_path, s->nodes[index].id);
@@ -2510,8 +3113,20 @@ uint32_t build_node(InlaySurface* s, JSValueConst value, uint32_t depth, uint32_
         return INLAY_UI_NONE;
     }
 
+    // #52 Container query width scoping for descendants when this container has explicit width.
+    const float prev_container_w = s->current_container_width_px;
+    if (is_container_kind(kind) && (s->styles[index].flags2 & Nf2WExplicit) != 0u) {
+        if (s->styles[index].w_kind == uint8_t(ETCH_SIZING_FIXED) && s->styles[index].w_val > 0.f) {
+            s->current_container_width_px = s->styles[index].w_val;
+        } else if (s->styles[index].w_kind == uint8_t(ETCH_SIZING_PERCENT) &&
+                   s->styles[index].w_val > 0.f && prev_container_w > 0.f) {
+            s->current_container_width_px = prev_container_w * s->styles[index].w_val;
+        }
+    }
+
     if (inlay_ui_is_ext_widget(kind)) {
         if (!inlay_ui_parse_ext_widget(s, props, kind, s->nodes[index], s->styles[index], path_id)) {
+            s->current_container_width_px = prev_container_w;
             JS_FreeValue(s->js, props);
             return INLAY_UI_NONE;
         }
@@ -2640,7 +3255,10 @@ uint32_t build_node(InlaySurface* s, JSValueConst value, uint32_t depth, uint32_
         }
     }
     JS_FreeValue(s->js, props);
-    if (JS_HasException(s->js)) return INLAY_UI_NONE;
+    if (JS_HasException(s->js)) {
+        s->current_container_width_px = prev_container_w;
+        return INLAY_UI_NONE;
+    }
 
     if (!built_vlist_items) {
         const JSValue children = JS_GetPropertyStr(s->js, value, "children");
@@ -2670,6 +3288,7 @@ uint32_t build_node(InlaySurface* s, JSValueConst value, uint32_t depth, uint32_
         }
         JS_FreeValue(s->js, children);
     }
+    s->current_container_width_px = prev_container_w;
     if (kind == INLAY_UI_DOC && s->styles[index].ext_idx != INLAY_UI_NONE) {
         const EtchStr text = s->nodes[index].text;
         auto& spec = s->doc_specs[s->styles[index].ext_idx];
@@ -2682,7 +3301,123 @@ uint32_t build_node(InlaySurface* s, JSValueConst value, uint32_t depth, uint32_
             text = {};
         }
     }
+    if (has_memo && !JS_HasException(s->js)) {
+        store_memo_native(s, memo_key, memo_rev, index, memo_cold_start, memo_extra_start,
+                          memo_text_start, memo_handler_start, memo_shadow_start,
+                          memo_grad_start, memo_item_start, memo_resp_start, explicit_id);
+    }
     return index;
+}
+
+// ============================================================================
+// #14 Action Permission Policy & Audit Gate
+// ============================================================================
+
+const ActionPolicyEntry* find_action_policy(const InlaySurface* s, EtchStr name) noexcept {
+    const auto* storage = ext(s);
+    for (uint32_t i = 0u; i < storage->action_policy_count; ++i) {
+        if (inlay_ui_equal(name, storage->action_policies[i].name)) {
+            return &storage->action_policies[i];
+        }
+    }
+    return nullptr;
+}
+
+bool json_object_has_key(EtchStr payload, const char* key, size_t key_len) noexcept {
+    if (!payload.chars || payload.length < 2u || !key || key_len == 0u) return false;
+    const char* p = payload.chars;
+    const char* end = p + payload.length;
+    auto skip_ws = [&]() noexcept {
+        while (p < end && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) ++p;
+    };
+    auto skip_str = [&]() noexcept -> bool {
+        if (p >= end || *p != '"') return false;
+        ++p;
+        while (p < end) {
+            if (*p == '\\') {
+                ++p;
+                if (p < end) ++p;
+                continue;
+            }
+            if (*p == '"') {
+                ++p;
+                return true;
+            }
+            ++p;
+        }
+        return false;
+    };
+    skip_ws();
+    if (p >= end || *p != '{') return false;
+    ++p;
+    while (p < end) {
+        skip_ws();
+        if (p >= end || *p == '}') return false;
+        if (*p != '"') return false;
+        const char* kstart = p + 1;
+        if (!skip_str()) return false;
+        const char* kend = p - 1;
+        skip_ws();
+        if (p >= end || *p != ':') return false;
+        ++p;
+        if (size_t(kend - kstart) == key_len && std::memcmp(kstart, key, key_len) == 0) {
+            return true;
+        }
+        int depth = 0;
+        while (p < end) {
+            const char ch = *p;
+            if (ch == '"') {
+                if (!skip_str()) return false;
+                continue;
+            }
+            if (ch == '{' || ch == '[') {
+                ++depth;
+            } else if (ch == '}' || ch == ']') {
+                if (depth == 0) break;
+                --depth;
+            } else if (ch == ',' && depth == 0) {
+                ++p;
+                break;
+            }
+            ++p;
+        }
+    }
+    return false;
+}
+
+bool payload_satisfies_required_keys(const char* csv, EtchStr payload) noexcept {
+    if (!csv || !csv[0]) return true;
+    const char* p = csv;
+    while (*p) {
+        while (*p == ' ' || *p == '\t' || *p == ',') ++p;
+        if (!*p) break;
+        const char* tok = p;
+        while (*p && *p != ',') ++p;
+        const char* tok_end = p;
+        while (tok_end > tok && (tok_end[-1] == ' ' || tok_end[-1] == '\t')) --tok_end;
+        const size_t len = size_t(tok_end - tok);
+        if (len > 0u && !json_object_has_key(payload, tok, len)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool check_action_authorized(InlaySurface* s, EtchStr name, EtchStr payload) {
+    const ActionPolicyEntry* pol = find_action_policy(s, name);
+    const InlayActionPermission perm = pol ? pol->permission : INLAY_ACTION_READ;
+    const bool req_approval = pol ? pol->require_approval : false;
+    if (pol && pol->required_keys_csv[0] != '\0') {
+        if (!payload_satisfies_required_keys(pol->required_keys_csv, payload)) {
+            return false;
+        }
+    }
+    auto* storage = ext(s);
+    if (storage->audit_fn) {
+        return storage->audit_fn(s, name, perm, req_approval, payload, storage->audit_user);
+    }
+    if (req_approval) return false;
+    return true;
 }
 
 JSValue js_action(JSContext* js, JSValueConst, int argc, JSValueConst* argv) {
@@ -2705,14 +3440,20 @@ JSValue js_action(JSContext* js, JSValueConst, int argc, JSValueConst* argv) {
     if (JS_IsUndefined(json)) return JS_ThrowTypeError(js, "Action payload is not JSON serializable");
     size_t length = 0u;
     const char* payload = JS_ToCStringLen(js, &length, json);
+    bool allowed = false;
     if (payload && length <= 65536u) {
-        binding->callback(s, {payload, static_cast<uint32_t>(length), false}, binding->user);
+        const EtchStr name_str = {binding->name, static_cast<uint32_t>(std::strlen(binding->name)), true};
+        const EtchStr payload_str = {payload, static_cast<uint32_t>(length), false};
+        if (check_action_authorized(s, name_str, payload_str)) {
+            allowed = true;
+            binding->callback(s, payload_str, binding->user);
+        }
     } else if (payload) {
         JS_ThrowTypeError(js, "Action payload exceeds 64KiB");
     }
     if (payload) JS_FreeCString(js, payload);
     JS_FreeValue(js, json);
-    return JS_HasException(js) ? JS_EXCEPTION : JS_UNDEFINED;
+    return JS_HasException(js) ? JS_EXCEPTION : JS_NewBool(js, allowed);
 }
 
 JSValue settle_async_action(InlaySurface* s, AsyncActionSlot& slot, JSValueConst result,
@@ -2773,6 +3514,15 @@ JSValue js_request_async_action(JSContext* js, JSValueConst, int argc, JSValueCo
     if (payload_length > kAsyncPayloadLimit) {
         JS_FreeCString(js, payload);
         return JS_ThrowTypeError(js, "Async action payload exceeds 64 KiB");
+    }
+    {
+        const char* allowed_name = storage->async_action_names[name_index].value;
+        const EtchStr name_str = {allowed_name, static_cast<uint32_t>(std::strlen(allowed_name)), true};
+        const EtchStr payload_str = {payload, static_cast<uint32_t>(payload_length), false};
+        if (!check_action_authorized(s, name_str, payload_str)) {
+            JS_FreeCString(js, payload);
+            return JS_ThrowTypeError(js, "Async action blocked by policy");
+        }
     }
     // JSON serialization can run toJSON and enqueue another action.
     if (!storage->async_actions) {
@@ -2963,6 +3713,9 @@ bool rebuild(InlaySurface* s, bool eager_state) {
         s->gradient_pool_count = 0u;
         s->item_pool_count = 0u;
         ext(s)->core_extra_count = 0u;
+        ext(s)->uses_responsive_cls = false;
+        ext(s)->responsive_cls_hits = 0u;
+        s->current_container_width_px = s->last_view_width_px;
         inlay_ui_reset_widget_specs(s);
         if (!JS_IsException(tree)) build_node(s, tree, 0u, 0u, 0u);
         JS_FreeValue(s->js, tree);
@@ -3049,7 +3802,9 @@ bool dispatch_one_event(InlaySurface* s, JSValueConst global, const WidgetEvent&
         } else {
             for (uint32_t i = 0u; i < s->action_count; ++i) {
                 if (inlay_ui_equal(ev.name, s->actions[i].name)) {
-                    s->actions[i].callback(s, ev.payload, s->actions[i].user);
+                    if (check_action_authorized(s, ev.name, ev.payload)) {
+                        s->actions[i].callback(s, ev.payload, s->actions[i].user);
+                    }
                     break;
                 }
             }
@@ -3088,6 +3843,7 @@ bool run_update(InlaySurface* s, EtchStr name, EtchStr payload) {
 }
 
 void clear_context(InlaySurface* s) {
+    clear_memo_cache(s);
     if (s->js) {
         retire_async_actions(s);
         clear_handlers(s);
@@ -3099,6 +3855,15 @@ void clear_context(InlaySurface* s) {
             JS_FreeValue(s->js, timer.function);
             timer.function = JS_UNDEFINED;
             timer.id = 0u;
+        }
+        auto* storage = ext(s);
+        if (storage->atom_memo_key != JS_ATOM_NULL) {
+            JS_FreeAtom(s->js, storage->atom_memo_key);
+            storage->atom_memo_key = JS_ATOM_NULL;
+        }
+        if (storage->atom_memo_rev != JS_ATOM_NULL) {
+            JS_FreeAtom(s->js, storage->atom_memo_rev);
+            storage->atom_memo_rev = JS_ATOM_NULL;
         }
         JS_FreeContext(s->js);
         s->js = nullptr;
@@ -3177,6 +3942,8 @@ bool load(InlaySurface* s, EtchStr script, bool is_hmr = false) {
             return false;
         }
         JS_SetContextOpaque(s->js, s);
+        ext(s)->atom_memo_key = JS_NewAtom(s->js, "__memoKey");
+        ext(s)->atom_memo_rev = JS_NewAtom(s->js, "__memoRev");
     } else {
         start = SDL_GetPerformanceCounter();
         begin_tick(s);
@@ -3201,6 +3968,7 @@ bool load(InlaySurface* s, EtchStr script, bool is_hmr = false) {
             s->stats.last_tick_ms = double(SDL_GetPerformanceCounter() - start) * 1000.0 / s->frequency;
             return false;
         }
+        clear_memo_cache(s);
         retire_async_actions(s);
         for (auto& timer : s->timers) {
             JS_FreeValue(s->js, timer.function);
@@ -3256,7 +4024,7 @@ bool load(InlaySurface* s, EtchStr script, bool is_hmr = false) {
             "m=t=>mk((p,...c)=>isP(p)?h(t,p,...c):((p===undefined||p===null)&&!c.length?h(t,{}):h(t,{},p,...c))),"
             "x=(t,k='text')=>mk((p,...c)=>typeof p==='string'?h(t,{[k]:p},...c):m(t)(p,...c));"
             "globalThis.ui={"
-            "box:m('box'),row:m('row'),col:m('col'),card:m('card'),spacer:m('spacer'),"
+            "box:m('box'),row:m('row'),col:m('col'),card:m('card'),form:m('form'),spacer:m('spacer'),"
             "text:x('text'),button:x('button'),input:m('input'),toggle:m('toggle'),switch:m('toggle'),"
             "checkbox:m('checkbox'),tabs:m('tabs'),combobox:m('combobox'),scroll:m('scroll'),"
             "progress:m('progress'),slider:m('slider'),badge:x('badge'),divider:m('divider'),"
@@ -3268,7 +4036,7 @@ bool load(InlaySurface* s, EtchStr script, bool is_hmr = false) {
             "toast:x('toast','description'),accordion:x('accordion','title'),skeleton:m('skeleton'),"
             "h:globalThis.h,fragment:(...c)=>c};"
             "const G=globalThis;"
-            "G.Box='box';G.Row='row';G.Col='col';G.Card='card';G.Text='text';"
+            "G.Box='box';G.Row='row';G.Col='col';G.Card='card';G.Form='form';G.Text='text';"
             "G.Button='button';G.Input='input';G.Toggle='toggle';G.Switch='switch';"
             "G.Checkbox='checkbox';G.Tabs='tabs';G.Combobox='combobox';G.Scroll='scroll';"
             "G.Progress='progress';G.Slider='slider';G.Badge='badge';G.Divider='divider';"
@@ -3309,10 +4077,11 @@ bool load(InlaySurface* s, EtchStr script, bool is_hmr = false) {
                     }
                     return true;
                 }
+                let nextMemoKey = 1;
                 G.memo = (component, equal = equalProps) => {
                     function Memo(props) {
                         const ref = G.useRef(null);
-                        const cache = ref.current || (ref.current = {});
+                        const cache = ref.current || (ref.current = {id: nextMemoKey++, rev: 0});
                         const stack = G.__inlay_stk, frame = stack[stack.length - 1];
                         const collect = G.__inlay_collect;
                         cache.parent = frame.memo;
@@ -3339,6 +4108,12 @@ bool load(InlaySurface* s, EtchStr script, bool is_hmr = false) {
                         if (collect) for (const key of cache.scopes) collect.push(key);
                         cache.props = props;
                         cache.component = component;
+                        cache.rev = (cache.rev + 1) >>> 0;
+                        if (cache.tree && typeof cache.tree === 'object' && !Array.isArray(cache.tree) &&
+                            typeof cache.tree.tag === 'string' && Object.isExtensible(cache.tree)) {
+                            Object.defineProperty(cache.tree, '__memoKey', {value: cache.id, configurable: true});
+                            Object.defineProperty(cache.tree, '__memoRev', {value: cache.rev, configurable: true});
+                        }
                         return cache.tree;
                     }
                     Object.defineProperty(Memo, 'name', {value: 'memo(' + component.name + ')'});
@@ -3657,10 +4432,138 @@ void dispatch_hover_focus(InlaySurface* s, const ColdVisualStyle* cold,
     }
 }
 
+FormStateEntry* find_or_add_form_state(InlaySurface* s, uint32_t element_id) noexcept {
+    auto* e = ext(s);
+    for (uint32_t i = 0u; i < e->form_state_count; ++i) {
+        if (e->form_states[i].element_id == element_id) {
+            e->form_states[i].last_used_frame = s->frame_counter;
+            return &e->form_states[i];
+        }
+    }
+    FormStateEntry* slot = nullptr;
+    if (e->form_state_count < kMaxFormStates) {
+        slot = &e->form_states[e->form_state_count++];
+    } else {
+        uint32_t victim = 0u;
+        for (uint32_t i = 1u; i < kMaxFormStates; ++i) {
+            if (e->form_states[i].last_used_frame < e->form_states[victim].last_used_frame) victim = i;
+        }
+        slot = &e->form_states[victim];
+    }
+    *slot = {element_id, 0u, false, s->frame_counter};
+    return slot;
+}
+
+uint32_t utf8_codepoint_count(const char* chars, uint32_t byte_len) noexcept {
+    if (!chars || byte_len == 0u) return 0u;
+    uint32_t count = 0u;
+    size_t pos = 0u;
+    while (pos < byte_len) {
+        (void)inlay_utf8_next(chars, byte_len, &pos);
+        ++count;
+    }
+    return count;
+}
+
+bool validate_input_field(const InlaySurface* s, const CoreNodeExtra* extra,
+                          const char* val, uint32_t byte_len,
+                          char out_err[96], EtchStr* out_err_str) noexcept {
+    if (extra && extra->field_error.len > 0u) {
+        *out_err_str = inlay_ui_slice(s, extra->field_error);
+        return false;
+    }
+    if (!extra) return true;
+    const bool req = (extra->flags & CefInputRequired) != 0u;
+    const bool has_min = (extra->flags & CefInputHasMinLen) != 0u;
+    const bool has_max = (extra->flags & CefInputHasMaxLen) != 0u;
+    if (!req && !has_min && !has_max) return true;
+
+    bool non_ws = false;
+    for (uint32_t i = 0u; i < byte_len; ++i) {
+        const char c = val[i];
+        if (c != ' ' && c != '\t' && c != '\r' && c != '\n') {
+            non_ws = true;
+            break;
+        }
+    }
+    if (req && !non_ws) {
+        *out_err_str = ETCH_STR_LIT("This field is required");
+        return false;
+    }
+    const uint32_t cp_len = utf8_codepoint_count(val, byte_len);
+    if (has_min && cp_len < extra->min_length) {
+        const int n = std::snprintf(out_err, 96u, "Minimum %u characters", extra->min_length);
+        *out_err_str = n > 0 ? EtchStr{out_err, static_cast<uint32_t>(n), false} : ETCH_STR_LIT("Too short");
+        return false;
+    }
+    if (has_max && cp_len > extra->max_length) {
+        const int n = std::snprintf(out_err, 96u, "Maximum %u characters", extra->max_length);
+        *out_err_str = n > 0 ? EtchStr{out_err, static_cast<uint32_t>(n), false} : ETCH_STR_LIT("Too long");
+        return false;
+    }
+    return true;
+}
+
+struct ArenaJsonWriter {
+    char* data;
+    uint32_t len;
+    uint32_t cap;
+    bool overflow;
+};
+
+ArenaJsonWriter arena_json_begin(EtchContext* ctx, uint32_t cap) noexcept {
+    if (cap > 65536u) cap = 65536u;
+    char* mem = static_cast<char*>(etch_frame_arena_alloc(ctx, cap, 1u));
+    return {mem, 0u, mem ? cap : 0u, mem == nullptr};
+}
+
+void arena_json_raw(ArenaJsonWriter& w, const char* s, uint32_t n) noexcept {
+    if (n == 0u) return;
+    if (!w.data || n > w.cap - w.len) {
+        w.overflow = true;
+        return;
+    }
+    std::memcpy(w.data + w.len, s, n);
+    w.len += n;
+}
+
+void arena_json_quoted(ArenaJsonWriter& w, EtchStr str) noexcept {
+    constexpr char hex[] = "0123456789abcdef";
+    arena_json_raw(w, "\"", 1u);
+    for (uint32_t i = 0u; i < str.length; ++i) {
+        const uint8_t c = static_cast<uint8_t>(str.chars[i]);
+        switch (c) {
+            case '"':  arena_json_raw(w, "\\\"", 2u); break;
+            case '\\': arena_json_raw(w, "\\\\", 2u); break;
+            case '\b': arena_json_raw(w, "\\b", 2u); break;
+            case '\f': arena_json_raw(w, "\\f", 2u); break;
+            case '\n': arena_json_raw(w, "\\n", 2u); break;
+            case '\r': arena_json_raw(w, "\\r", 2u); break;
+            case '\t': arena_json_raw(w, "\\t", 2u); break;
+            default:
+                if (c < 0x20u) {
+                    const char esc[6] = {'\\', 'u', '0', '0', hex[c >> 4], hex[c & 15u]};
+                    arena_json_raw(w, esc, 6u);
+                } else {
+                    const char ch = static_cast<char>(c);
+                    arena_json_raw(w, &ch, 1u);
+                }
+                break;
+        }
+    }
+    arena_json_raw(w, "\"", 1u);
+}
+
+EtchStr arena_json_finish(const ArenaJsonWriter& w) noexcept {
+    return (w.data && !w.overflow) ? EtchStr{w.data, w.len, false} : EtchStr{};
+}
+
 void dispatch_box_interaction(InlaySurface* s, const NodeStyle& st, const ColdVisualStyle* cold,
-                              const CoreNodeExtra* extra, uint32_t id, WidgetEvents* events) {
+                              const CoreNodeExtra* extra, uint32_t id, WidgetEvents* events,
+                              uint8_t descendants_consumed = 0u) {
     const bool disabled = (st.flags & NfDisabled) != 0u;
     const bool hovered = etch_hovered(id);
+    const bool stop_prop = extra && (extra->flags & CefStopPropagation) != 0u;
     if (!disabled) {
         if (hovered) {
             if (cold && (cold->cflags & CfHasCursor)) {
@@ -3669,17 +4572,30 @@ void dispatch_box_interaction(InlaySurface* s, const NodeStyle& st, const ColdVi
                 etch_set_cursor(ETCH_CURSOR_HAND);
             }
         }
-        if (has_event(st.action, st.handler) && is_activated(id)) {
+        const bool activated = is_activated(id);
+        if ((descendants_consumed & ConsumeClick) == 0u && has_event(st.action, st.handler) && activated) {
             inlay_ui_queue_event(s, events, inlay_ui_slice(s, st.action), st.handler,
                                  ETCH_STR_LIT("null"), true);
         }
-        if (extra && has_event(extra->dbl_action, extra->dbl_handler) && etch_double_clicked(id)) {
+        const bool dbl = etch_double_clicked(id);
+        if ((descendants_consumed & ConsumeDblClick) == 0u && extra &&
+            has_event(extra->dbl_action, extra->dbl_handler) && dbl) {
             inlay_ui_queue_event(s, events, inlay_ui_slice(s, extra->dbl_action), extra->dbl_handler,
                                  ETCH_STR_LIT("null"), true);
         }
-        if (extra && has_event(extra->rclick_action, extra->rclick_handler) && etch_right_clicked(id)) {
+        const bool rclick = etch_right_clicked(id);
+        if ((descendants_consumed & ConsumeRClick) == 0u && extra &&
+            has_event(extra->rclick_action, extra->rclick_handler) && rclick) {
             inlay_ui_queue_event(s, events, inlay_ui_slice(s, extra->rclick_action), extra->rclick_handler,
                                  ETCH_STR_LIT("null"), true);
+        }
+        if (stop_prop) {
+            if (activated || etch_clicked(id)) ext(s)->child_consumed_mask |= ConsumeClick;
+            if (dbl) ext(s)->child_consumed_mask |= ConsumeDblClick;
+            if (rclick) ext(s)->child_consumed_mask |= ConsumeRClick;
+            if ((hovered || etch_focused(id)) && etch_key_pressed(SDLK_ESCAPE, false)) {
+                ext(s)->child_consumed_mask |= ConsumeEscape;
+            }
         }
         dispatch_hover_focus(s, cold, id, events);
     }
@@ -3703,6 +4619,7 @@ bool box_handles_opacity(InlayUiKind kind) noexcept {
     switch (kind) {
         case INLAY_UI_BOX:
         case INLAY_UI_CARD:
+        case INLAY_UI_FORM:
         case INLAY_UI_SCROLL:
         case INLAY_UI_POPOVER:
         case INLAY_UI_BADGE:
@@ -3895,6 +4812,12 @@ void draw_error_card(InlaySurface* s, const EtchTheme& theme, const char* error,
 // ============================================================================
 // Exported Cross-Module Helpers (Declared in src/inlay_ui_internal.h)
 // ============================================================================
+
+void inlay_ui_note_responsive_cls(InlaySurface* s) noexcept {
+    if (!s) return;
+    ext(s)->uses_responsive_cls = true;
+    ++ext(s)->responsive_cls_hits;
+}
 
 TextSlice inlay_ui_copy_text_slice(InlaySurface* s, JSValueConst value) {
     size_t n = 0u;
@@ -4412,7 +5335,7 @@ void inlay_ui_draw_node(InlaySurface* s, uint32_t index, uint32_t parent,
     if (inlay_ui_is_ext_widget(n.kind)) {
         inlay_ui_draw_ext_widget(s, index, id, parent, theme, use_layer, events);
     } else if (n.kind == INLAY_UI_BOX || n.kind == INLAY_UI_SCROLL ||
-               n.kind == INLAY_UI_CARD || n.kind == INLAY_UI_POPOVER) {
+               n.kind == INLAY_UI_CARD || n.kind == INLAY_UI_POPOVER || n.kind == INLAY_UI_FORM) {
         auto box = etch_box_desc_default();
         if (n.kind == INLAY_UI_SCROLL) {
             box.scroll_x = false;
@@ -4429,6 +5352,8 @@ void inlay_ui_draw_node(InlaySurface* s, uint32_t index, uint32_t parent,
             box.continuous_corners = true;
             box.elevation = ETCH_ELEVATION_MD;
             box.top_rim_alpha = dark ? 0.14f : 0.0f;
+        } else if (n.kind == INLAY_UI_FORM) {
+            box.gap = 10.f;
         } else if (n.kind == INLAY_UI_POPOVER) {
             box.attach_to = ETCH_ATTACH_PARENT;
             box.anchor_parent = ETCH_ANCHOR_BOTTOM_LEFT;
@@ -4449,6 +5374,27 @@ void inlay_ui_draw_node(InlaySurface* s, uint32_t index, uint32_t parent,
             box.focusable = true;
         }
         inlay_ui_populate_box_desc(s, st, theme, id, box, use_layer);
+
+        // #54 Form validation & grouped submit scope
+        FormStateEntry* form_state = nullptr;
+        ActiveFormField form_fields[64] = {};
+        ActiveFormCtx form_ctx = {};
+        ActiveFormCtx* prev_form = ext(s)->active_form;
+        if (n.kind == INLAY_UI_FORM) {
+            form_state = find_or_add_form_state(s, id);
+            const uint64_t rhash = (extra && extra->field_name.len > 0u)
+                ? inlay_fnv1a_64(s->text + extra->field_name.off, extra->field_name.len)
+                : 0u;
+            if (form_state->reset_key_hash != rhash) {
+                form_state->reset_key_hash = rhash;
+                form_state->show_errors = false;
+            }
+            form_ctx = {id, form_state->show_errors, false, form_fields, 0u, 64u};
+            ext(s)->active_form = &form_ctx;
+        }
+
+        const uint8_t parent_consumed_before = ext(s)->child_consumed_mask;
+        ext(s)->child_consumed_mask = 0u;
         etch_begin_box(&box);
         {
             const bool prev_col = s->draw_parent_col;
@@ -4459,13 +5405,77 @@ void inlay_ui_draw_node(InlaySurface* s, uint32_t index, uint32_t parent,
             s->draw_parent_col = prev_col;
         }
         etch_end_box();
-        if (n.kind == INLAY_UI_POPOVER) {
-            if (has_event(st.action, st.handler) &&
+        const uint8_t descendants_consumed = ext(s)->child_consumed_mask;
+        ext(s)->child_consumed_mask = static_cast<uint8_t>(parent_consumed_before | descendants_consumed);
+
+        if (n.kind == INLAY_UI_FORM) {
+            ext(s)->active_form = prev_form;
+            if (form_ctx.submit_requested) {
+                bool all_valid = true;
+                uint32_t est_bytes = 16u;
+                uint32_t invalid_bytes = 16u;
+                for (uint32_t fi = 0u; fi < form_ctx.field_count; ++fi) {
+                    est_bytes += (form_ctx.fields[fi].name.length + form_ctx.fields[fi].value.length) * 6u + 8u;
+                    if (!form_ctx.fields[fi].valid) {
+                        all_valid = false;
+                        invalid_bytes += form_ctx.fields[fi].name.length * 6u + 4u;
+                    }
+                }
+                if (all_valid) {
+                    form_state->show_errors = false;
+                    if (has_event(st.action, st.handler)) {
+                        auto jw = arena_json_begin(s->etch, est_bytes);
+                        arena_json_raw(jw, "{", 1u);
+                        for (uint32_t fi = 0u; fi < form_ctx.field_count; ++fi) {
+                            if (fi > 0u) arena_json_raw(jw, ",", 1u);
+                            arena_json_quoted(jw, form_ctx.fields[fi].name);
+                            arena_json_raw(jw, ":", 1u);
+                            arena_json_quoted(jw, form_ctx.fields[fi].value);
+                        }
+                        arena_json_raw(jw, "}", 1u);
+                        const EtchStr payload = arena_json_finish(jw);
+                        if (payload.length > 0u) {
+                            inlay_ui_queue_event(s, events, inlay_ui_slice(s, st.action), st.handler, payload, true);
+                        }
+                    }
+                } else {
+                    form_state->show_errors = true;
+                    etch_request_redraw(s->etch);
+                    for (uint32_t fi = 0u; fi < form_ctx.field_count; ++fi) {
+                        if (!form_ctx.fields[fi].valid) {
+                            EtchA11yOverrideDesc inv_ov = {};
+                            inv_ov.element_id = form_ctx.fields[fi].element_id;
+                            inv_ov.add_states = uint32_t(ETCH_A11Y_STATE_INVALID);
+                            etch_set_a11y_override(&inv_ov);
+                        }
+                    }
+                    if (extra && has_event(extra->field_error, extra->invalid_handler)) {
+                        auto jw = arena_json_begin(s->etch, invalid_bytes);
+                        arena_json_raw(jw, "[", 1u);
+                        bool first_inv = true;
+                        for (uint32_t fi = 0u; fi < form_ctx.field_count; ++fi) {
+                            if (form_ctx.fields[fi].valid) continue;
+                            if (!first_inv) arena_json_raw(jw, ",", 1u);
+                            arena_json_quoted(jw, form_ctx.fields[fi].name);
+                            first_inv = false;
+                        }
+                        arena_json_raw(jw, "]", 1u);
+                        const EtchStr payload = arena_json_finish(jw);
+                        if (payload.length > 0u) {
+                            inlay_ui_queue_event(s, events, inlay_ui_slice(s, extra->field_error),
+                                                 extra->invalid_handler, payload, false);
+                        }
+                    }
+                }
+            }
+        } else if (n.kind == INLAY_UI_POPOVER) {
+            if ((descendants_consumed & ConsumeEscape) == 0u && has_event(st.action, st.handler) &&
                 etch_should_close_popover(id, box.attach_to == ETCH_ATTACH_ROOT ? 0u : parent)) {
                 inlay_ui_queue_event(s, events, inlay_ui_slice(s, st.action), st.handler, ETCH_STR_LIT("false"));
+                ext(s)->child_consumed_mask |= ConsumeEscape;
             }
         } else {
-            dispatch_box_interaction(s, st, cold, extra, id, events);
+            dispatch_box_interaction(s, st, cold, extra, id, events, descendants_consumed);
         }
     } else if (n.kind == INLAY_UI_SPACER) {
         auto box = etch_box_desc_default();
@@ -4581,6 +5591,8 @@ void inlay_ui_draw_node(InlaySurface* s, uint32_t index, uint32_t parent,
             const uint16_t btn_font_id = (st.flags & NfHasFontId) ? st.font_id : uint16_t(ETCH_FONT_SANS);
             const uint32_t btn_ot = (cold && (cold->cflags & CfHasOpenType)) ? cold->opentype_flags : 0u;
 
+            const uint8_t btn_parent_consumed = ext(s)->child_consumed_mask;
+            ext(s)->child_consumed_mask = 0u;
             if (has_custom_children) {
                 if (n.text.length > 0u) {
                     auto td = etch_text_desc_default();
@@ -4617,19 +5629,30 @@ void inlay_ui_draw_node(InlaySurface* s, uint32_t index, uint32_t parent,
                 etch_text(label, &td);
             }
             etch_end_box();
+            const uint8_t btn_desc_consumed = ext(s)->child_consumed_mask;
+            ext(s)->child_consumed_mask = static_cast<uint8_t>(btn_parent_consumed | btn_desc_consumed);
             if (!disabled) {
                 if (etch_hovered(id)) {
                     etch_set_cursor((cold && (cold->cflags & CfHasCursor)) ? cold->cursor : ETCH_CURSOR_HAND);
                 }
-                if (is_activated(id)) {
+                const bool activated = (btn_desc_consumed & ConsumeClick) == 0u && is_activated(id);
+                if (activated) {
+                    ext(s)->child_consumed_mask |= ConsumeClick;
                     inlay_ui_queue_event(s, events, inlay_ui_slice(s, st.action), st.handler,
                                          ETCH_STR_LIT("null"), true);
+                    if (extra && (extra->flags & CefButtonSubmit) != 0u && ext(s)->active_form) {
+                        ext(s)->active_form->submit_requested = true;
+                    }
                 }
-                if (extra && has_event(extra->dbl_action, extra->dbl_handler) && etch_double_clicked(id)) {
+                if ((btn_desc_consumed & ConsumeDblClick) == 0u && extra &&
+                    has_event(extra->dbl_action, extra->dbl_handler) && etch_double_clicked(id)) {
+                    ext(s)->child_consumed_mask |= ConsumeDblClick;
                     inlay_ui_queue_event(s, events, inlay_ui_slice(s, extra->dbl_action),
                                          extra->dbl_handler, ETCH_STR_LIT("null"), true);
                 }
-                if (extra && has_event(extra->rclick_action, extra->rclick_handler) && etch_right_clicked(id)) {
+                if ((btn_desc_consumed & ConsumeRClick) == 0u && extra &&
+                    has_event(extra->rclick_action, extra->rclick_handler) && etch_right_clicked(id)) {
+                    ext(s)->child_consumed_mask |= ConsumeRClick;
                     inlay_ui_queue_event(s, events, inlay_ui_slice(s, extra->rclick_action),
                                          extra->rclick_handler, ETCH_STR_LIT("null"), true);
                 }
@@ -4688,8 +5711,14 @@ void inlay_ui_draw_node(InlaySurface* s, uint32_t index, uint32_t parent,
             const bool pressed = etch_button(&button);
             if (custom_theme) etch_pop_theme();
             if (pressed) {
+                ext(s)->child_consumed_mask |= ConsumeClick;
                 inlay_ui_queue_event(s, events, inlay_ui_slice(s, st.action), st.handler,
                                      ETCH_STR_LIT("null"), true);
+                if (extra && (extra->flags & CefButtonSubmit) != 0u && ext(s)->active_form) {
+                    ext(s)->active_form->submit_requested = true;
+                }
+            } else if (!disabled && extra && (extra->flags & CefStopPropagation) != 0u && etch_clicked(id)) {
+                ext(s)->child_consumed_mask |= ConsumeClick;
             }
             if (!disabled) {
                 dispatch_hover_focus(s, cold, id, events);
@@ -4708,7 +5737,14 @@ void inlay_ui_draw_node(InlaySurface* s, uint32_t index, uint32_t parent,
             if (st.flags & NfHasPadding) editor.padding = st.padding;
             editor.read_only = extra && (extra->flags & CefInputReadOnly);
             editor.word_wrap = extra && (extra->flags & CefInputWordWrap);
+            if (extra && (extra->flags & CefEditorHasGhost) != 0u) {
+                etch_code_editor_set_inline_completion(id, inlay_ui_frame_text(s, inlay_ui_slice(s, extra->field_name)));
+            }
+            if (extra && (extra->flags & CefEditorHasSearch) != 0u) {
+                etch_code_editor_set_search_highlights(id, inlay_ui_frame_text(s, inlay_ui_slice(s, extra->field_error)), false);
+            }
             const auto edit = etch_code_editor(&editor);
+            if (edit.changed || etch_clicked(id)) ext(s)->child_consumed_mask |= ConsumeClick;
             if (edit.changed && has_event(st.action, st.handler)) {
                 char payload[128];
                 const int len = std::snprintf(payload, sizeof(payload),
@@ -4756,7 +5792,9 @@ void inlay_ui_draw_node(InlaySurface* s, uint32_t index, uint32_t parent,
         input.multiline = extra && (extra->flags & CefInputMultiline);
         input.read_only = extra && (extra->flags & CefInputReadOnly);
         input.word_wrap = extra && (extra->flags & CefInputWordWrap);
-        input.submit_on_enter = extra && has_event(extra->submit_action, extra->submit_handler);
+        ActiveFormCtx* active_form = ext(s)->active_form;
+        const bool has_own_submit = extra && has_event(extra->submit_action, extra->submit_handler);
+        input.submit_on_enter = has_own_submit || (active_form != nullptr && !input.multiline);
         const EtchStr edit_text = input.password ? inlay_ui_slice(s, extra->password_text) : n.text;
         uint32_t length = edit_text.length;
         if (length >= INLAY_UI_INPUT_CAPACITY) {
@@ -4769,14 +5807,71 @@ void inlay_ui_draw_node(InlaySurface* s, uint32_t index, uint32_t parent,
         s->edit_buffer[length] = '\0';
         input.buffer = s->edit_buffer;
         input.capacity = INLAY_UI_INPUT_CAPACITY;
+
+        char pre_err_buf[96] = {};
+        EtchStr pre_err_str = {};
+        const bool pre_valid = validate_input_field(s, extra, s->edit_buffer, length, pre_err_buf, &pre_err_str);
+        const bool explicit_err = extra && extra->field_error.len > 0u;
+        const bool show_field_err = explicit_err || (!pre_valid && active_form && active_form->show_errors);
+        if (show_field_err) {
+            input.border_color = theme.danger;
+            input.hover_border_color = theme.danger;
+            input.focus_border_color = theme.danger;
+            auto wrap = etch_box_desc_default();
+            wrap.axis = ETCH_AXIS_COL;
+            wrap.width = input.width;
+            wrap.height = etch_sizing_fit(0.f, 0.f);
+            wrap.gap = 4.f;
+            etch_begin_box(&wrap);
+            if (wrap.width.kind != ETCH_SIZING_FIT) {
+                input.width = etch_sizing_grow(0.f, 0.f);
+            }
+        }
+
         const auto edit = etch_text_input(&input);
+        if (show_field_err) {
+            EtchA11yOverrideDesc inv_ov = {};
+            inv_ov.element_id = id;
+            inv_ov.add_states = uint32_t(ETCH_A11Y_STATE_INVALID);
+            etch_set_a11y_override(&inv_ov);
+            if (pre_err_str.length > 0u) {
+                auto etd = etch_text_desc_default();
+                etd.font_size_px = 11.5f;
+                etd.color = theme.danger;
+                etd.wrap = true;
+                etch_text(inlay_ui_frame_text(s, pre_err_str), &etd);
+            }
+            etch_end_box();
+        }
+        if (edit.changed || edit.submitted || etch_clicked(id)) {
+            ext(s)->child_consumed_mask |= ConsumeClick;
+        }
+        if (active_form && active_form->field_count < active_form->field_cap) {
+            char post_err_buf[96] = {};
+            EtchStr post_err_str = {};
+            const bool post_valid = validate_input_field(s, extra, s->edit_buffer, edit.byte_length, post_err_buf, &post_err_str);
+            EtchStr field_key = {};
+            if (extra && extra->field_name.len > 0u) {
+                field_key = inlay_ui_frame_text(s, inlay_ui_slice(s, extra->field_name));
+            } else {
+                char fb[24] = {};
+                const int fn = std::snprintf(fb, sizeof(fb), "field_%u", active_form->field_count);
+                field_key = fn > 0 ? inlay_ui_frame_text(s, {fb, static_cast<uint32_t>(fn), false}) : ETCH_STR_LIT("field");
+            }
+            const EtchStr field_val = inlay_ui_frame_text(s, {s->edit_buffer, edit.byte_length, false});
+            active_form->fields[active_form->field_count++] = {id, field_key, field_val, post_valid};
+        }
         if (edit.changed && has_event(st.action, st.handler)) {
             inlay_ui_queue_event(s, events, inlay_ui_slice(s, st.action), st.handler,
                                  input_json(s->etch, s->edit_buffer, edit.byte_length));
         }
-        if (edit.submitted && input.submit_on_enter) {
-            inlay_ui_queue_event(s, events, inlay_ui_slice(s, extra->submit_action), extra->submit_handler,
-                                 input_json(s->etch, s->edit_buffer, edit.byte_length), true);
+        if (edit.submitted) {
+            if (has_own_submit) {
+                inlay_ui_queue_event(s, events, inlay_ui_slice(s, extra->submit_action), extra->submit_handler,
+                                     input_json(s->etch, s->edit_buffer, edit.byte_length), true);
+            } else if (active_form) {
+                active_form->submit_requested = true;
+            }
         }
     } else if (n.kind == INLAY_UI_TOGGLE) {
         auto toggle = etch_toggle_switch_desc_default();
@@ -4798,6 +5893,7 @@ void inlay_ui_draw_node(InlaySurface* s, uint32_t index, uint32_t parent,
             if (extra->color_b.set) toggle.thumb_color = inlay_ui_resolve_color(extra->color_b, theme, toggle.thumb_color);
         }
         if (etch_toggle_switch(&toggle)) {
+            ext(s)->child_consumed_mask |= ConsumeClick;
             inlay_ui_queue_event(s, events, inlay_ui_slice(s, st.action), st.handler,
                                  checked ? ETCH_STR_LIT("true") : ETCH_STR_LIT("false"));
         }
@@ -4813,6 +5909,7 @@ void inlay_ui_draw_node(InlaySurface* s, uint32_t index, uint32_t parent,
         if (st.flags & NfHasFontId) cb.font_id = st.font_id;
         if (st.color.set) cb.accent = inlay_ui_resolve_color(st.color, theme, theme.accent);
         if (etch_checkbox(&cb)) {
+            ext(s)->child_consumed_mask |= ConsumeClick;
             inlay_ui_queue_event(s, events, inlay_ui_slice(s, st.action), st.handler,
                                  checked ? ETCH_STR_LIT("true") : ETCH_STR_LIT("false"));
         }
@@ -4901,12 +5998,15 @@ void inlay_ui_draw_node(InlaySurface* s, uint32_t index, uint32_t parent,
             etch_end_box();
             if (!tab_disabled) {
                 if (etch_hovered(tab_id)) etch_set_cursor(ETCH_CURSOR_HAND);
-                if (is_activated(tab_id) && !active) {
-                    char buf[16] = {};
-                    const int len = std::snprintf(buf, sizeof(buf), "%u", i);
-                    if (len > 0) {
-                        inlay_ui_queue_event(s, events, inlay_ui_slice(s, st.action), st.handler,
-                                             inlay_ui_frame_text(s, {buf, uint32_t(len), false}));
+                if (is_activated(tab_id)) {
+                    ext(s)->child_consumed_mask |= ConsumeClick;
+                    if (!active) {
+                        char buf[16] = {};
+                        const int len = std::snprintf(buf, sizeof(buf), "%u", i);
+                        if (len > 0) {
+                            inlay_ui_queue_event(s, events, inlay_ui_slice(s, st.action), st.handler,
+                                                 inlay_ui_frame_text(s, {buf, uint32_t(len), false}));
+                        }
                     }
                 }
             }
@@ -4946,6 +6046,7 @@ void inlay_ui_draw_node(InlaySurface* s, uint32_t index, uint32_t parent,
         }
         if (st.flags & NfHasBorderWidth) cb.border_width = std::fmax(0.f, st.border_width);
         if (cb.item_count > 0u && etch_combo_box(&cb)) {
+            ext(s)->child_consumed_mask |= ConsumeClick;
             char buf[16] = {};
             const int len = std::snprintf(buf, sizeof(buf), "%d", selected);
             if (len > 0) {
@@ -5156,9 +6257,50 @@ void inlay_ui_draw_node(InlaySurface* s, uint32_t index, uint32_t parent,
         }
         etch_end_box();
     } else if (n.kind == INLAY_UI_SLOT) {
+        SlotBinding* binding = nullptr;
+        for (uint32_t i = 0u; i < s->slot_count; ++i) {
+            if (inlay_ui_equal(n.text, s->slots[i].name)) {
+                binding = &s->slots[i];
+                break;
+            }
+        }
+        const EtchStr pjson = (cold && cold->placeholder.len > 0u)
+            ? inlay_ui_frame_text(s, inlay_ui_slice(s, cold->placeholder))
+            : EtchStr{};
+
         auto box = etch_box_desc_default();
         inlay_ui_populate_box_desc(s, st, theme, id, box, use_layer);
         const auto prev_b = etch_element_bounds(id);
+
+        // #53 First-frame native intrinsic measurement via slot measure_callback
+        const bool explicit_w = has_sizing_override(s, st, cold, false);
+        const bool explicit_h = has_sizing_override(s, st, cold, true);
+        if (binding && binding->measure_callback && (!explicit_w || !explicit_h)) {
+            const float pad_x = box.padding.left + box.padding.right;
+            const float pad_y = box.padding.top + box.padding.bottom;
+            const EtchRect par_b = parent ? etch_element_bounds(parent) : EtchRect{};
+            float avail_w = 0.f;
+            if (box.width.kind == ETCH_SIZING_FIXED && box.width.value > 0.f) avail_w = std::fmax(0.f, box.width.value - pad_x);
+            else if (prev_b.w > 0.f) avail_w = std::fmax(0.f, prev_b.w - pad_x);
+            else if (par_b.w > 0.f) avail_w = std::fmax(0.f, par_b.w - pad_x);
+            else if (s->last_view_width_px > 0.f) avail_w = std::fmax(0.f, s->last_view_width_px - pad_x);
+
+            float avail_h = 0.f;
+            if (box.height.kind == ETCH_SIZING_FIXED && box.height.value > 0.f) avail_h = std::fmax(0.f, box.height.value - pad_y);
+            else if (prev_b.h > 0.f) avail_h = std::fmax(0.f, prev_b.h - pad_y);
+            else if (par_b.h > 0.f) avail_h = std::fmax(0.f, par_b.h - pad_y);
+
+            EtchVec2 measured = {0.f, 0.f};
+            if (binding->measure_callback(s, id, avail_w, avail_h, pjson, &measured, binding->user)) {
+                if (!explicit_w && std::isfinite(measured.x) && measured.x > 0.f) {
+                    box.width = etch_sizing_fixed(measured.x + pad_x);
+                }
+                if (!explicit_h && std::isfinite(measured.y) && measured.y > 0.f) {
+                    box.height = etch_sizing_fixed(measured.y + pad_y);
+                }
+            }
+        }
+
         const bool fixed_w = (box.width.kind == ETCH_SIZING_FIXED && box.width.value > 0.f);
         const bool fixed_h = (box.height.kind == ETCH_SIZING_FIXED && box.height.value > 0.f);
         // Bug 6 fix: non-fixed slot reading 0 bounds on frame 1 requests a follow-up layout pass.
@@ -5169,18 +6311,22 @@ void inlay_ui_draw_node(InlaySurface* s, uint32_t index, uint32_t parent,
         float eff_h = fixed_h ? box.height.value : prev_b.h;
         if (eff_w > 0.f) eff_w = std::fmax(0.f, eff_w - box.padding.left - box.padding.right);
         if (eff_h > 0.f) eff_h = std::fmax(0.f, eff_h - box.padding.top - box.padding.bottom);
-        SlotBinding* binding = nullptr;
-        for (uint32_t i = 0u; i < s->slot_count; ++i) {
-            if (inlay_ui_equal(n.text, s->slots[i].name)) {
-                binding = &s->slots[i];
-                break;
-            }
-        }
+
         etch_begin_box(&box);
         if (binding) {
-            const EtchStr pjson = (cold && cold->placeholder.len > 0u)
-                ? inlay_ui_frame_text(s, inlay_ui_slice(s, cold->placeholder))
-                : EtchStr{};
+            if (binding->a11y_role != ETCH_A11Y_NONE) {
+                const EtchStr a11y_lbl = binding->a11y_label[0]
+                    ? inlay_ui_frame_text(s, {binding->a11y_label, static_cast<uint32_t>(std::strlen(binding->a11y_label)), false})
+                    : inlay_ui_frame_text(s, n.text);
+                etch_emit_a11y_node(id, binding->a11y_role, a11y_lbl, {}, 0u, 0u, 0.f, {});
+                EtchA11yOverrideDesc ov = {};
+                ov.element_id = id;
+                ov.role = binding->a11y_role;
+                ov.label = a11y_lbl;
+                ov.has_role = true;
+                ov.has_label = a11y_lbl.length > 0u;
+                etch_set_a11y_override(&ov);
+            }
             binding->callback(s, id, eff_w, eff_h, pjson, binding->user);
         } else {
             const uint32_t cap = n.text.length + 12u;
@@ -5364,12 +6510,15 @@ void inlay_ui_draw_node(InlaySurface* s, uint32_t index, uint32_t parent,
             sl.track_color = inlay_ui_resolve_color(cold->track_color, theme, sl.track_color);
         }
         if (st.color.set) sl.fill_color = inlay_ui_resolve_color(st.color, theme, sl.fill_color);
-        if (etch_slider(&sl) && has_event(st.action, st.handler)) {
-            char buf[32] = {};
-            const int len = std::snprintf(buf, sizeof(buf), "%.9g", double(val));
-            if (len > 0) {
-                inlay_ui_queue_event(s, events, inlay_ui_slice(s, st.action), st.handler,
-                                     inlay_ui_frame_text(s, {buf, uint32_t(len), false}));
+        if (etch_slider(&sl)) {
+            ext(s)->child_consumed_mask |= ConsumeClick;
+            if (has_event(st.action, st.handler)) {
+                char buf[32] = {};
+                const int len = std::snprintf(buf, sizeof(buf), "%.9g", double(val));
+                if (len > 0) {
+                    inlay_ui_queue_event(s, events, inlay_ui_slice(s, st.action), st.handler,
+                                         inlay_ui_frame_text(s, {buf, uint32_t(len), false}));
+                }
             }
         }
     } else if (n.kind == INLAY_UI_BADGE) {
@@ -5425,6 +6574,8 @@ void inlay_ui_draw_node(InlaySurface* s, uint32_t index, uint32_t parent,
                 td.opentype_flags = ot;
                 etch_text(inlay_ui_frame_text(s, n.text), &td);
             }
+            const uint8_t bdg_parent_consumed = ext(s)->child_consumed_mask;
+            ext(s)->child_consumed_mask = 0u;
             const bool prev_col = s->draw_parent_col;
             s->draw_parent_col = (box.axis == ETCH_AXIS_COL);
             for (uint32_t at = n.first_child; at != INLAY_UI_NONE; at = s->nodes[at].next_sibling) {
@@ -5442,7 +6593,9 @@ void inlay_ui_draw_node(InlaySurface* s, uint32_t index, uint32_t parent,
             }
             s->draw_parent_col = prev_col;
             etch_end_box();
-            dispatch_box_interaction(s, st, cold, extra, id, events);
+            const uint8_t bdg_desc_consumed = ext(s)->child_consumed_mask;
+            ext(s)->child_consumed_mask = static_cast<uint8_t>(bdg_parent_consumed | bdg_desc_consumed);
+            dispatch_box_interaction(s, st, cold, extra, id, events, bdg_desc_consumed);
         }
     } else if (n.kind == INLAY_UI_DIVIDER) {
         auto box = etch_box_desc_default();
@@ -5631,6 +6784,8 @@ INLAY_API InlaySurface* inlay_surface_create(EtchContext* context, const InlaySu
         return nullptr;
     }
     JS_SetContextOpaque(s->js, s);
+    storage->atom_memo_key = JS_NewAtom(s->js, "__memoKey");
+    storage->atom_memo_rev = JS_NewAtom(s->js, "__memoRev");
     return s;
 }
 
@@ -5639,6 +6794,7 @@ INLAY_API void inlay_surface_destroy(InlaySurface* s) {
     auto* storage = ext(s);
     SDL_free(s->content);
     clear_context(s);
+    SDL_free(storage->action_policies);
     SDL_free(storage->async_actions);
     SDL_free(storage->async_action_names);
     SDL_free(storage->reload_error);
@@ -5786,27 +6942,101 @@ INLAY_API void inlay_surface_close_async_actions(InlaySurface* s) {
     retire_async_actions(s);
 }
 
-INLAY_API bool inlay_surface_bind_slot(InlaySurface* s, EtchStr name, InlaySlotRenderFn fn, void* user) {
+INLAY_API bool inlay_surface_bind_slot_ex(InlaySurface* s, EtchStr name, InlaySlotRenderFn fn,
+                                          InlaySlotMeasureFn measure_fn, EtchA11yRole a11y_role,
+                                          EtchStr a11y_label, void* user) {
     if (!s || !name.chars || !name.length || name.length >= 64u || !fn ||
         std::memchr(name.chars, 0, name.length)) {
         return false;
     }
+    if (a11y_label.length > 0u && (!a11y_label.chars || std::memchr(a11y_label.chars, 0, a11y_label.length))) {
+        return false;
+    }
+    SlotBinding* slot = nullptr;
     for (uint32_t i = 0u; i < s->slot_count; ++i) {
         if (inlay_ui_equal(name, s->slots[i].name)) {
-            s->slots[i].callback = fn;
-            s->slots[i].user = user;
-            etch_request_redraw(s->etch);
-            return true;
+            slot = &s->slots[i];
+            break;
         }
     }
-    if (s->slot_count == 32u) return false;
-    auto& sl = s->slots[s->slot_count++];
-    std::memcpy(sl.name, name.chars, name.length);
-    sl.name[name.length] = '\0';
-    sl.callback = fn;
-    sl.user = user;
+    if (!slot) {
+        if (s->slot_count == 32u) return false;
+        slot = &s->slots[s->slot_count++];
+        *slot = {};
+        std::memcpy(slot->name, name.chars, name.length);
+        slot->name[name.length] = '\0';
+    }
+    slot->callback = fn;
+    slot->measure_callback = measure_fn;
+    slot->a11y_role = a11y_role;
+    slot->a11y_label[0] = '\0';
+    if (a11y_label.length > 0u) {
+        const uint32_t copy_n = a11y_label.length < (sizeof(slot->a11y_label) - 1u)
+            ? a11y_label.length
+            : uint32_t(sizeof(slot->a11y_label) - 1u);
+        std::memcpy(slot->a11y_label, a11y_label.chars, copy_n);
+        slot->a11y_label[copy_n] = '\0';
+    }
+    slot->user = user;
     etch_request_redraw(s->etch);
     return true;
+}
+
+INLAY_API bool inlay_surface_bind_slot(InlaySurface* s, EtchStr name, InlaySlotRenderFn fn, void* user) {
+    return inlay_surface_bind_slot_ex(s, name, fn, nullptr, ETCH_A11Y_NONE, {}, user);
+}
+
+INLAY_API bool inlay_surface_set_action_policy(InlaySurface* s, EtchStr name, const InlayActionPolicy* policy_in) {
+    if (!s || !name.chars || !name.length || name.length >= sizeof(ActionPolicyEntry::name) ||
+        std::memchr(name.chars, 0, name.length)) {
+        return false;
+    }
+    auto* storage = ext(s);
+    uint32_t found = storage->action_policy_count;
+    for (uint32_t i = 0u; i < storage->action_policy_count; ++i) {
+        if (inlay_ui_equal(name, storage->action_policies[i].name)) {
+            found = i;
+            break;
+        }
+    }
+    if (!policy_in) {
+        if (found < storage->action_policy_count) {
+            storage->action_policies[found] = storage->action_policies[--storage->action_policy_count];
+        }
+        return true;
+    }
+    InlayActionPolicy policy = inlay_action_policy_default();
+    if (!inlay_read_abi_struct(policy_in, &policy)) return false;
+    if (policy.required_keys_csv.length > 0u &&
+        (!policy.required_keys_csv.chars ||
+         policy.required_keys_csv.length >= sizeof(ActionPolicyEntry::required_keys_csv) ||
+         std::memchr(policy.required_keys_csv.chars, 0, policy.required_keys_csv.length))) {
+        return false;
+    }
+    if (found == storage->action_policy_count) {
+        if (!inlay_grow_pod(storage->action_policies, storage->action_policy_cap,
+                            storage->action_policy_count + 1u, 8u, 128u)) {
+            return false;
+        }
+        ++storage->action_policy_count;
+    }
+    auto& dst = storage->action_policies[found];
+    dst = {};
+    std::memcpy(dst.name, name.chars, name.length);
+    dst.name[name.length] = '\0';
+    dst.permission = policy.permission;
+    dst.require_approval = policy.require_approval;
+    if (policy.required_keys_csv.length > 0u) {
+        std::memcpy(dst.required_keys_csv, policy.required_keys_csv.chars, policy.required_keys_csv.length);
+        dst.required_keys_csv[policy.required_keys_csv.length] = '\0';
+    }
+    return true;
+}
+
+INLAY_API void inlay_surface_set_action_audit_hook(InlaySurface* s, InlayActionAuditFn fn, void* user_data) {
+    if (!s) return;
+    ext(s)->audit_fn = fn;
+    ext(s)->audit_user = user_data;
 }
 
 static bool bind_content(InlaySurface* s, EtchStr name, InlayUiKind kind, void* resource) {
@@ -5827,6 +7057,264 @@ static bool bind_content(InlaySurface* s, EtchStr name, InlayUiKind kind, void* 
     }
     etch_request_redraw(s->etch);
     return true;
+}
+
+INLAY_API bool inlay_surface_bind_model(InlaySurface* s, EtchStr name, InlayModel* model) {
+    return bind_content(s, name, INLAY_UI_VIRTUAL_LIST, model);
+}
+
+INLAY_API uint64_t inlay_surface_memo_reused_nodes(const InlaySurface* s) {
+    return s ? s->memo_reused_nodes : 0u;
+}
+
+INLAY_API uint32_t inlay_surface_export_dts(const InlaySurface* s, char* out_buf, uint32_t cap) {
+    if (!s) {
+        if (out_buf && cap > 0u) out_buf[0] = '\0';
+        return 0u;
+    }
+    struct DtsWriter {
+        char* buf;
+        uint32_t cap;
+        uint32_t len;
+        void put_raw(const char* p, uint32_t n) noexcept {
+            if (buf && cap > 1u && len < cap - 1u) {
+                const uint32_t avail = (cap - 1u) - len;
+                const uint32_t take = n < avail ? n : avail;
+                std::memcpy(buf + len, p, take);
+            }
+            len += n;
+        }
+        void put(const char* lit) noexcept {
+            put_raw(lit, static_cast<uint32_t>(std::strlen(lit)));
+        }
+        void put_ts_str(const char* str) noexcept {
+            put_raw("'", 1u);
+            for (const char* p = str; *p; ++p) {
+                const char c = *p;
+                if (c == '\'' || c == '\\') {
+                    put_raw("\\", 1u);
+                    put_raw(&c, 1u);
+                } else if (c == '\n') {
+                    put_raw("\\n", 2u);
+                } else if (c == '\r') {
+                    put_raw("\\r", 2u);
+                } else {
+                    put_raw(&c, 1u);
+                }
+            }
+            put_raw("'", 1u);
+        }
+    };
+
+    DtsWriter w = {out_buf, cap, 0u};
+    const auto* storage = ext(s);
+    w.put("// Auto-generated Inlay surface declarations\n");
+
+    auto emit_content_union = [&](const char* type_name, InlayUiKind kind) noexcept {
+        w.put("export type ");
+        w.put(type_name);
+        w.put(" = ");
+        bool any = false;
+        for (uint32_t i = 0u; i < s->content_count; ++i) {
+            if (s->content[i].kind != kind) continue;
+            if (any) w.put(" | ");
+            w.put_ts_str(s->content[i].name);
+            any = true;
+        }
+        if (!any) w.put("never");
+        w.put(";\n");
+    };
+
+    w.put("export type ActionName = ");
+    if (s->action_count == 0u) {
+        w.put("never");
+    } else {
+        for (uint32_t i = 0u; i < s->action_count; ++i) {
+            if (i > 0u) w.put(" | ");
+            w.put_ts_str(s->actions[i].name);
+        }
+    }
+    w.put(";\n");
+
+    w.put("export type AsyncActionName = ");
+    if (storage->async_action_name_count == 0u) {
+        w.put("never");
+    } else {
+        for (uint32_t i = 0u; i < storage->async_action_name_count; ++i) {
+            if (i > 0u) w.put(" | ");
+            w.put_ts_str(storage->async_action_names[i].value);
+        }
+    }
+    w.put(";\n");
+
+    w.put("export type SlotName = ");
+    if (s->slot_count == 0u) {
+        w.put("never");
+    } else {
+        for (uint32_t i = 0u; i < s->slot_count; ++i) {
+            if (i > 0u) w.put(" | ");
+            w.put_ts_str(s->slots[i].name);
+        }
+    }
+    w.put(";\n");
+
+    emit_content_union("DocumentName", INLAY_UI_DOC);
+    emit_content_union("BufferName", INLAY_UI_CODE_EDITOR);
+    emit_content_union("ModelName", INLAY_UI_VIRTUAL_LIST);
+
+    w.put(
+        "\n"
+        "export type InlayNode = { tag: string; props: Record<string, unknown>; children: unknown[] } | string | number | boolean | null | undefined | InlayNode[];\n"
+        "export interface CommonProps {\n"
+        "  id?: string;\n"
+        "  key?: string | number;\n"
+        "  cls?: string;\n"
+        "  className?: string;\n"
+        "  width?: number | string;\n"
+        "  height?: number | string;\n"
+        "  bg?: string;\n"
+        "  color?: string;\n"
+        "  opacity?: number;\n"
+        "  disabled?: boolean;\n"
+        "  stopPropagation?: boolean;\n"
+        "  onClick?: ActionName | ((state: unknown) => void);\n"
+        "  [key: string]: unknown;\n"
+        "}\n"
+        "export interface FormProps extends CommonProps {\n"
+        "  resetKey?: string;\n"
+        "  onSubmit?: ActionName | ((values: Record<string, string>, state: unknown) => void);\n"
+        "  onInvalid?: ActionName | ((fields: string[], state: unknown) => void);\n"
+        "}\n"
+        "export interface InputProps extends CommonProps {\n"
+        "  name?: string;\n"
+        "  value?: string;\n"
+        "  placeholder?: string;\n"
+        "  required?: boolean;\n"
+        "  minLength?: number;\n"
+        "  maxLength?: number;\n"
+        "  error?: string;\n"
+        "  password?: boolean;\n"
+        "  multiline?: boolean;\n"
+        "  readOnly?: boolean;\n"
+        "  onChange?: ActionName | ((value: string, state: unknown) => void);\n"
+        "  onSubmit?: ActionName | ((value: string, state: unknown) => void);\n"
+        "}\n"
+        "export interface SlotProps extends CommonProps { name: SlotName; props?: unknown; }\n"
+        "export interface DocProps extends CommonProps { document?: DocumentName; markdown?: string; }\n"
+        "export interface CodeEditorProps extends CommonProps { buffer: BufferName; readOnly?: boolean; wordWrap?: boolean; ghostText?: string; searchQuery?: string; }\n"
+        "export interface VirtualListProps extends CommonProps { model?: ModelName; count?: number; itemHeight?: number; items?: unknown[]; renderItem?: (index: number) => InlayNode; }\n"
+        "export interface TreeProps extends CommonProps { model?: ModelName; showIndentGuide?: boolean; rowHeight?: number; indent?: number; }\n");
+
+    w.put(
+        "\n"
+        "declare function action(name: ActionName, payload?: unknown): boolean;\n"
+        "declare function request<T = unknown>(name: AsyncActionName, payload?: unknown): Promise<T> & { cancel(): boolean };\n"
+        "declare function setTimeout(fn: () => void, ms?: number): number;\n"
+        "declare function clearTimeout(id: number): void;\n"
+        "declare function useState<T>(init: T | (() => T)): [T, (next: T | ((prev: T) => T)) => void];\n"
+        "declare function useRef<T>(init: T): { current: T };\n"
+        "declare function useMemo<T>(fn: () => T, deps?: readonly unknown[]): T;\n"
+        "declare function useCallback<T extends (...args: unknown[]) => unknown>(fn: T, deps?: readonly unknown[]): T;\n"
+        "declare function useEffect(fn: () => void | (() => void), deps?: readonly unknown[]): void;\n"
+        "declare function memo<P extends object>(component: (props: P) => InlayNode, equal?: (a: P, b: P) => boolean): (props: P) => InlayNode;\n"
+        "\n"
+        "declare namespace ui {\n"
+        "  function box(props?: CommonProps | InlayNode, ...children: InlayNode[]): InlayNode;\n"
+        "  function row(props?: CommonProps | InlayNode, ...children: InlayNode[]): InlayNode;\n"
+        "  function col(props?: CommonProps | InlayNode, ...children: InlayNode[]): InlayNode;\n"
+        "  function card(props?: CommonProps | InlayNode, ...children: InlayNode[]): InlayNode;\n"
+        "  function form(props?: FormProps | InlayNode, ...children: InlayNode[]): InlayNode;\n"
+        "  function spacer(props?: CommonProps): InlayNode;\n"
+        "  function text(props?: string | CommonProps, ...children: InlayNode[]): InlayNode;\n"
+        "  function button(props?: string | CommonProps, ...children: InlayNode[]): InlayNode;\n"
+        "  function input(props?: InputProps): InlayNode;\n"
+        "  function toggle(props?: CommonProps): InlayNode;\n"
+        "  function checkbox(props?: CommonProps): InlayNode;\n"
+        "  function tabs(props?: CommonProps): InlayNode;\n"
+        "  function combobox(props?: CommonProps): InlayNode;\n"
+        "  function scroll(props?: CommonProps | InlayNode, ...children: InlayNode[]): InlayNode;\n"
+        "  function progress(props?: CommonProps): InlayNode;\n"
+        "  function slider(props?: CommonProps): InlayNode;\n"
+        "  function badge(props?: string | CommonProps, ...children: InlayNode[]): InlayNode;\n"
+        "  function divider(props?: CommonProps): InlayNode;\n"
+        "  function image(props?: CommonProps): InlayNode;\n"
+        "  function modal(props?: CommonProps | InlayNode, ...children: InlayNode[]): InlayNode;\n"
+        "  function popover(props?: CommonProps | InlayNode, ...children: InlayNode[]): InlayNode;\n"
+        "  function tooltip(props?: CommonProps | InlayNode, ...children: InlayNode[]): InlayNode;\n"
+        "  function split(props?: CommonProps | InlayNode, ...children: InlayNode[]): InlayNode;\n"
+        "  function math(props?: string | CommonProps): InlayNode;\n"
+        "  function diagram(props?: string | CommonProps): InlayNode;\n"
+        "  function slot(props?: SlotName | SlotProps): InlayNode;\n"
+        "  function doc(props?: string | DocProps): InlayNode;\n"
+        "  function codeEditor(props?: BufferName | CodeEditorProps): InlayNode;\n"
+        "  function terminal(props?: string | CommonProps): InlayNode;\n"
+        "  function virtualList(props?: VirtualListProps, ...children: InlayNode[]): InlayNode;\n"
+        "  function table(props?: CommonProps): InlayNode;\n"
+        "  function tree(props?: TreeProps, ...children: InlayNode[]): InlayNode;\n"
+        "  function treeItem(props?: string | CommonProps, ...children: InlayNode[]): InlayNode;\n"
+        "  function menu(props?: CommonProps, ...children: InlayNode[]): InlayNode;\n"
+        "  function contextMenu(props?: CommonProps, ...children: InlayNode[]): InlayNode;\n"
+        "  function avatar(props?: string | CommonProps): InlayNode;\n"
+        "  function toast(props?: string | CommonProps, ...children: InlayNode[]): InlayNode;\n"
+        "  function accordion(props?: string | CommonProps, ...children: InlayNode[]): InlayNode;\n"
+        "  function skeleton(props?: CommonProps): InlayNode;\n"
+        "  function errorBoundary(props: { resetKey?: unknown; render: () => InlayNode; fallback?: (err: unknown, retry: () => void) => InlayNode }): InlayNode;\n"
+        "  function h(tag: string | ((props: Record<string, unknown>) => InlayNode), props?: Record<string, unknown> | null, ...children: unknown[]): InlayNode;\n"
+        "  function fragment(...children: InlayNode[]): InlayNode[];\n"
+        "}\n");
+
+    w.put(
+        "\n"
+        "declare namespace JSX {\n"
+        "  interface IntrinsicElements {\n"
+        "    Box: CommonProps;\n"
+        "    Row: CommonProps;\n"
+        "    Col: CommonProps;\n"
+        "    Card: CommonProps;\n"
+        "    Form: FormProps;\n"
+        "    Text: CommonProps;\n"
+        "    Button: CommonProps;\n"
+        "    Input: InputProps;\n"
+        "    Toggle: CommonProps;\n"
+        "    Switch: CommonProps;\n"
+        "    Checkbox: CommonProps;\n"
+        "    Tabs: CommonProps;\n"
+        "    Combobox: CommonProps;\n"
+        "    Scroll: CommonProps;\n"
+        "    Progress: CommonProps;\n"
+        "    Slider: CommonProps;\n"
+        "    Badge: CommonProps;\n"
+        "    Divider: CommonProps;\n"
+        "    Image: CommonProps;\n"
+        "    Modal: CommonProps;\n"
+        "    Popover: CommonProps;\n"
+        "    Tooltip: CommonProps;\n"
+        "    Split: CommonProps;\n"
+        "    Spacer: CommonProps;\n"
+        "    Diagram: CommonProps;\n"
+        "    Slot: SlotProps;\n"
+        "    Doc: DocProps;\n"
+        "    CodeEditor: CodeEditorProps;\n"
+        "    Terminal: CommonProps;\n"
+        "    VirtualList: VirtualListProps;\n"
+        "    Table: CommonProps;\n"
+        "    Tree: TreeProps;\n"
+        "    TreeItem: CommonProps;\n"
+        "    Menu: CommonProps;\n"
+        "    ContextMenu: CommonProps;\n"
+        "    Avatar: CommonProps;\n"
+        "    Toast: CommonProps;\n"
+        "    Accordion: CommonProps;\n"
+        "    Skeleton: CommonProps;\n"
+        "    [elemName: string]: CommonProps;\n"
+        "  }\n"
+        "}\n");
+
+    if (out_buf && cap > 0u) {
+        const uint32_t nul_pos = w.len < cap - 1u ? w.len : (cap - 1u);
+        out_buf[nul_pos] = '\0';
+    }
+    return w.len;
 }
 
 INLAY_API bool inlay_surface_bind_document(InlaySurface* s, EtchStr name, InlayDoc* doc) {
@@ -5940,6 +7428,29 @@ INLAY_API void inlay_surface_view(InlaySurface* s, const InlaySurfaceViewDesc* i
     }
     if (inlay_surface_next_timer_ms(s) == 0) etch_request_redraw(s->etch);
 
+    // #52 Capture effective surface width & trigger responsive breakpoint rebuild ONLY when responsive cls is used.
+    {
+        float eff_view_w = input.width_px;
+        if (eff_view_w <= 0.f) {
+            const EtchRect prev_b = etch_element_bounds(input.id);
+            if (prev_b.w > 0.f) eff_view_w = prev_b.w;
+        }
+        if (eff_view_w > 0.f) {
+            const bool had_width = ext(s)->has_view_width;
+            const uint8_t prev_bp = responsive_width_bucket(s->last_view_width_px);
+            const uint8_t next_bp = responsive_width_bucket(eff_view_w);
+            s->last_view_width_px = eff_view_w;
+            s->current_container_width_px = eff_view_w;
+            ext(s)->has_view_width = true;
+            if (ext(s)->uses_responsive_cls && (!had_width || prev_bp != next_bp) &&
+                s->js && s->loaded && !s->stats.has_error) {
+                run_update(s, {}, {});
+            }
+        } else if (ext(s)->uses_responsive_cls && !ext(s)->has_view_width) {
+            etch_request_redraw(s->etch);
+        }
+    }
+
     const EtchTheme theme = etch_get_theme(s->etch);
     auto box = etch_box_desc_default();
     box.id = input.id;
@@ -5965,6 +7476,7 @@ INLAY_API void inlay_surface_view(InlaySurface* s, const InlaySurfaceViewDesc* i
         if (s->node_count > 0u) {
             s->drawing = true;
             s->draw_parent_col = true;
+            ext(s)->child_consumed_mask = 0u;
             inlay_ui_draw_node(s, 0u, input.id, theme, &events);
             s->drawing = false;
         }
@@ -6066,6 +7578,16 @@ INLAY_API InlayAsyncActionEvent inlay_surface_poll_async_action(InlaySurface*) {
 INLAY_API bool inlay_surface_complete_async_action(InlaySurface*, uint32_t, bool, EtchStr) { return false; }
 INLAY_API void inlay_surface_close_async_actions(InlaySurface*) {}
 INLAY_API bool inlay_surface_bind_slot(InlaySurface*, EtchStr, InlaySlotRenderFn, void*) { return false; }
+INLAY_API bool inlay_surface_bind_slot_ex(InlaySurface*, EtchStr, InlaySlotRenderFn, InlaySlotMeasureFn,
+                                          EtchA11yRole, EtchStr, void*) { return false; }
+INLAY_API bool inlay_surface_set_action_policy(InlaySurface*, EtchStr, const InlayActionPolicy*) { return false; }
+INLAY_API void inlay_surface_set_action_audit_hook(InlaySurface*, InlayActionAuditFn, void*) {}
+INLAY_API bool inlay_surface_bind_model(InlaySurface*, EtchStr, InlayModel*) { return false; }
+INLAY_API uint64_t inlay_surface_memo_reused_nodes(const InlaySurface*) { return 0u; }
+INLAY_API uint32_t inlay_surface_export_dts(const InlaySurface*, char* out_buf, uint32_t cap) {
+    if (out_buf && cap > 0u) out_buf[0] = '\0';
+    return 0u;
+}
 INLAY_API bool inlay_surface_bind_document(InlaySurface*, EtchStr, InlayDoc*) { return false; }
 INLAY_API bool inlay_surface_bind_text_buffer(InlaySurface*, EtchStr, EtchTextBuffer*) { return false; }
 INLAY_API bool inlay_surface_set_image_resolver(InlaySurface*, InlayImageResolverFn, void*) { return false; }

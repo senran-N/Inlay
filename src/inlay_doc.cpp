@@ -1798,6 +1798,7 @@ INLAY_API void inlay_doc_destroy(InlayDoc* d) {
  SDL_free(d->list_items);
  SDL_free(d->ast_text);
  SDL_free(d->ref_defs);
+ inlay_doc_free_diagram_cache(d);
  SDL_free(d);
 }
 
@@ -1986,6 +1987,7 @@ INLAY_API void inlay_doc_clear(InlayDoc* d) {
  d->utf8_carry_len = 0;
  reset_doc_parse(d);
  invalidate_doc_views(d);
+ inlay_doc_free_diagram_cache(d);
  ++d->revision;
  etch_request_redraw(d->context);
 }
@@ -2106,4 +2108,614 @@ INLAY_API const InlayBlock* inlay_doc_block(const InlayDoc* d, uint32_t i) {
  return i < inlay_doc_block_count(d) ? d->blocks + i : nullptr;
 }
 INLAY_API EtchStr inlay_doc_source(const InlayDoc* d) { return d ? EtchStr{d->source, d->source_size, false} : EtchStr{}; }
+} // extern "C"
+
+namespace {
+struct HtmlOut {
+ char* buf;
+ uint32_t cap;
+ uint32_t len;
+
+ void write_char(char c) noexcept {
+  if (buf && cap > 0u && len + 1u < cap) buf[len] = c;
+  ++len;
+ }
+ void write(const char* s, uint32_t n) noexcept {
+  if (!n) return;
+  if (buf && cap > 0u && len + 1u < cap) {
+   const uint32_t avail = (cap - 1u) - len;
+   const uint32_t cp = n < avail ? n : avail;
+   if (cp > 0u) std::memcpy(buf + len, s, cp);
+  }
+  len += n;
+ }
+ void write_lit(const char* lit) noexcept {
+  write(lit, static_cast<uint32_t>(std::strlen(lit)));
+ }
+ void write_escaped(const char* s, uint32_t n) noexcept {
+  uint32_t run = 0u;
+  for (uint32_t i = 0u; i < n; ++i) {
+   const char* rep = nullptr;
+   switch (s[i]) {
+    case '&': rep = "&amp;"; break;
+    case '<': rep = "&lt;"; break;
+    case '>': rep = "&gt;"; break;
+    case '"': rep = "&quot;"; break;
+    default: break;
+   }
+   if (rep) {
+    if (i > run) write(s + run, i - run);
+    write_lit(rep);
+    run = i + 1u;
+   }
+  }
+  if (n > run) write(s + run, n - run);
+ }
+};
+
+uint32_t html_trim_eol(const char* s, uint32_t n) noexcept {
+ while (n > 0u && (s[n - 1u] == '\n' || s[n - 1u] == '\r')) --n;
+ return n;
 }
+
+uint32_t html_strip_quotes(const char* s, uint32_t n, uint16_t max_depth) noexcept {
+ uint32_t p = 0u;
+ for (uint16_t q = 0u; q < max_depth && p < n; ++q) {
+  uint32_t ind = 0u;
+  while (p + ind < n && ind < 3u && s[p + ind] == ' ') ++ind;
+  if (p + ind < n && s[p + ind] == '>') {
+   p += ind + 1u;
+   if (p < n && s[p] == ' ') ++p;
+  } else {
+   break;
+  }
+ }
+ return p;
+}
+
+uint32_t html_strip_list_marker(const char* s, uint32_t n, bool* out_ordered, bool* out_task, bool* out_checked) noexcept {
+ uint32_t p = 0u;
+ while (p < n && (s[p] == ' ' || s[p] == '\t')) ++p;
+ bool ordered = false;
+ if (p < n && (s[p] == '-' || s[p] == '*' || s[p] == '+') && (p + 1u == n || s[p + 1u] == ' ' || s[p + 1u] == '\t')) {
+  ++p;
+  if (p < n && (s[p] == ' ' || s[p] == '\t')) ++p;
+ } else {
+  uint32_t d = p;
+  while (d < n && s[d] >= '0' && s[d] <= '9' && d - p < 9u) ++d;
+  if (d > p && d < n && (s[d] == '.' || s[d] == ')') && (d + 1u == n || s[d + 1u] == ' ' || s[d + 1u] == '\t')) {
+   ordered = true;
+   p = d + 1u;
+   if (p < n && (s[p] == ' ' || s[p] == '\t')) ++p;
+  }
+ }
+ bool is_task = false;
+ bool checked = false;
+ if (p + 3u <= n && s[p] == '[' && (s[p + 1u] == ' ' || s[p + 1u] == 'x' || s[p + 1u] == 'X') && s[p + 2u] == ']' &&
+     (p + 3u == n || s[p + 3u] == ' ' || s[p + 3u] == '\t')) {
+  is_task = true;
+  checked = (s[p + 1u] != ' ');
+  p += 3u;
+  if (p < n && (s[p] == ' ' || s[p] == '\t')) ++p;
+ }
+ if (out_ordered) *out_ordered = ordered;
+ if (out_task) *out_task = is_task;
+ if (out_checked) *out_checked = checked;
+ return p;
+}
+
+bool html_is_ascii_alnum(char c) noexcept {
+ return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
+}
+
+bool html_is_md_escapable(char c) noexcept {
+ switch (c) {
+  case '\\': case '`': case '*': case '_': case '{': case '}': case '[': case ']':
+  case '(': case ')': case '#': case '+': case '-': case '.': case '!': case '|':
+  case '~': case '=': case '$': case '<': case '>':
+   return true;
+  default: return false;
+ }
+}
+
+void write_inline_html(const InlayDoc* doc, const char* s, uint32_t n, HtmlOut* out, uint32_t depth = 0u) noexcept {
+ if (depth >= 8u) {
+  out->write_escaped(s, n);
+  return;
+ }
+ uint32_t i = 0u;
+ while (i < n) {
+  const char c = s[i];
+  // Backslash escape
+  if (c == '\\' && i + 1u < n && html_is_md_escapable(s[i + 1u])) {
+   out->write_escaped(s + i + 1u, 1u);
+   i += 2u;
+   continue;
+  }
+  // Inline code span: `...` or ``...``
+  if (c == '`') {
+   uint32_t ticks = 0u;
+   while (i + ticks < n && s[i + ticks] == '`') ++ticks;
+   uint32_t p = i + ticks;
+   uint32_t close = UINT32_MAX;
+   while (p < n) {
+    if (s[p] == '`') {
+     uint32_t run = 0u;
+     while (p + run < n && s[p + run] == '`') ++run;
+     if (run == ticks) { close = p; break; }
+     p += run;
+    } else {
+     ++p;
+    }
+   }
+   if (close != UINT32_MAX) {
+    uint32_t a = i + ticks;
+    uint32_t b = close;
+    if (b >= a + 2u && s[a] == ' ' && s[b - 1u] == ' ') {
+     bool all_spaces = true;
+     for (uint32_t k = a; k < b; ++k) if (s[k] != ' ') { all_spaces = false; break; }
+     if (!all_spaces) { ++a; --b; }
+    }
+    out->write_lit("<code>");
+    out->write_escaped(s + a, b - a);
+    out->write_lit("</code>");
+    i = close + ticks;
+    continue;
+   }
+   out->write_escaped(s + i, ticks);
+   i += ticks;
+   continue;
+  }
+  // Inline math: $...$
+  if (c == '$' && i + 1u < n && s[i + 1u] != '$' && s[i + 1u] != ' ' && s[i + 1u] != '\t') {
+   uint32_t close = i + 1u;
+   while (close < n) {
+    if (s[close] == '\\' && close + 1u < n) { close += 2u; continue; }
+    if (s[close] == '$') break;
+    ++close;
+   }
+   if (close < n && close > i + 1u && s[close - 1u] != ' ' && s[close - 1u] != '\t') {
+    const bool next_digit = (close + 1u < n && s[close + 1u] >= '0' && s[close + 1u] <= '9');
+    if (!next_digit) {
+     out->write_lit("<span class=\"math\">");
+     out->write_escaped(s + i + 1u, close - (i + 1u));
+     out->write_lit("</span>");
+     i = close + 1u;
+     continue;
+    }
+   }
+  }
+  // Inline image: ![alt](src)
+  if (c == '!' && i + 1u < n && s[i + 1u] == '[') {
+   uint32_t rb = i + 2u;
+   while (rb < n && s[rb] != ']') {
+    if (s[rb] == '\\' && rb + 1u < n) rb += 2u;
+    else ++rb;
+   }
+   if (rb + 2u < n && s[rb] == ']' && s[rb + 1u] == '(') {
+    uint32_t rp = rb + 2u;
+    int parens = 0;
+    while (rp < n) {
+     if (s[rp] == '\\' && rp + 1u < n) { rp += 2u; continue; }
+     if (s[rp] == '(') ++parens;
+     else if (s[rp] == ')') { if (parens == 0) break; --parens; }
+     ++rp;
+    }
+    if (rp < n && s[rp] == ')') {
+     uint32_t src_a = rb + 2u, src_b = rp;
+     while (src_a < src_b && (s[src_a] == ' ' || s[src_a] == '\t')) ++src_a;
+     while (src_b > src_a && (s[src_b - 1u] == ' ' || s[src_b - 1u] == '\t')) --src_b;
+     out->write_lit("<img src=\"");
+     out->write_escaped(s + src_a, src_b - src_a);
+     out->write_lit("\" alt=\"");
+     out->write_escaped(s + i + 2u, rb - (i + 2u));
+     out->write_lit("\">");
+     i = rp + 1u;
+     continue;
+    }
+   }
+  }
+  // Links and footnote references: [label](url), [label][ref], [^fn]
+  if (c == '[') {
+   if (i + 2u < n && s[i + 1u] == '^') {
+    uint32_t rb = i + 2u;
+    while (rb < n && s[rb] != ']' && s[rb] != ' ' && s[rb] != '\t') ++rb;
+    if (rb > i + 2u && rb < n && s[rb] == ']') {
+     out->write_lit("<sup><a href=\"#fn-");
+     out->write_escaped(s + i + 2u, rb - (i + 2u));
+     out->write_lit("\">");
+     out->write_escaped(s + i + 2u, rb - (i + 2u));
+     out->write_lit("</a></sup>");
+     i = rb + 1u;
+     continue;
+    }
+   }
+   uint32_t rb = i + 1u;
+   int brackets = 0;
+   while (rb < n) {
+    if (s[rb] == '\\' && rb + 1u < n) { rb += 2u; continue; }
+    if (s[rb] == '[') ++brackets;
+    else if (s[rb] == ']') { if (brackets == 0) break; --brackets; }
+    ++rb;
+   }
+   if (rb < n && s[rb] == ']') {
+    const uint32_t lbl_a = i + 1u, lbl_len = rb - lbl_a;
+    if (rb + 1u < n && s[rb + 1u] == '(') {
+     uint32_t rp = rb + 2u;
+     int parens = 0;
+     while (rp < n) {
+      if (s[rp] == '\\' && rp + 1u < n) { rp += 2u; continue; }
+      if (s[rp] == '(') ++parens;
+      else if (s[rp] == ')') { if (parens == 0) break; --parens; }
+      ++rp;
+     }
+     if (rp < n && s[rp] == ')') {
+      uint32_t url_a = rb + 2u, url_b = rp;
+      while (url_a < url_b && (s[url_a] == ' ' || s[url_a] == '\t')) ++url_a;
+      while (url_b > url_a && (s[url_b - 1u] == ' ' || s[url_b - 1u] == '\t')) --url_b;
+      out->write_lit("<a href=\"");
+      out->write_escaped(s + url_a, url_b - url_a);
+      out->write_lit("\">");
+      write_inline_html(doc, s + lbl_a, lbl_len, out, depth + 1u);
+      out->write_lit("</a>");
+      i = rp + 1u;
+      continue;
+     }
+    } else if (doc && doc->ref_def_count > 0u) {
+     uint32_t ref_a = lbl_a, ref_len = lbl_len, after = rb + 1u;
+     if (rb + 1u < n && s[rb + 1u] == '[') {
+      uint32_t rb2 = rb + 2u;
+      while (rb2 < n && s[rb2] != ']') ++rb2;
+      if (rb2 < n && s[rb2] == ']') {
+       if (rb2 > rb + 2u) { ref_a = rb + 2u; ref_len = rb2 - (rb + 2u); }
+       after = rb2 + 1u;
+      }
+     }
+     const InlayRefDef* rd = inlay_doc_find_ref_def(doc, s + ref_a, ref_len);
+     if (rd) {
+      const char* uptr = rd->url_in_pool ? (doc->ast_text + rd->url_off) : (doc->source + rd->url_off);
+      out->write_lit("<a href=\"");
+      out->write_escaped(uptr, rd->url_len);
+      out->write_lit("\">");
+      write_inline_html(doc, s + lbl_a, lbl_len, out, depth + 1u);
+      out->write_lit("</a>");
+      i = after;
+      continue;
+     }
+    }
+   }
+  }
+  // Double delimiters: **bold**, __bold__, ~~del~~, ==mark==
+  if (i + 3u < n && ((c == '*' && s[i + 1u] == '*') || (c == '_' && s[i + 1u] == '_') ||
+                     (c == '~' && s[i + 1u] == '~') || (c == '=' && s[i + 1u] == '='))) {
+   const bool ok_open = (c != '_') || (i == 0u || !html_is_ascii_alnum(s[i - 1u]));
+   if (ok_open && s[i + 2u] != ' ' && s[i + 2u] != '\t') {
+    uint32_t close = UINT32_MAX;
+    for (uint32_t p = i + 2u; p + 1u < n; ++p) {
+     if (s[p] == '\\' && p + 1u < n) { ++p; continue; }
+     if (s[p] == c && s[p + 1u] == c && s[p - 1u] != ' ' && s[p - 1u] != '\t') {
+      if (c == '_' && p + 2u < n && html_is_ascii_alnum(s[p + 2u])) continue;
+      close = p;
+      break;
+     }
+    }
+    if (close != UINT32_MAX && close > i + 2u) {
+     const char* open_tag = (c == '~') ? "<del>" : (c == '=' ? "<mark>" : "<strong>");
+     const char* close_tag = (c == '~') ? "</del>" : (c == '=' ? "</mark>" : "</strong>");
+     out->write_lit(open_tag);
+     write_inline_html(doc, s + i + 2u, close - (i + 2u), out, depth + 1u);
+     out->write_lit(close_tag);
+     i = close + 2u;
+     continue;
+    }
+   }
+  }
+  // Single emphasis: *em* or _em_
+  if (i + 2u < n && (c == '*' || c == '_') && s[i + 1u] != c && s[i + 1u] != ' ' && s[i + 1u] != '\t') {
+   const bool ok_open = (c != '_') || (i == 0u || !html_is_ascii_alnum(s[i - 1u]));
+   if (ok_open) {
+    uint32_t close = UINT32_MAX;
+    for (uint32_t p = i + 1u; p < n; ++p) {
+     if (s[p] == '\\' && p + 1u < n) { ++p; continue; }
+     if (s[p] == c && s[p - 1u] != ' ' && s[p - 1u] != '\t') {
+      if (p + 1u < n && s[p + 1u] == c) { ++p; continue; }
+      if (c == '_' && p + 1u < n && html_is_ascii_alnum(s[p + 1u])) continue;
+      close = p;
+      break;
+     }
+    }
+    if (close != UINT32_MAX && close > i + 1u) {
+     out->write_lit("<em>");
+     write_inline_html(doc, s + i + 1u, close - (i + 1u), out, depth + 1u);
+     out->write_lit("</em>");
+     i = close + 1u;
+     continue;
+    }
+   }
+  }
+  // Plain character
+  out->write_escaped(s + i, 1u);
+  ++i;
+ }
+}
+
+const char* html_alert_class(uint8_t kind) noexcept {
+ switch (kind) {
+  case INLAY_ALERT_TIP:       return "tip";
+  case INLAY_ALERT_IMPORTANT: return "important";
+  case INLAY_ALERT_WARNING:   return "warning";
+  case INLAY_ALERT_CAUTION:   return "caution";
+  default:                    return "note";
+ }
+}
+
+void write_table_cells_html(const InlayDoc* doc, const char* line, uint32_t len, bool header, HtmlOut* out) noexcept {
+ uint32_t a = 0u, b = len;
+ while (a < b && (line[a] == ' ' || line[a] == '\t')) ++a;
+ while (b > a && (line[b - 1u] == ' ' || line[b - 1u] == '\t')) --b;
+ if (a < b && line[a] == '|') ++a;
+ if (b > a && line[b - 1u] == '|' && !(b >= a + 2u && line[b - 2u] == '\\')) --b;
+ out->write_lit("<tr>");
+ uint32_t p = a;
+ while (p <= b) {
+  uint32_t cell_end = p;
+  while (cell_end < b) {
+   if (line[cell_end] == '\\' && cell_end + 1u < b) { cell_end += 2u; continue; }
+   if (line[cell_end] == '|') break;
+   ++cell_end;
+  }
+  uint32_t ca = p, cb = cell_end;
+  while (ca < cb && (line[ca] == ' ' || line[ca] == '\t')) ++ca;
+  while (cb > ca && (line[cb - 1u] == ' ' || line[cb - 1u] == '\t')) --cb;
+  out->write_lit(header ? "<th>" : "<td>");
+  write_inline_html(doc, line + ca, cb - ca, out);
+  out->write_lit(header ? "</th>" : "</td>");
+  if (cell_end >= b) break;
+  p = cell_end + 1u;
+ }
+ out->write_lit("</tr>\n");
+}
+} // namespace
+
+extern "C" {
+INLAY_API uint32_t inlay_doc_export_html(const InlayDoc* doc, char* out_buf, uint32_t cap) {
+ if (!doc) {
+  if (out_buf && cap > 0u) out_buf[0] = 0;
+  return 0u;
+ }
+ inlay_doc_parse_pending(const_cast<InlayDoc*>(doc));
+ HtmlOut out = {out_buf, cap, 0u};
+ const char* src = doc->source;
+ const uint32_t src_len = doc->source_size;
+
+ for (uint32_t bi = 0u; bi < doc->block_count; ++bi) {
+  const InlayBlock& b = doc->blocks[bi];
+  const InlayBlockMeta& meta = doc->block_meta[bi];
+  const bool synthetic = (b.flags & INLAY_BLOCK_FLAG_SYNTHETIC) != 0u;
+  const char* body_ptr = synthetic ? (doc->ast_text + meta.pool_offset)
+   : (b.content_offset <= src_len ? src + b.content_offset : src);
+  const uint32_t body_len = synthetic ? meta.pool_length
+   : (b.content_offset <= src_len ? (b.content_length <= src_len - b.content_offset ? b.content_length : src_len - b.content_offset) : 0u);
+
+  switch (b.kind) {
+   case INLAY_HEADING: {
+    const uint32_t lvl = b.level < 1u ? 1u : (b.level > 6u ? 6u : b.level);
+    const char open_h[4] = {'<', 'h', char('0' + lvl), '>'};
+    const char close_h[6] = {'<', '/', 'h', char('0' + lvl), '>', '\n'};
+    const uint32_t trim_n = html_trim_eol(body_ptr, body_len);
+    out.write(open_h, 4u);
+    write_inline_html(doc, body_ptr, trim_n, &out);
+    out.write(close_h, 6u);
+    break;
+   }
+   case INLAY_PARAGRAPH: {
+    out.write_lit("<p>");
+    uint32_t pos = 0u;
+    bool first_line = true;
+    while (pos < body_len) {
+     uint32_t e = pos;
+     while (e < body_len && body_ptr[e] != '\n') ++e;
+     uint32_t ll = html_trim_eol(body_ptr + pos, e - pos);
+     const uint32_t q = b.quote_depth ? html_strip_quotes(body_ptr + pos, ll, b.quote_depth) : 0u;
+     if (!first_line) out.write_char('\n');
+     first_line = false;
+     write_inline_html(doc, body_ptr + pos + q, ll - q, &out);
+     pos = e < body_len ? e + 1u : e;
+    }
+    out.write_lit("</p>\n");
+    break;
+   }
+   case INLAY_CODE_BLOCK: {
+    const char* lang_ptr = b.language_offset <= src_len ? src + b.language_offset : src;
+    const uint32_t lang_len = b.language_offset <= src_len
+     ? (b.language_length <= src_len - b.language_offset ? b.language_length : src_len - b.language_offset) : 0u;
+    const bool is_mermaid = lang_len == 7u && std::memcmp(lang_ptr, "mermaid", 7u) == 0;
+    if (is_mermaid) {
+     out.write_lit("<div class=\"mermaid\">");
+     out.write_escaped(body_ptr, body_len);
+     out.write_lit("</div>\n");
+    } else {
+     out.write_lit("<pre><code");
+     if (lang_len > 0u) {
+      out.write_lit(" class=\"language-");
+      out.write_escaped(lang_ptr, lang_len);
+      out.write_char('"');
+     }
+     out.write_char('>');
+     out.write_escaped(body_ptr, body_len);
+     out.write_lit("</code></pre>\n");
+    }
+    break;
+   }
+   case INLAY_BLOCKQUOTE:
+   case INLAY_ALERT: {
+    if (b.kind == INLAY_ALERT) {
+     out.write_lit("<blockquote class=\"alert alert-");
+     out.write_lit(html_alert_class(b.alert_kind));
+     out.write_lit("\"><p>");
+    } else {
+     out.write_lit("<blockquote><p>");
+    }
+    const uint16_t qd = b.quote_depth ? b.quote_depth : 1u;
+    uint32_t pos = 0u;
+    bool first_line = true;
+    bool emitted_line = false;
+    while (pos < body_len) {
+     uint32_t e = pos;
+     while (e < body_len && body_ptr[e] != '\n') ++e;
+     uint32_t ll = html_trim_eol(body_ptr + pos, e - pos);
+     const uint32_t q = html_strip_quotes(body_ptr + pos, ll, qd);
+     const char* lp = body_ptr + pos + q;
+     const uint32_t lrem = ll - q;
+     if (first_line && b.kind == INLAY_ALERT && starts(lp, lrem, "[!")) {
+      first_line = false;
+      pos = e < body_len ? e + 1u : e;
+      continue;
+     }
+     first_line = false;
+     if (emitted_line) out.write_char('\n');
+     emitted_line = true;
+     write_inline_html(doc, lp, lrem, &out);
+     pos = e < body_len ? e + 1u : e;
+    }
+    out.write_lit("</p></blockquote>\n");
+    break;
+   }
+   case INLAY_LIST:
+   case INLAY_TASK_LIST: {
+    if (meta.list_item_count > 0u && meta.list_item_first + meta.list_item_count <= doc->list_item_count) {
+     const bool ordered = doc->list_items[meta.list_item_first].ordered != 0u;
+     out.write_lit(ordered ? "<ol>\n" : "<ul>\n");
+     for (uint32_t k = 0u; k < meta.list_item_count; ++k) {
+      const InlayListItemMeta& it = doc->list_items[meta.list_item_first + k];
+      const uint32_t off = it.content_offset <= src_len ? it.content_offset : src_len;
+      const uint32_t len = it.content_length <= src_len - off ? it.content_length : src_len - off;
+      uint32_t ll = html_trim_eol(src + off, len);
+      uint32_t skip = b.quote_depth ? html_strip_quotes(src + off, ll, b.quote_depth) : 0u;
+      skip += html_strip_list_marker(src + off + skip, ll - skip, nullptr, nullptr, nullptr);
+      out.write_lit("<li>");
+      if (it.is_task) {
+       const bool chk = (it.task_mark_offset < src_len) ? (src[it.task_mark_offset] != ' ') : (it.checked != 0u);
+       out.write_lit(chk ? "<input type=\"checkbox\" disabled checked> " : "<input type=\"checkbox\" disabled> ");
+      }
+      write_inline_html(doc, src + off + skip, ll - skip, &out);
+      out.write_lit("</li>\n");
+     }
+     out.write_lit(ordered ? "</ol>\n" : "</ul>\n");
+    } else {
+     const bool ordered = (b.flags & INLAY_BLOCK_FLAG_ORDERED) != 0u;
+     out.write_lit(ordered ? "<ol>\n" : "<ul>\n");
+     uint32_t pos = 0u;
+     while (pos < body_len) {
+      uint32_t e = pos;
+      while (e < body_len && body_ptr[e] != '\n') ++e;
+      uint32_t ll = html_trim_eol(body_ptr + pos, e - pos);
+      uint32_t skip = b.quote_depth ? html_strip_quotes(body_ptr + pos, ll, b.quote_depth) : 0u;
+      bool is_task = false, checked = false;
+      skip += html_strip_list_marker(body_ptr + pos + skip, ll - skip, nullptr, &is_task, &checked);
+      if (ll > 0u) {
+       out.write_lit("<li>");
+       if (is_task) out.write_lit(checked ? "<input type=\"checkbox\" disabled checked> " : "<input type=\"checkbox\" disabled> ");
+       write_inline_html(doc, body_ptr + pos + skip, ll - skip, &out);
+       out.write_lit("</li>\n");
+      }
+      pos = e < body_len ? e + 1u : e;
+     }
+     out.write_lit(ordered ? "</ol>\n" : "</ul>\n");
+    }
+    break;
+   }
+   case INLAY_TABLE: {
+    out.write_lit("<table>\n");
+    uint32_t pos = 0u;
+    uint32_t row_idx = 0u;
+    bool tbody_open = false;
+    while (pos < body_len) {
+     uint32_t e = pos;
+     while (e < body_len && body_ptr[e] != '\n') ++e;
+     uint32_t ll = html_trim_eol(body_ptr + pos, e - pos);
+     const uint32_t q = b.quote_depth ? html_strip_quotes(body_ptr + pos, ll, b.quote_depth) : 0u;
+     const char* lp = body_ptr + pos + q;
+     const uint32_t lrem = ll - q;
+     if (row_idx == 0u) {
+      out.write_lit("<thead>\n");
+      write_table_cells_html(doc, lp, lrem, true, &out);
+      out.write_lit("</thead>\n");
+     } else if (row_idx == 1u && inlay_table_rule(lp, lrem)) {
+      // Skip Markdown table alignment delimiter row
+     } else {
+      if (!tbody_open) { out.write_lit("<tbody>\n"); tbody_open = true; }
+      write_table_cells_html(doc, lp, lrem, false, &out);
+     }
+     ++row_idx;
+     pos = e < body_len ? e + 1u : e;
+    }
+    if (tbody_open) out.write_lit("</tbody>\n");
+    out.write_lit("</table>\n");
+    break;
+   }
+   case INLAY_THEMATIC_BREAK:
+    out.write_lit("<hr>\n");
+    break;
+   case INLAY_IMAGE: {
+    const char* img_src = b.language_offset <= src_len ? src + b.language_offset : src;
+    const uint32_t img_src_len = b.language_offset <= src_len
+     ? (b.language_length <= src_len - b.language_offset ? b.language_length : src_len - b.language_offset) : 0u;
+    out.write_lit("<figure><img src=\"");
+    out.write_escaped(img_src, img_src_len);
+    out.write_lit("\" alt=\"");
+    out.write_escaped(body_ptr, body_len);
+    out.write_lit("\"></figure>\n");
+    break;
+   }
+   case INLAY_MATH_BLOCK:
+    out.write_lit("<div class=\"math\">");
+    out.write_escaped(body_ptr, body_len);
+    out.write_lit("</div>\n");
+    break;
+   case INLAY_DETAILS: {
+    uint32_t sum_a = 0u, sum_b = 0u, det_body = 0u, det_end = body_len;
+    uint32_t p = 0u;
+    while (p + 9u <= body_len && std::memcmp(body_ptr + p, "<summary>", 9u) != 0) ++p;
+    if (p + 9u <= body_len) {
+     sum_a = p + 9u;
+     sum_b = sum_a;
+     while (sum_b < body_len && body_ptr[sum_b] != '<') ++sum_b;
+     det_body = sum_b;
+     while (det_body < body_len && body_ptr[det_body] != '\n') ++det_body;
+     if (det_body < body_len) ++det_body;
+    }
+    for (uint32_t k = det_body; k + 10u <= body_len; ++k) {
+     if (std::memcmp(body_ptr + k, "</details>", 10u) == 0) { det_end = k; break; }
+    }
+    out.write_lit("<details><summary>");
+    if (sum_b > sum_a) write_inline_html(doc, body_ptr + sum_a, sum_b - sum_a, &out);
+    else out.write_lit("Details");
+    out.write_lit("</summary>");
+    if (det_end > det_body) {
+     const uint32_t db_trim = html_trim_eol(body_ptr + det_body, det_end - det_body);
+     write_inline_html(doc, body_ptr + det_body, db_trim, &out);
+    }
+    out.write_lit("</details>\n");
+    break;
+   }
+   case INLAY_FOOTNOTE: {
+    const char* fn_id = b.language_offset <= src_len ? src + b.language_offset : src;
+    const uint32_t fn_len = b.language_offset <= src_len
+     ? (b.language_length <= src_len - b.language_offset ? b.language_length : src_len - b.language_offset) : 0u;
+    out.write_lit("<aside class=\"footnote\" id=\"fn-");
+    out.write_escaped(fn_id, fn_len);
+    out.write_lit("\">");
+    write_inline_html(doc, body_ptr, html_trim_eol(body_ptr, body_len), &out);
+    out.write_lit("</aside>\n");
+    break;
+   }
+  }
+ }
+
+ if (out_buf && cap > 0u) {
+  out_buf[out.len < cap - 1u ? out.len : (cap - 1u)] = '\0';
+ }
+ return out.len;
+}
+} // extern "C"

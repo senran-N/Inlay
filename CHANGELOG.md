@@ -2,6 +2,32 @@
 
 ## [Unreleased]
 
+- Add structured AI conversation & tool-result streams (`InlayStream`: stable
+  64-bit IDs, in-place upsert, streaming delta append, resumable cursor, and
+  JSON session import/export) plus budgeted `inlay_inbox_drain_to_surface`.
+- Add verifiable Generative UI JSON schema validation & safe static rendering
+  (`inlay_genui_validate_json`, `inlay_genui_list_actions`,
+  `inlay_genui_render_to_surface`), action permission policies & audit hooks
+  (`inlay_surface_set_action_policy`, `inlay_surface_set_action_audit_hook`),
+  W3C DTCG Design Tokens import/export (`inlay_tokens_import_theme`/
+  `export_theme`), and TypeScript `.d.ts` generation (`inlay_surface_export_dts`).
+- Upgrade `InlaySurface` reactivity & widgets: native node subtree caching for
+  `memo()` (`inlay_surface_memo_reused_nodes`), reusable host-owned million-row
+  `InlayModel` bound to `<VirtualList>`/`<Tree>`, responsive & container-query
+  `cls` prefixes (`sm:`/`md:`/`lg:`/`xl:`/`@sm:`/`@md:`/`@lg:`), custom slot
+  intrinsic measurement & A11y (`inlay_surface_bind_slot_ex`), grouped `<Form>`
+  validation & unified submit, scoped event consumption (`stopPropagation`), and
+  `<CodeEditor>` inline ghost-text / search highlight bridging.
+- Add cross-frame Mermaid layout LRU caching (`inlay_doc_diagram_cache_stats`),
+  semantic A11y emission for documents/headings/links/math/diagrams, semantic
+  HTML5 & standalone vector SVG exports (`inlay_doc_export_html`,
+  `inlay_diagram_export_svg`, `inlay_math_export_svg`), and a non-blocking async
+  image loader (`InlayImageLoader`) with bounded VRAM LRU eviction.
+- Add Portal navigation policy, origin allowlist, history back/forward/reload,
+  bidirectional host↔web message bridge (`inlay_portal_set_policy`,
+  `inlay_portal_post_message`, `inlay_portal_poll_message`, WebView2 wiring),
+  and unified `inlay_portal_end_frame_sync`.
+
 - Add JSX error boundaries with panel-local fallback rendering, cleanup and retry.
 - Add keyed component memoization with nested hook invalidation and effect cleanup.
 - Expose a native JSX code editor backed by a named, host-owned Etch text buffer.

@@ -614,6 +614,9 @@ struct ActionBinding {
 struct SlotBinding {
     char name[64];
     InlaySlotRenderFn callback;
+    InlaySlotMeasureFn measure_callback;
+    EtchA11yRole a11y_role;
+    char a11y_label[64];
     void* user;
 };
 
@@ -729,6 +732,9 @@ struct InlaySurface {
     double frequency;
     bool running, drawing, draw_parent_col, timed_out, pending_state, state_dirty, loaded, hmr_file_error;
     bool hide_tree_guide;
+    float last_view_width_px;
+    float current_container_width_px;
+    uint64_t memo_reused_nodes;
     JSValue rejections[32];
     uint32_t rejection_count;
     InlaySurfaceStats stats;

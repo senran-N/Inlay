@@ -1,8 +1,76 @@
 #include "inlay_internal.h"
 #include <cmath>
+#include <cstddef>
+#include <cstdio>
 #include <cstring>
 
 namespace {
+struct DiagramChunk {
+    DiagramChunk* next;
+    size_t used;
+    size_t cap;
+    size_t reserved;
+    uint8_t data[16];
+};
+
+struct DiagramHeapArena {
+    DiagramChunk* head;
+    void* alloc(size_t bytes, size_t align) noexcept {
+        if (align < 1u) align = 1u;
+        if (bytes == 0u) bytes = 1u;
+        if (head) {
+            const size_t cur = (head->used + align - 1u) & ~(align - 1u);
+            if (cur + bytes <= head->cap) {
+                head->used = cur + bytes;
+                return head->data + cur;
+            }
+        }
+        const size_t need = bytes + align + 4096u;
+        const size_t chunk_cap = need > 16384u ? need : 16384u;
+        auto* c = static_cast<DiagramChunk*>(SDL_malloc(offsetof(DiagramChunk, data) + chunk_cap));
+        if (!c) return nullptr;
+        c->next = head;
+        c->used = 0u;
+        c->cap = chunk_cap;
+        head = c;
+        const size_t cur = (c->used + align - 1u) & ~(align - 1u);
+        c->used = cur + bytes;
+        return c->data + cur;
+    }
+    void destroy() noexcept {
+        while (head) {
+            DiagramChunk* nx = head->next;
+            SDL_free(head);
+            head = nx;
+        }
+    }
+};
+
+struct DiagramEnv {
+    EtchContext* ctx;
+    DiagramHeapArena* heap;
+    bool use_etch_fonts;
+
+    void* alloc(size_t bytes, size_t align) const noexcept {
+        if (heap) return heap->alloc(bytes, align);
+        return etch_frame_arena_alloc(ctx, bytes, align);
+    }
+    float line_height(uint16_t font_id, float font_size) const noexcept {
+        if (use_etch_fonts) return std::fmax(etch_font_metrics(font_id, font_size).line_height, font_size * 1.25f);
+        return font_size * 1.25f;
+    }
+    EtchVec2 measure_text(EtchStr s, uint16_t font_id, float font_size) const noexcept {
+        if (use_etch_fonts) return etch_measure_text(s, font_id, font_size, 0);
+        size_t pos = 0u;
+        float units = 0.0f;
+        while (pos < s.length) {
+            const uint32_t cp = inlay_utf8_next(s.chars, s.length, &pos);
+            units += (cp > 0x2E7Fu) ? 1.0f : 0.56f;
+        }
+        return { units * font_size, font_size * 1.25f };
+    }
+};
+
 struct Graph {
     EtchStr source;
     uint32_t pos;
@@ -72,8 +140,8 @@ uint32_t match_br_tag(const char* s, uint32_t len, uint32_t pos) noexcept {
     return 0u;
 }
 
-EtchVec2 measure_label(EtchStr label, uint16_t font_id, float font_size, float* out_line_h = nullptr) noexcept {
-    const float line_h = std::fmax(etch_font_metrics(font_id, font_size).line_height, font_size * 1.25f);
+EtchVec2 measure_label_env(EtchStr label, uint16_t font_id, float font_size, const DiagramEnv& env, float* out_line_h = nullptr) noexcept {
+    const float line_h = env.line_height(font_id, font_size);
     if (out_line_h) *out_line_h = line_h;
     if (!label.chars || !label.length) return { 0.0f, 0.0f };
     bool multiline = false;
@@ -81,7 +149,7 @@ EtchVec2 measure_label(EtchStr label, uint16_t font_id, float font_size, float* 
         if (match_br_tag(label.chars, label.length, i) > 0u) { multiline = true; break; }
     }
     if (!multiline) {
-        return etch_measure_text(label, font_id, font_size, 0);
+        return env.measure_text(label, font_id, font_size);
     }
     float max_w = 0.0f;
     uint32_t lines = 0;
@@ -96,7 +164,7 @@ EtchVec2 measure_label(EtchStr label, uint16_t font_id, float font_size, float* 
         }
         const EtchStr seg = trim_slice(label, pos, stop);
         if (seg.length) {
-            const float w = etch_measure_text(seg, font_id, font_size, 0).x;
+            const float w = env.measure_text(seg, font_id, font_size).x;
             max_w = std::fmax(max_w, w);
         }
         ++lines;
@@ -104,6 +172,11 @@ EtchVec2 measure_label(EtchStr label, uint16_t font_id, float font_size, float* 
         pos = stop + tag_len;
     }
     return { max_w, float(lines ? lines : 1u) * line_h };
+}
+
+EtchVec2 measure_label(EtchStr label, uint16_t font_id, float font_size, float* out_line_h = nullptr) noexcept {
+    const DiagramEnv env = { nullptr, nullptr, true };
+    return measure_label_env(label, font_id, font_size, env, out_line_h);
 }
 
 void draw_label(EtchStr label, EtchVec2 top_pos, uint16_t font_id, float font_size, EtchColor color,
@@ -525,12 +598,9 @@ void draw_arrowhead(EtchVec2 tip, EtchVec2 tangent, EtchColor color, float scale
     arrow.fill = color;
     etch_draw_filled_polygon(&arrow);
 }
-} // namespace
-
-InlayDiagramResult inlay_diagram_layout_ex(EtchStr source, const InlayDiagramDesc* input, InlayDiagramMeta* out_meta) noexcept {
+InlayDiagramResult diagram_layout_core(EtchStr source, const InlayDiagramDesc* input, InlayDiagramMeta* out_meta, const DiagramEnv& env) noexcept {
     if (out_meta) *out_meta = {};
-    auto* ctx = etch_current_context();
-    if (!ctx || !etch_frame_in_progress(ctx) || !input || !source.chars || source.length > 16384 ||
+    if (!input || !source.chars || source.length > 16384 ||
         !std::isfinite(input->pos.x) || !std::isfinite(input->pos.y) ||
         !std::isfinite(input->font_size_px) || input->font_size_px < 6 || input->font_size_px > 128 ||
         !std::isfinite(input->node_gap_px) || input->node_gap_px < 0 || input->node_gap_px > 4096 ||
@@ -606,12 +676,12 @@ InlayDiagramResult inlay_diagram_layout_ex(EtchStr source, const InlayDiagramDes
     g.node_capacity = body < kNodeCap ? body : kNodeCap;
     const uint32_t edge_cap = body < kEdgeCap ? body : kEdgeCap;
     const uint32_t subgraph_cap = body < kSubgraphCap ? body : kSubgraphCap;
-    auto* nodes = static_cast<InlayDiagramNode*>(etch_frame_arena_alloc(ctx, size_t(g.node_capacity) * sizeof(InlayDiagramNode), alignof(InlayDiagramNode)));
-    auto* edges = static_cast<InlayDiagramEdge*>(etch_frame_arena_alloc(ctx, size_t(edge_cap) * sizeof(InlayDiagramEdge), alignof(InlayDiagramEdge)));
-    auto* edge_styles = static_cast<uint8_t*>(etch_frame_arena_alloc(ctx, size_t(edge_cap), 1));
-    auto* shapes = static_cast<InlayDiagramShape*>(etch_frame_arena_alloc(ctx, size_t(g.node_capacity) * sizeof(InlayDiagramShape), alignof(InlayDiagramShape)));
-    auto* node_sub = static_cast<int32_t*>(etch_frame_arena_alloc(ctx, size_t(g.node_capacity) * sizeof(int32_t), alignof(int32_t)));
-    auto* subgraphs = static_cast<InlayDiagramSubgraph*>(etch_frame_arena_alloc(ctx, size_t(subgraph_cap) * sizeof(InlayDiagramSubgraph), alignof(InlayDiagramSubgraph)));
+    auto* nodes = static_cast<InlayDiagramNode*>(env.alloc(size_t(g.node_capacity) * sizeof(InlayDiagramNode), alignof(InlayDiagramNode)));
+    auto* edges = static_cast<InlayDiagramEdge*>(env.alloc(size_t(edge_cap) * sizeof(InlayDiagramEdge), alignof(InlayDiagramEdge)));
+    auto* edge_styles = static_cast<uint8_t*>(env.alloc(size_t(edge_cap), 1));
+    auto* shapes = static_cast<InlayDiagramShape*>(env.alloc(size_t(g.node_capacity) * sizeof(InlayDiagramShape), alignof(InlayDiagramShape)));
+    auto* node_sub = static_cast<int32_t*>(env.alloc(size_t(g.node_capacity) * sizeof(int32_t), alignof(int32_t)));
+    auto* subgraphs = static_cast<InlayDiagramSubgraph*>(env.alloc(size_t(subgraph_cap) * sizeof(InlayDiagramSubgraph), alignof(InlayDiagramSubgraph)));
     if (!nodes || !edges || !edge_styles || !shapes || !node_sub || !subgraphs) return {};
     g.nodes = nodes;
     g.shapes = shapes;
@@ -662,11 +732,11 @@ InlayDiagramResult inlay_diagram_layout_ex(EtchStr source, const InlayDiagramDes
             const float eff_rank_gap = input->rank_gap_px * s;
             float width = 0.0f, max_message = 0.0f, max_box_h = eff_font * 1.5f + 24.0f * s;
             for (uint32_t i = 0; i < g.edge_count; ++i) {
-                const auto msz = measure_label(edges[i].label, body_font, caption_font);
+                const auto msz = measure_label_env(edges[i].label, body_font, caption_font, env);
                 max_message = std::fmax(max_message, msz.x + 24.0f * s);
             }
             for (uint32_t i = 0; i < g.node_count; ++i) {
-                const auto sz = measure_label(nodes[i].label, body_font, eff_font);
+                const auto sz = measure_label_env(nodes[i].label, body_font, eff_font, env);
                 const float bh = std::fmax(eff_font * 1.5f, sz.y) + 24.0f * s;
                 max_box_h = std::fmax(max_box_h, bh);
                 nodes[i].bounds = { input->pos.x + width, input->pos.y, std::fmax(sz.x + 32.0f * s, max_message), bh };
@@ -765,10 +835,10 @@ InlayDiagramResult inlay_diagram_layout_ex(EtchStr source, const InlayDiagramDes
     if (!g.valid || !g.node_count || sub_depth) return syntax_failure(g.pos);
 
     // 1. Iterative DFS reverses feedback edges so remaining orientation is acyclic.
-    auto* colors = static_cast<uint8_t*>(etch_frame_arena_alloc(ctx, g.node_count, 1));
-    auto* stack = static_cast<uint32_t*>(etch_frame_arena_alloc(ctx, size_t(g.node_count) * sizeof(uint32_t), alignof(uint32_t)));
-    auto* cursor = static_cast<uint32_t*>(etch_frame_arena_alloc(ctx, size_t(g.node_count) * sizeof(uint32_t), alignof(uint32_t)));
-    auto* topo = static_cast<uint32_t*>(etch_frame_arena_alloc(ctx, size_t(g.node_count) * sizeof(uint32_t), alignof(uint32_t)));
+    auto* colors = static_cast<uint8_t*>(env.alloc(g.node_count, 1));
+    auto* stack = static_cast<uint32_t*>(env.alloc(size_t(g.node_count) * sizeof(uint32_t), alignof(uint32_t)));
+    auto* cursor = static_cast<uint32_t*>(env.alloc(size_t(g.node_count) * sizeof(uint32_t), alignof(uint32_t)));
+    auto* topo = static_cast<uint32_t*>(env.alloc(size_t(g.node_count) * sizeof(uint32_t), alignof(uint32_t)));
     if (!colors || !stack || !cursor || !topo) return {};
     std::memset(colors, 0, g.node_count);
     std::memset(cursor, 0, size_t(g.node_count) * sizeof(uint32_t));
@@ -814,14 +884,14 @@ InlayDiagramResult inlay_diagram_layout_ex(EtchStr source, const InlayDiagramDes
     }
     const uint32_t vnode_count = g.node_count + dummy_count;
     const uint32_t vedge_cap = g.edge_count + dummy_count;
-    auto* vrank = static_cast<uint32_t*>(etch_frame_arena_alloc(ctx, size_t(vnode_count) * sizeof(uint32_t), alignof(uint32_t)));
-    auto* order = static_cast<uint32_t*>(etch_frame_arena_alloc(ctx, size_t(vnode_count) * sizeof(uint32_t), alignof(uint32_t)));
-    auto* pos_in_rank = static_cast<uint32_t*>(etch_frame_arena_alloc(ctx, size_t(vnode_count) * sizeof(uint32_t), alignof(uint32_t)));
-    auto* bary = static_cast<float*>(etch_frame_arena_alloc(ctx, size_t(vnode_count) * sizeof(float), alignof(float)));
-    auto* vedges = static_cast<VEdge*>(etch_frame_arena_alloc(ctx, size_t(vedge_cap ? vedge_cap : 1u) * sizeof(VEdge), alignof(VEdge)));
-    auto* edge_paths = static_cast<InlayDiagramEdgePath*>(etch_frame_arena_alloc(ctx, size_t(g.edge_count ? g.edge_count : 1u) * sizeof(InlayDiagramEdgePath), alignof(InlayDiagramEdgePath)));
-    auto* waypoints = static_cast<EtchVec2*>(etch_frame_arena_alloc(ctx, size_t(dummy_count ? dummy_count : 1u) * sizeof(EtchVec2), alignof(EtchVec2)));
-    auto* dummy_to_wp = static_cast<uint32_t*>(etch_frame_arena_alloc(ctx, size_t(dummy_count ? dummy_count : 1u) * sizeof(uint32_t), alignof(uint32_t)));
+    auto* vrank = static_cast<uint32_t*>(env.alloc(size_t(vnode_count) * sizeof(uint32_t), alignof(uint32_t)));
+    auto* order = static_cast<uint32_t*>(env.alloc(size_t(vnode_count) * sizeof(uint32_t), alignof(uint32_t)));
+    auto* pos_in_rank = static_cast<uint32_t*>(env.alloc(size_t(vnode_count) * sizeof(uint32_t), alignof(uint32_t)));
+    auto* bary = static_cast<float*>(env.alloc(size_t(vnode_count) * sizeof(float), alignof(float)));
+    auto* vedges = static_cast<VEdge*>(env.alloc(size_t(vedge_cap ? vedge_cap : 1u) * sizeof(VEdge), alignof(VEdge)));
+    auto* edge_paths = static_cast<InlayDiagramEdgePath*>(env.alloc(size_t(g.edge_count ? g.edge_count : 1u) * sizeof(InlayDiagramEdgePath), alignof(InlayDiagramEdgePath)));
+    auto* waypoints = static_cast<EtchVec2*>(env.alloc(size_t(dummy_count ? dummy_count : 1u) * sizeof(EtchVec2), alignof(EtchVec2)));
+    auto* dummy_to_wp = static_cast<uint32_t*>(env.alloc(size_t(dummy_count ? dummy_count : 1u) * sizeof(uint32_t), alignof(uint32_t)));
     if (!vrank || !order || !pos_in_rank || !bary || !vedges || !edge_paths || !waypoints || !dummy_to_wp) return {};
 
     for (uint32_t i = 0; i < g.node_count; ++i) vrank[i] = nodes[i].rank;
@@ -894,10 +964,10 @@ InlayDiagramResult inlay_diagram_layout_ex(EtchStr source, const InlayDiagramDes
     }
 
     // 5-7. Geometry placement (reusable in-place for native layout-space auto-fit).
-    auto* rank_gaps = static_cast<float*>(etch_frame_arena_alloc(ctx, size_t(max_rank ? max_rank : 1u) * sizeof(float), alignof(float)));
-    auto* rank_cross = static_cast<float*>(etch_frame_arena_alloc(ctx, size_t(max_rank + 1) * sizeof(float), alignof(float)));
-    auto* rank_start_pos = static_cast<float*>(etch_frame_arena_alloc(ctx, size_t(max_rank + 1) * sizeof(float), alignof(float)));
-    auto* rank_depth = static_cast<float*>(etch_frame_arena_alloc(ctx, size_t(max_rank + 1) * sizeof(float), alignof(float)));
+    auto* rank_gaps = static_cast<float*>(env.alloc(size_t(max_rank ? max_rank : 1u) * sizeof(float), alignof(float)));
+    auto* rank_cross = static_cast<float*>(env.alloc(size_t(max_rank + 1) * sizeof(float), alignof(float)));
+    auto* rank_start_pos = static_cast<float*>(env.alloc(size_t(max_rank + 1) * sizeof(float), alignof(float)));
+    auto* rank_depth = static_cast<float*>(env.alloc(size_t(max_rank + 1) * sizeof(float), alignof(float)));
     if (!rank_gaps || !rank_cross || !rank_start_pos || !rank_depth) return {};
 
     const auto place_geometry = [&](float s) noexcept -> EtchVec2 {
@@ -911,7 +981,7 @@ InlayDiagramResult inlay_diagram_layout_ex(EtchStr source, const InlayDiagramDes
         for (uint32_t r = 0; r < max_rank; ++r) rank_gaps[r] = eff_rank_gap;
         float label_width = 0.0f;
         for (uint32_t i = 0; i < g.edge_count; ++i) if (edges[i].label.length) {
-            const EtchVec2 lsz = measure_label(edges[i].label, body_font, caption_font);
+            const EtchVec2 lsz = measure_label_env(edges[i].label, body_font, caption_font, env);
             const float plate_w = lsz.x + 2.0f * label_pad_x;
             const float plate_h = lsz.y + 2.0f * label_pad_y;
             label_width = std::fmax(label_width, plate_w);
@@ -929,7 +999,7 @@ InlayDiagramResult inlay_diagram_layout_ex(EtchStr source, const InlayDiagramDes
         }
 
         for (uint32_t i = 0; i < g.node_count; ++i) {
-            const auto text = measure_label(nodes[i].label, body_font, eff_font);
+            const auto text = measure_label_env(nodes[i].label, body_font, eff_font, env);
             float w = text.x + 32.0f * s;
             float h = std::fmax(eff_font * 1.5f, text.y) + 24.0f * s;
             if (shapes[i] == InlayShapeDiamond) {
@@ -1035,7 +1105,7 @@ InlayDiagramResult inlay_diagram_layout_ex(EtchStr source, const InlayDiagramDes
             for (int32_t si = int32_t(g.subgraph_count) - 1; si >= 0; --si) {
                 auto& sg = subgraphs[si];
                 if (!sg.has_nodes) continue;
-                const float title_w = etch_measure_text(sg.title, bold_font, title_font, 0).x + 30.0f * s;
+                const float title_w = env.measure_text(sg.title, bold_font, title_font).x + 30.0f * s;
                 sg.bounds.x -= pad_x;
                 sg.bounds.y -= pad_top;
                 sg.bounds.w = std::fmax(sg.bounds.w + pad_x * 2.0f, title_w);
@@ -1105,6 +1175,118 @@ InlayDiagramResult inlay_diagram_layout_ex(EtchStr source, const InlayDiagramDes
         out_meta->reversed_dir = g.reverse_dir;
     }
     return { nodes, edges, g.node_count, g.edge_count, final_sz.x, final_sz.y, true, g.lr, false, final_scale, nat.x, nat.y, warnings };
+}
+
+struct DiagramSvgOut {
+    char* buf;
+    uint32_t cap;
+    uint32_t len;
+
+    void write(const char* s, uint32_t n) noexcept {
+        if (!n) return;
+        if (buf && cap > 0u && len + 1u < cap) {
+            const uint32_t avail = (cap - 1u) - len;
+            const uint32_t cp = n < avail ? n : avail;
+            if (cp > 0u) std::memcpy(buf + len, s, cp);
+        }
+        len += n;
+    }
+    void write_lit(const char* lit) noexcept {
+        write(lit, static_cast<uint32_t>(std::strlen(lit)));
+    }
+    void write_num(float v) noexcept {
+        char tmp[32];
+        const int n = std::snprintf(tmp, sizeof(tmp), "%.2f", std::isfinite(v) ? v : 0.0f);
+        if (n <= 0) return;
+        uint32_t l = static_cast<uint32_t>(n);
+        while (l > 1u && tmp[l - 1u] == '0') --l;
+        if (l > 1u && tmp[l - 1u] == '.') --l;
+        write(tmp, l);
+    }
+    void write_escaped(const char* s, uint32_t n) noexcept {
+        uint32_t run = 0u;
+        for (uint32_t i = 0u; i < n; ++i) {
+            const char* rep = nullptr;
+            switch (s[i]) {
+                case '&': rep = "&amp;"; break;
+                case '<': rep = "&lt;"; break;
+                case '>': rep = "&gt;"; break;
+                case '"': rep = "&quot;"; break;
+                default: break;
+            }
+            if (rep) {
+                if (i > run) write(s + run, i - run);
+                write_lit(rep);
+                run = i + 1u;
+            }
+        }
+        if (n > run) write(s + run, n - run);
+    }
+};
+
+void svg_emit_diagram_label(DiagramSvgOut* out, EtchStr label, float cx, float top_y, float line_h,
+                            float font_size, const char* fill_hex, const char* weight = nullptr,
+                            const char* anchor = "middle") noexcept {
+    if (!label.chars || !label.length) return;
+    uint32_t pos = 0u;
+    uint32_t line_idx = 0u;
+    while (pos <= label.length) {
+        uint32_t stop = pos;
+        uint32_t tag_len = 0u;
+        while (stop < label.length) {
+            tag_len = match_br_tag(label.chars, label.length, stop);
+            if (tag_len > 0u) break;
+            ++stop;
+        }
+        const EtchStr seg = trim_slice(label, pos, stop);
+        if (seg.length) {
+            const float y = top_y + float(line_idx) * line_h + font_size * 0.85f;
+            out->write_lit("<text x=\""); out->write_num(cx);
+            out->write_lit("\" y=\""); out->write_num(y);
+            out->write_lit("\" text-anchor=\""); out->write_lit(anchor);
+            out->write_lit("\" font-family=\"system-ui, -apple-system, sans-serif\" font-size=\"");
+            out->write_num(font_size);
+            if (weight) { out->write_lit("\" font-weight=\""); out->write_lit(weight); }
+            out->write_lit("\" fill=\""); out->write_lit(fill_hex);
+            out->write_lit("\">");
+            out->write_escaped(seg.chars, seg.length);
+            out->write_lit("</text>\n");
+        }
+        ++line_idx;
+        if (tag_len == 0u) break;
+        pos = stop + tag_len;
+    }
+}
+
+void svg_emit_bezier_polyline(DiagramSvgOut* out, const EtchBezierDesc& bz, float ox, float oy,
+                              const char* stroke, float stroke_w, bool dashed,
+                              const char* marker_start, const char* marker_end) noexcept {
+    out->write_lit("<polyline fill=\"none\" stroke=\""); out->write_lit(stroke);
+    out->write_lit("\" stroke-width=\""); out->write_num(stroke_w);
+    if (dashed) out->write_lit("\" stroke-dasharray=\"6,4");
+    if (marker_start) { out->write_lit("\" marker-start=\"url(#"); out->write_lit(marker_start); out->write_lit(")"); }
+    if (marker_end) { out->write_lit("\" marker-end=\"url(#"); out->write_lit(marker_end); out->write_lit(")"); }
+    out->write_lit("\" points=\"");
+    constexpr uint32_t kSteps = 10u;
+    for (uint32_t k = 0u; k <= kSteps; ++k) {
+        const EtchVec2 pt = curve_point(bz, float(k) / float(kSteps));
+        if (k > 0u) out->write_lit(" ");
+        out->write_num(pt.x + ox);
+        out->write_lit(",");
+        out->write_num(pt.y + oy);
+    }
+    out->write_lit("\"/>\n");
+}
+} // namespace
+
+InlayDiagramResult inlay_diagram_layout_ex(EtchStr source, const InlayDiagramDesc* input, InlayDiagramMeta* out_meta) noexcept {
+    auto* ctx = etch_current_context();
+    if (!ctx || !etch_frame_in_progress(ctx)) {
+        if (out_meta) *out_meta = {};
+        return {};
+    }
+    const DiagramEnv env = { ctx, nullptr, true };
+    return diagram_layout_core(source, input, out_meta, env);
 }
 
 void inlay_diagram_draw_ex(const InlayDiagramResult& result, const InlayDiagramDesc& input, const InlayDiagramMeta* meta) noexcept {
@@ -1438,5 +1620,254 @@ INLAY_API InlayDiagramResult inlay_diagram_view(EtchStr source, const InlayDiagr
     if (!result.valid) return result;
     inlay_diagram_draw_ex(result, input, &meta);
     return result;
+}
+
+INLAY_API uint32_t inlay_diagram_export_svg(EtchStr source, const InlayDiagramDesc* desc_in, char* out_buf, uint32_t cap) {
+    InlayDiagramDesc desc = inlay_diagram_desc_default();
+    if (desc_in && !inlay_read_abi_struct(desc_in, &desc)) {
+        if (out_buf && cap > 0u) out_buf[0] = '\0';
+        return 0u;
+    }
+    desc.canvas_id = 0u;
+    auto* ctx = etch_current_context();
+    const bool in_frame = ctx && etch_frame_in_progress(ctx);
+    DiagramHeapArena heap = {};
+    const DiagramEnv env = { ctx, &heap, in_frame };
+    InlayDiagramMeta meta = {};
+    const InlayDiagramResult result = diagram_layout_core(source, &desc, &meta, env);
+    if (!result.valid) {
+        heap.destroy();
+        if (out_buf && cap > 0u) out_buf[0] = '\0';
+        return 0u;
+    }
+
+    const float scale = (result.scale > 0.0f && std::isfinite(result.scale)) ? std::fmin(1.0f, result.scale) : 1.0f;
+    const float eff_font = std::fmax(7.0f, desc.font_size_px * scale);
+    const float caption_font = std::fmax(7.0f, std::fmax(10.0f * scale, eff_font * 0.82f));
+    const float eff_rank_gap = desc.rank_gap_px * scale;
+    const uint16_t body_font = resolve_body_font(desc);
+    const uint16_t bold_font = resolve_bold_font(desc);
+    const float stroke_normal = std::fmax(1.5f, 1.85f * scale);
+    const float stroke_thick = std::fmax(2.25f, 2.85f * scale);
+    const float border_w = std::fmax(0.85f, 1.0f * scale);
+
+    const float pad = 12.0f;
+    const float ox = pad - desc.pos.x;
+    const float oy = pad - desc.pos.y;
+    const float svg_w = std::fmax(1.0f, result.width + 2.0f * pad);
+    const float svg_h = std::fmax(1.0f, result.height + 2.0f * pad);
+
+    DiagramSvgOut out = { out_buf, cap, 0u };
+    out.write_lit("<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 ");
+    out.write_num(svg_w); out.write_lit(" "); out.write_num(svg_h);
+    out.write_lit("\" width=\""); out.write_num(svg_w);
+    out.write_lit("\" height=\""); out.write_num(svg_h);
+    out.write_lit("\">\n<defs>\n"
+                  "<marker id=\"arrow\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\">"
+                  "<path d=\"M 0 1 L 10 5 L 0 9 z\" fill=\"#4f6ef7\"/></marker>\n"
+                  "<marker id=\"arrow-rev\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\">"
+                  "<path d=\"M 0 1 L 10 5 L 0 9 z\" fill=\"#8b5cf6\"/></marker>\n"
+                  "</defs>\n");
+
+    // 1. Subgraphs
+    if (meta.subgraphs && meta.subgraph_count > 0u) {
+        const float title_font = std::fmax(7.5f, std::fmax(11.0f * scale, eff_font * 0.85f));
+        for (uint32_t si = 0u; si < meta.subgraph_count; ++si) {
+            const auto& sg = meta.subgraphs[si];
+            if (!sg.has_nodes) continue;
+            out.write_lit("<rect x=\""); out.write_num(sg.bounds.x + ox);
+            out.write_lit("\" y=\""); out.write_num(sg.bounds.y + oy);
+            out.write_lit("\" width=\""); out.write_num(sg.bounds.w);
+            out.write_lit("\" height=\""); out.write_num(sg.bounds.h);
+            out.write_lit("\" rx=\"8\" ry=\"8\" fill=\"#f1f5f9\" stroke=\"#cbd5e1\" stroke-width=\"");
+            out.write_num(border_w); out.write_lit("\"/>\n");
+            if (sg.title.length) {
+                const float line_h = env.line_height(bold_font, title_font);
+                svg_emit_diagram_label(&out, sg.title, sg.bounds.x + ox + 12.0f * scale,
+                                       sg.bounds.y + oy + 6.0f * scale, line_h, title_font, "#475569", "600", "start");
+            }
+        }
+    }
+
+    // 2. Sequence lifelines
+    if (result.sequence) {
+        for (uint32_t i = 0u; i < result.node_count; ++i) {
+            const auto b = result.nodes[i].bounds;
+            const float lx = b.x + b.w * 0.5f + ox;
+            out.write_lit("<line x1=\""); out.write_num(lx);
+            out.write_lit("\" y1=\""); out.write_num(b.y + b.h + oy);
+            out.write_lit("\" x2=\""); out.write_num(lx);
+            out.write_lit("\" y2=\""); out.write_num(desc.pos.y + result.height + oy);
+            out.write_lit("\" stroke=\"#cbd5e1\" stroke-width=\""); out.write_num(border_w);
+            out.write_lit("\" stroke-dasharray=\"4,4\"/>\n");
+        }
+    }
+
+    // 3. Edges
+    for (uint32_t i = 0u; i < result.edge_count; ++i) {
+        const auto& edge = result.edges[i];
+        const auto a = result.nodes[edge.from].bounds, b = result.nodes[edge.to].bounds;
+        const char* stroke_col = edge.reversed ? "#8b5cf6" : "#4f6ef7";
+        const char* marker_id = edge.reversed ? "arrow-rev" : "arrow";
+        const InlayDiagramEdgePath path = meta.edge_paths ? meta.edge_paths[i] : InlayDiagramEdgePath{ 0, 0, edge.reversed ? 0 : -1 };
+        const uint8_t estyle = meta.edge_styles ? meta.edge_styles[i] : uint8_t(InlayEdgeStyleNone);
+        const bool no_arrow = (estyle & InlayEdgeStyleNoArrow) != 0;
+        const bool bidir = (estyle & InlayEdgeStyleBidir) != 0;
+        const float thickness = (estyle & InlayEdgeStyleThick) ? stroke_thick : stroke_normal;
+        const bool rev_dir = meta.reversed_dir ||
+            (!result.sequence && !edge.reversed && edge.from != edge.to &&
+             (result.horizontal ? (a.x > b.x + b.w * 0.5f) : (a.y > b.y + b.h * 0.5f)));
+
+        EtchVec2 label_mid = {};
+        if (!result.sequence && !edge.reversed && edge.from != edge.to && path.point_count > 0u && meta.waypoints) {
+            const uint32_t segs = path.point_count + 1u;
+            const EtchVec2 start_pt = result.horizontal
+                ? (rev_dir ? EtchVec2{ a.x, a.y + a.h * 0.5f } : EtchVec2{ a.x + a.w, a.y + a.h * 0.5f })
+                : (rev_dir ? EtchVec2{ a.x + a.w * 0.5f, a.y } : EtchVec2{ a.x + a.w * 0.5f, a.y + a.h });
+            const EtchVec2 end_pt = result.horizontal
+                ? (rev_dir ? EtchVec2{ b.x + b.w, b.y + b.h * 0.5f } : EtchVec2{ b.x, b.y + b.h * 0.5f })
+                : (rev_dir ? EtchVec2{ b.x + b.w * 0.5f, b.y + b.h } : EtchVec2{ b.x + b.w * 0.5f, b.y });
+            out.write_lit("<polyline fill=\"none\" stroke=\""); out.write_lit(stroke_col);
+            out.write_lit("\" stroke-width=\""); out.write_num(thickness);
+            if (edge.dashed) out.write_lit("\" stroke-dasharray=\"6,4");
+            if (bidir) { out.write_lit("\" marker-start=\"url(#"); out.write_lit(marker_id); out.write_lit(")"); }
+            if (!no_arrow) { out.write_lit("\" marker-end=\"url(#"); out.write_lit(marker_id); out.write_lit(")"); }
+            out.write_lit("\" points=\"");
+            for (uint32_t s = 0u; s < segs; ++s) {
+                const EtchVec2 p0 = (s == 0u) ? start_pt : meta.waypoints[path.point_offset + s - 1u];
+                const EtchVec2 p3 = (s + 1u == segs) ? end_pt : meta.waypoints[path.point_offset + s];
+                EtchBezierDesc bz = {};
+                bz.p0 = p0; bz.p3 = p3;
+                bz.p1 = result.horizontal ? EtchVec2{ (p0.x + p3.x) * 0.5f, p0.y } : EtchVec2{ p0.x, (p0.y + p3.y) * 0.5f };
+                bz.p2 = result.horizontal ? EtchVec2{ bz.p1.x, p3.y } : EtchVec2{ p3.x, bz.p1.y };
+                if (s == segs / 2u) label_mid = curve_point(bz, 0.5f);
+                constexpr uint32_t kSub = 6u;
+                for (uint32_t k = (s == 0u ? 0u : 1u); k <= kSub; ++k) {
+                    const EtchVec2 pt = curve_point(bz, float(k) / float(kSub));
+                    if (s > 0u || k > 0u) out.write_lit(" ");
+                    out.write_num(pt.x + ox); out.write_lit(","); out.write_num(pt.y + oy);
+                }
+            }
+            out.write_lit("\"/>\n");
+        } else if (result.sequence && edge.from != edge.to) {
+            const float y = desc.pos.y + a.h + float(i + 1u) * eff_rank_gap;
+            const float x0 = a.x + a.w * 0.5f;
+            const float x1 = b.x + b.w * 0.5f;
+            out.write_lit("<line x1=\""); out.write_num(x0 + ox);
+            out.write_lit("\" y1=\""); out.write_num(y + oy);
+            out.write_lit("\" x2=\""); out.write_num(x1 + ox);
+            out.write_lit("\" y2=\""); out.write_num(y + oy);
+            out.write_lit("\" stroke=\""); out.write_lit(stroke_col);
+            out.write_lit("\" stroke-width=\""); out.write_num(thickness);
+            if (edge.dashed) out.write_lit("\" stroke-dasharray=\"6,4");
+            if (!no_arrow) { out.write_lit("\" marker-end=\"url(#"); out.write_lit(marker_id); out.write_lit(")"); }
+            out.write_lit("\"/>\n");
+            label_mid = { (x0 + x1) * 0.5f, y };
+        } else {
+            EtchBezierDesc bz = {};
+            if (result.horizontal) {
+                bz.p0 = rev_dir ? EtchVec2{ a.x, a.y + a.h * 0.5f } : EtchVec2{ a.x + a.w, a.y + a.h * 0.5f };
+                bz.p3 = rev_dir ? EtchVec2{ b.x + b.w, b.y + b.h * 0.5f } : EtchVec2{ b.x, b.y + b.h * 0.5f };
+            } else {
+                bz.p0 = rev_dir ? EtchVec2{ a.x + a.w * 0.5f, a.y } : EtchVec2{ a.x + a.w * 0.5f, a.y + a.h };
+                bz.p3 = rev_dir ? EtchVec2{ b.x + b.w * 0.5f, b.y + b.h } : EtchVec2{ b.x + b.w * 0.5f, b.y };
+            }
+            bz.p1 = result.horizontal ? EtchVec2{ (bz.p0.x + bz.p3.x) * 0.5f, bz.p0.y } : EtchVec2{ bz.p0.x, (bz.p0.y + bz.p3.y) * 0.5f };
+            bz.p2 = result.horizontal ? EtchVec2{ bz.p1.x, bz.p3.y } : EtchVec2{ bz.p3.x, bz.p1.y };
+            if (edge.reversed) {
+                const float lane_off = float(path.feedback_lane >= 0 ? path.feedback_lane : 0) * 18.0f * scale;
+                if (result.horizontal) {
+                    const float route = desc.pos.y + result.height - 8.0f * scale - lane_off;
+                    bz.p0 = { a.x + a.w * 0.5f, a.y + a.h };
+                    bz.p3 = { b.x + b.w * 0.5f, b.y + b.h };
+                    bz.p1 = { bz.p0.x, route };
+                    bz.p2 = { bz.p3.x, route };
+                } else {
+                    const float route = desc.pos.x + result.width - 8.0f * scale - lane_off;
+                    bz.p0 = { a.x + a.w, a.y + a.h * 0.5f };
+                    bz.p3 = { b.x + b.w, b.y + b.h * 0.5f };
+                    bz.p1 = { route, bz.p0.y };
+                    bz.p2 = { route, bz.p3.y };
+                }
+            }
+            if (edge.from == edge.to) {
+                const float loop_y = result.sequence ? (desc.pos.y + a.h + float(i + 1u) * eff_rank_gap) : (a.y + a.h * 0.5f);
+                const float loop_x = result.sequence ? (a.x + a.w * 0.5f) : (a.x + a.w);
+                const float loop_r = 40.0f * scale;
+                const float loop_dy = 12.0f * scale;
+                bz.p0 = { loop_x, loop_y - loop_dy };
+                bz.p3 = { loop_x, loop_y + loop_dy };
+                bz.p1 = { loop_x + loop_r, bz.p0.y };
+                bz.p2 = { loop_x + loop_r, bz.p3.y };
+            }
+            svg_emit_bezier_polyline(&out, bz, ox, oy, stroke_col, thickness, edge.dashed,
+                                     bidir ? marker_id : nullptr, no_arrow ? nullptr : marker_id);
+            label_mid = curve_point(bz, 0.5f);
+        }
+
+        if (edge.label.length) {
+            float l_lh = 0.0f;
+            const EtchVec2 sz = measure_label_env(edge.label, body_font, caption_font, env, &l_lh);
+            const float pad_x = 7.0f * scale;
+            const float pad_y = 2.5f * scale;
+            const float plate_w = sz.x + 2.0f * pad_x;
+            const float plate_h = sz.y + 2.0f * pad_y;
+            const float half = plate_w * 0.5f;
+            const float lx = std::fmax(desc.pos.x + half, std::fmin(label_mid.x, desc.pos.x + result.width - half));
+            const float raw_y = (result.sequence || (result.horizontal && !edge.reversed && edge.from != edge.to))
+                                    ? (label_mid.y - plate_h - 4.0f * scale)
+                                    : (label_mid.y - plate_h * 0.5f);
+            const float ly = std::fmax(desc.pos.y, std::fmin(raw_y, desc.pos.y + std::fmax(0.0f, result.height - plate_h)));
+            out.write_lit("<rect x=\""); out.write_num(lx - half + ox);
+            out.write_lit("\" y=\""); out.write_num(ly + oy);
+            out.write_lit("\" width=\""); out.write_num(plate_w);
+            out.write_lit("\" height=\""); out.write_num(plate_h);
+            out.write_lit("\" rx=\"4\" ry=\"4\" fill=\"#ffffff\" stroke=\"#e2e8f0\" stroke-width=\"0.8\"/>\n");
+            svg_emit_diagram_label(&out, edge.label, lx + ox, ly + pad_y + oy, l_lh, caption_font, "#475569");
+        }
+    }
+
+    // 4. Nodes
+    for (uint32_t i = 0u; i < result.node_count; ++i) {
+        const auto& n = result.nodes[i];
+        const InlayDiagramShape shape = meta.shapes ? meta.shapes[i] : InlayShapeRect;
+        float n_lh = 0.0f;
+        const EtchVec2 tsz = measure_label_env(n.label, body_font, eff_font, env, &n_lh);
+        const float cx = n.bounds.x + n.bounds.w * 0.5f + ox;
+        const float cy = n.bounds.y + n.bounds.h * 0.5f + oy;
+        if (shape == InlayShapeDiamond) {
+            out.write_lit("<polygon points=\"");
+            out.write_num(cx); out.write_lit(","); out.write_num(n.bounds.y + oy); out.write_lit(" ");
+            out.write_num(n.bounds.x + n.bounds.w + ox); out.write_lit(","); out.write_num(cy); out.write_lit(" ");
+            out.write_num(cx); out.write_lit(","); out.write_num(n.bounds.y + n.bounds.h + oy); out.write_lit(" ");
+            out.write_num(n.bounds.x + ox); out.write_lit(","); out.write_num(cy);
+            out.write_lit("\" fill=\"#ffffff\" stroke=\"#94a3b8\" stroke-width=\"");
+            out.write_num(std::fmax(0.9f, 1.15f * scale)); out.write_lit("\"/>\n");
+        } else if (shape == InlayShapeCircle) {
+            out.write_lit("<circle cx=\""); out.write_num(cx);
+            out.write_lit("\" cy=\""); out.write_num(cy);
+            out.write_lit("\" r=\""); out.write_num(n.bounds.w * 0.5f);
+            out.write_lit("\" fill=\"#ffffff\" stroke=\"#94a3b8\" stroke-width=\"");
+            out.write_num(border_w); out.write_lit("\"/>\n");
+        } else {
+            const float rad = (shape == InlayShapeRound) ? (n.bounds.h * 0.5f) : (6.0f * scale);
+            out.write_lit("<rect x=\""); out.write_num(n.bounds.x + ox);
+            out.write_lit("\" y=\""); out.write_num(n.bounds.y + oy);
+            out.write_lit("\" width=\""); out.write_num(n.bounds.w);
+            out.write_lit("\" height=\""); out.write_num(n.bounds.h);
+            out.write_lit("\" rx=\""); out.write_num(rad);
+            out.write_lit("\" ry=\""); out.write_num(rad);
+            out.write_lit("\" fill=\"#ffffff\" stroke=\"#94a3b8\" stroke-width=\"");
+            out.write_num(border_w); out.write_lit("\"/>\n");
+        }
+        svg_emit_diagram_label(&out, n.label, cx, cy - tsz.y * 0.5f, n_lh, eff_font, "#0f172a");
+    }
+
+    out.write_lit("</svg>\n");
+    heap.destroy();
+    if (out_buf && cap > 0u) {
+        out_buf[out.len < cap - 1u ? out.len : (cap - 1u)] = '\0';
+    }
+    return out.len;
 }
 }

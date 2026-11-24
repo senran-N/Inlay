@@ -54,6 +54,27 @@ using TaskToggleFn=InlayTaskToggleFn;
 using CustomFenceEstimateFn=InlayCustomFenceEstimateFn;
 using CustomFenceRenderFn=InlayCustomFenceRenderFn;
 using CodeHeaderFn=InlayCodeHeaderFn;
+using SlotMeasureFn=InlaySlotMeasureFn;
+using ActionPermission=InlayActionPermission;
+using ActionPolicy=InlayActionPolicy;
+using ActionAuditFn=InlayActionAuditFn;
+using Model=InlayModel;
+using ModelRow=InlayModelRow;
+using ModelReadFn=InlayModelReadFn;
+using Stream=InlayStream;
+using StreamRole=InlayStreamRole;
+using StreamItemKind=InlayStreamItemKind;
+using StreamStatus=InlayStreamStatus;
+using StreamItem=InlayStreamItem;
+using GenUiValidation=InlayGenUiValidation;
+using ImageLoader=InlayImageLoader;
+using ImageLoadStatus=InlayImageLoadStatus;
+using ImageLoaderDesc=InlayImageLoaderDesc;
+using PortalNavDecision=InlayPortalNavDecision;
+using PortalNavFn=InlayPortalNavFn;
+using PortalMessageFn=InlayPortalMessageFn;
+using PortalPermissionFn=InlayPortalPermissionFn;
+using PortalPolicy=InlayPortalPolicy;
 
 inline uint32_t abi_version() noexcept { return inlay_abi_version(); }
 inline EtchContext* to_c_context(etch::Context* ctx) noexcept {
@@ -175,5 +196,11 @@ inline bool surface_set_image_resolver(Surface* s, ImageResolverFn fn, void* use
 /* width_px <= 0 or height_px <= 0 grows to fill the parent container (etch_sizing_grow). */
 inline void surface_view(Surface* s, const SurfaceViewDesc* desc) noexcept {
  inlay_surface_view(s, desc);
+}
+inline ActionPolicy action_policy_default() noexcept { return inlay_action_policy_default(); }
+inline PortalPolicy portal_policy_default() noexcept { return inlay_portal_policy_default(); }
+inline ImageLoaderDesc image_loader_desc_default() noexcept { return inlay_image_loader_desc_default(); }
+inline ImageLoader* create_image_loader(etch::Context* ctx, const ImageLoaderDesc* desc=nullptr) noexcept {
+ return inlay_image_loader_create(to_c_context(ctx), desc);
 }
 }

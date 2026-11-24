@@ -2672,6 +2672,703 @@ bool test_scoped_hooks_cls_cache_and_dark(EtchContext *ctx, const InlaySurfaceDe
     inlay_surface_destroy(s);
     return ok;
 }
+
+bool test_i2_audit_features(EtchContext *ctx, const InlaySurfaceDesc &desc) {
+    bool ok = true;
+    auto frame = etch_frame_desc_default();
+    frame.viewport_w = 960;
+    frame.viewport_h = 640;
+    frame.dt_seconds = 1.f / 60.f;
+    const EtchVec2 default_ptr = frame.pointer_pos;
+
+    // ------------------------------------------------------------------------
+    // 1. #14 Action Permissions, Required Keys & Audit Hook
+    // ------------------------------------------------------------------------
+    {
+        auto *s = inlay_surface_create(ctx, &desc);
+        if (!s) return check(false, "i2 #14 surface create");
+        struct AuditLog {
+            bool allow;
+            uint32_t calls;
+            InlayActionPermission last_perm;
+            bool last_req_approval;
+            char last_name[64];
+        };
+        AuditLog audit = {false, 0u, INLAY_ACTION_READ, false, {}};
+        int action_calls = 0;
+
+        auto on_delete = [](InlaySurface *, EtchStr, void *user) {
+            ++(*static_cast<int *>(user));
+        };
+        auto on_audit = [](InlaySurface *, EtchStr name, InlayActionPermission perm,
+                           bool req_approval, EtchStr, void *user) -> bool {
+            auto *log = static_cast<AuditLog *>(user);
+            ++log->calls;
+            log->last_perm = perm;
+            log->last_req_approval = req_approval;
+            const uint32_t n = name.length < 63u ? name.length : 63u;
+            if (n > 0u) std::memcpy(log->last_name, name.chars, n);
+            log->last_name[n] = '\0';
+            return log->allow;
+        };
+
+        ok &= check(inlay_surface_bind_action(s, ETCH_STR_LIT("delete_item"), on_delete, &action_calls),
+                    "i2 #14 bind action");
+        ok &= check(inlay_surface_allow_async_action(s, ETCH_STR_LIT("purge_all")),
+                    "i2 #14 allow async action");
+
+        InlayActionPolicy pol = inlay_action_policy_default();
+        pol.permission = INLAY_ACTION_DESTRUCTIVE;
+        pol.require_approval = true;
+        pol.required_keys_csv = ETCH_STR_LIT("id, confirm");
+        ok &= check(inlay_surface_set_action_policy(s, ETCH_STR_LIT("delete_item"), &pol),
+                    "i2 #14 set sync action policy");
+
+        InlayActionPolicy apol = inlay_action_policy_default();
+        apol.permission = INLAY_ACTION_DESTRUCTIVE;
+        apol.require_approval = true;
+        apol.required_keys_csv = ETCH_STR_LIT("scope");
+        ok &= check(inlay_surface_set_action_policy(s, ETCH_STR_LIT("purge_all"), &apol),
+                    "i2 #14 set async action policy");
+
+        static const char policy_script[] = R"JS(
+function render(st) { return <Text>{String(st.res || '')}</Text>; }
+function onEvent(n, v, st) {
+  if (n === 'sync') { st.res = String(action('delete_item', v)); }
+  if (n === 'async') {
+    try { request('purge_all', v); st.res = 'async_ok'; }
+    catch (e) { st.res = 'async_blocked'; }
+  }
+}
+)JS";
+        ok &= check(inlay_surface_set_script(s, {policy_script, uint32_t(sizeof(policy_script) - 1u), true}),
+                    "i2 #14 load policy script");
+
+        // Missing required key -> blocked cleanly without error
+        ok &= check(inlay_surface_dispatch(s, ETCH_STR_LIT("sync"), ETCH_STR_LIT("{\"id\":1}")),
+                    "i2 #14 missing key dispatch ok");
+        ok &= check(action_calls == 0 && std::strstr(inlay_surface_state_json(s).chars, "\"false\"") != nullptr,
+                    "i2 #14 missing required key blocked");
+
+        // All required keys, require_approval=true, no audit hook -> blocked
+        ok &= check(inlay_surface_dispatch(s, ETCH_STR_LIT("sync"), ETCH_STR_LIT("{\"id\":1,\"confirm\":true}")),
+                    "i2 #14 no-hook approval dispatch ok");
+        ok &= check(action_calls == 0 && std::strstr(inlay_surface_state_json(s).chars, "\"false\"") != nullptr,
+                    "i2 #14 require_approval blocks without audit hook");
+
+        // Audit hook denies -> blocked, audit recorded metadata
+        inlay_surface_set_action_audit_hook(s, on_audit, &audit);
+        ok &= check(inlay_surface_dispatch(s, ETCH_STR_LIT("sync"), ETCH_STR_LIT("{\"id\":1,\"confirm\":true}")),
+                    "i2 #14 audit-deny dispatch ok");
+        ok &= check(action_calls == 0 && audit.calls == 1u &&
+                        audit.last_perm == INLAY_ACTION_DESTRUCTIVE && audit.last_req_approval &&
+                        std::strcmp(audit.last_name, "delete_item") == 0,
+                    "i2 #14 audit hook deny blocks and reports metadata");
+
+        // Audit hook allows -> runs action
+        audit.allow = true;
+        ok &= check(inlay_surface_dispatch(s, ETCH_STR_LIT("sync"), ETCH_STR_LIT("{\"id\":1,\"confirm\":true}")),
+                    "i2 #14 audit-allow dispatch ok");
+        ok &= check(action_calls == 1 && std::strstr(inlay_surface_state_json(s).chars, "\"true\"") != nullptr,
+                    "i2 #14 audit hook allow executes action");
+
+        // Async action blocked by audit deny and missing key, allowed when valid + approved
+        audit.allow = false;
+        ok &= check(inlay_surface_dispatch(s, ETCH_STR_LIT("async"), ETCH_STR_LIT("{\"scope\":\"all\"}")),
+                    "i2 #14 async deny dispatch ok");
+        ok &= check(std::strstr(inlay_surface_state_json(s).chars, "async_blocked") != nullptr &&
+                        inlay_surface_poll_async_action(s).kind == INLAY_ASYNC_ACTION_NONE,
+                    "i2 #14 async action blocked by audit deny");
+
+        audit.allow = true;
+        ok &= check(inlay_surface_dispatch(s, ETCH_STR_LIT("async"), ETCH_STR_LIT("{}")),
+                    "i2 #14 async missing key dispatch ok");
+        ok &= check(std::strstr(inlay_surface_state_json(s).chars, "async_blocked") != nullptr &&
+                        inlay_surface_poll_async_action(s).kind == INLAY_ASYNC_ACTION_NONE,
+                    "i2 #14 async action blocked by missing required key");
+
+        ok &= check(inlay_surface_dispatch(s, ETCH_STR_LIT("async"), ETCH_STR_LIT("{\"scope\":\"all\"}")),
+                    "i2 #14 async allow dispatch ok");
+        const auto aev = inlay_surface_poll_async_action(s);
+        ok &= check(aev.kind == INLAY_ASYNC_ACTION_START && str_eq(aev.name, "purge_all"),
+                    "i2 #14 async action starts when policy + audit pass");
+        inlay_surface_close_async_actions(s);
+
+        // Direct dispatch_one_event host action fallback respects policy + audit hook
+        ok &= check(inlay_surface_set_script(s, ETCH_STR_LIT("function render(){return <Text>direct</Text>;}")),
+                    "i2 #14 direct action script");
+        audit.allow = false;
+        ok &= check(inlay_surface_dispatch(s, ETCH_STR_LIT("delete_item"), ETCH_STR_LIT("{\"id\":9,\"confirm\":true}")),
+                    "i2 #14 direct deny dispatch ok");
+        ok &= check(action_calls == 1, "i2 #14 direct host action blocked by audit deny");
+        audit.allow = true;
+        ok &= check(inlay_surface_dispatch(s, ETCH_STR_LIT("delete_item"), ETCH_STR_LIT("{\"id\":9,\"confirm\":true}")),
+                    "i2 #14 direct allow dispatch ok");
+        ok &= check(action_calls == 2, "i2 #14 direct host action runs when audit allows");
+
+        inlay_surface_destroy(s);
+    }
+
+    // ------------------------------------------------------------------------
+    // 2. #50 True Native Node Subtree Reuse for memo()
+    // ------------------------------------------------------------------------
+    {
+        auto *s = inlay_surface_create(ctx, &desc);
+        if (!s) return check(false, "i2 #50 surface create");
+        static const char memo_script[] = R"JS(
+const ItemCard = memo(function ItemCard(p) {
+  return (
+    <Box cls="p-2 bg-surface rounded-md">
+      <Text>{'Card ' + p.idx}</Text>
+      <Text>{p.label}</Text>
+    </Box>
+  );
+});
+function render(st) {
+  const list = [];
+  for (let i = 0; i < 10; ++i) {
+    list.push(<ItemCard key={i} idx={i} label={i === 0 ? (st.lbl0 || 'Alpha') : ('Fixed-' + i)} />);
+  }
+  return <Col id="mroot"><Text>{'Tick ' + (st.tick || 0)}</Text>{list}</Col>;
+}
+function onEvent(n, v, st) {
+  if (n === 'bump') st.tick = (st.tick || 0) + 1;
+  if (n === 'rename') st.lbl0 = String(v);
+}
+)JS";
+        ok &= check(inlay_surface_set_script(s, {memo_script, uint32_t(sizeof(memo_script) - 1u), true}),
+                    "i2 #50 memo script loads");
+        ok &= check(inlay_surface_memo_reused_nodes(s) == 0u, "i2 #50 initial cold mount has 0 reused nodes");
+        ok &= check(inlay_surface_dispatch(s, ETCH_STR_LIT("bump"), ETCH_STR_LIT("null")), "i2 #50 bump 1");
+        const uint64_t r1 = inlay_surface_memo_reused_nodes(s);
+        ok &= check(r1 >= 30u, "i2 #50 memo splices native subtrees (30+ nodes reused on bump 1)");
+        ok &= check(inlay_surface_dispatch(s, ETCH_STR_LIT("bump"), ETCH_STR_LIT("null")), "i2 #50 bump 2");
+        const uint64_t r2 = inlay_surface_memo_reused_nodes(s);
+        ok &= check(r2 >= r1 + 30u, "i2 #50 memo continues reusing native subtrees on bump 2");
+
+        // Changing prop on card 0 invalidates only card 0 while cards 1..9 reuse natively.
+        ok &= check(inlay_surface_dispatch(s, ETCH_STR_LIT("rename"), ETCH_STR_LIT("\"Omega\"")), "i2 #50 rename card 0");
+        const uint64_t r3 = inlay_surface_memo_reused_nodes(s);
+        uint32_t ncnt = 0u;
+        const auto *nodes = inlay_surface_nodes(s, &ncnt);
+        bool found_omega = false;
+        for (uint32_t i = 0u; i < ncnt; ++i) {
+            if (str_eq(nodes[i].text, "Omega")) found_omega = true;
+        }
+        ok &= check(found_omega && r3 == r2 + 27u,
+                    "i2 #50 invalidated memo card rebuilds while 9 unchanged cards reuse natively");
+        inlay_surface_destroy(s);
+    }
+
+    // ------------------------------------------------------------------------
+    // 3. #51 InlayModel 1,000,000-row VirtualList & Tree + notify_change
+    // ------------------------------------------------------------------------
+    {
+        struct BigModelData {
+            uint32_t reads;
+            uint32_t version;
+            char label[64];
+            char detail[64];
+        };
+        BigModelData mdata = {0u, 1u, {}, {}};
+        auto read_model = [](uint32_t index, InlayModelRow *out_row, void *user) -> bool {
+            auto *d = static_cast<BigModelData *>(user);
+            ++d->reads;
+            out_row->row_id = uint64_t(index) + 1000ull;
+            out_row->depth = index % 3u;
+            out_row->has_children = (index % 3u) == 0u;
+            out_row->expanded = true;
+            const int ln = std::snprintf(d->label, sizeof(d->label), "Row %u v%u", index, d->version);
+            const int dn = std::snprintf(d->detail, sizeof(d->detail), "Detail #%u", index);
+            out_row->label = {d->label, ln > 0 ? uint32_t(ln) : 0u, false};
+            out_row->detail = {d->detail, dn > 0 ? uint32_t(dn) : 0u, false};
+            out_row->badge = ETCH_STR_LIT("MODEL");
+            return true;
+        };
+
+        InlayModel *model = inlay_model_create(read_model, &mdata);
+        ok &= check(model != nullptr, "i2 #51 model create");
+        if (model) {
+            inlay_model_set_count(model, 1000000u);
+            ok &= check(inlay_model_count(model) == 1000000u && inlay_model_revision(model) == 2u,
+                        "i2 #51 model 1,000,000 count & revision");
+
+            auto *s = inlay_surface_create(ctx, &desc);
+            if (s) {
+                ok &= check(inlay_surface_bind_model(s, ETCH_STR_LIT("big_rows"), model),
+                            "i2 #51 bind model");
+                static const char model_script[] = R"JS(
+function render() {
+  return (
+    <Col id="m_root" width={400} gap={8}>
+      <VirtualList id="m_vlist" model="big_rows" height={180} itemHeight={30} />
+      <Tree id="m_tree" model="big_rows" height={120} rowHeight={24} />
+    </Col>
+  );
+}
+)JS";
+                ok &= check(inlay_surface_set_script(s, {model_script, uint32_t(sizeof(model_script) - 1u), true}),
+                            "i2 #51 model script loads");
+                uint32_t ncnt = 0u;
+                const auto *nodes = inlay_surface_nodes(s, &ncnt);
+                InlaySurfaceViewDesc view = inlay_surface_view_desc_default();
+                view.id = etch_id("i2-model-view");
+                view.width_px = 420.f;
+                view.height_px = 360.f;
+                const uint32_t vlist_eid = find_surface_eid(nodes, ncnt, view.id, "m_vlist");
+                const uint32_t tree_eid = find_surface_eid(nodes, ncnt, view.id, "m_tree");
+
+                const auto step = [&] {
+                    etch_begin_frame(ctx, &frame);
+                    inlay_surface_view(s, &view);
+                    etch_end_frame(ctx);
+                };
+
+                const uint64_t ticks0 = inlay_surface_stats(s).js_ticks;
+                step();
+                step();
+                ok &= check(mdata.reads > 0u && mdata.reads < 256u && inlay_surface_stats(s).js_ticks == ticks0,
+                            "i2 #51 1M-row model renders only visible slice with 0 JS ticks");
+
+                // Scroll to row 500,000 and select it natively
+                etch_virtual_list_scroll_to_row(vlist_eid, 500000u, 30.f, ETCH_ALIGN_Y_TOP);
+                step();
+                const uint32_t row500k_eid = etch_id_index(vlist_eid, 0x710000u + 500000u);
+                ok &= check(etch_perform_a11y_action(row500k_eid, ETCH_A11Y_ACT_PRESS, 0.f, {}, ctx, nullptr),
+                            "i2 #51 select row 500000 via A11y");
+                step();
+                step();
+                EtchA11yNode row_a11y = {};
+                ok &= check(etch_find_a11y_node(row500k_eid, &row_a11y, ctx, nullptr) &&
+                                row_a11y.role == ETCH_A11Y_LIST_ITEM &&
+                                (row_a11y.state_flags & ETCH_A11Y_STATE_SELECTED) != 0u &&
+                                str_eq(row_a11y.label, "Row 500000 v1"),
+                            "i2 #51 selected row 500000 has LIST_ITEM role & SELECTED state");
+
+                // Incremental notify_change + count update preserves scroll & selection with 0 JS ticks!
+                const double scroll_before = etch_virtual_list_scroll_offset(vlist_eid);
+                const uint64_t rev_before = inlay_model_revision(model);
+                mdata.version = 2u;
+                inlay_model_notify_change(model, 500000u, 1u);
+                inlay_model_set_count(model, 1000005u);
+                ok &= check(inlay_model_revision(model) == rev_before + 2u, "i2 #51 model revision incremented");
+                step();
+                const double scroll_after = etch_virtual_list_scroll_offset(vlist_eid);
+                EtchA11yNode row_a11y2 = {};
+                EtchA11yNode tree_a11y = {};
+                ok &= check(inlay_surface_stats(s).js_ticks == ticks0 &&
+                                std::fabs(scroll_after - scroll_before) < 1.0 && scroll_after > 1000000.0 &&
+                                etch_find_a11y_node(row500k_eid, &row_a11y2, ctx, nullptr) &&
+                                (row_a11y2.state_flags & ETCH_A11Y_STATE_SELECTED) != 0u &&
+                                str_eq(row_a11y2.label, "Row 500000 v2"),
+                            "i2 #51 notify_change & set_count update row live, preserve scroll & selection, 0 JS ticks");
+                ok &= check(etch_find_a11y_node(tree_eid, &tree_a11y, ctx, nullptr) &&
+                                tree_a11y.role == ETCH_A11Y_TREE,
+                            "i2 #51 Tree model mode emits ETCH_A11Y_TREE");
+
+                inlay_surface_bind_model(s, ETCH_STR_LIT("big_rows"), nullptr);
+                inlay_surface_destroy(s);
+            }
+            inlay_model_destroy(model);
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // 4. #52 Responsive & Container-Query Breakpoints (sm:, md:, @sm:, @md:)
+    // ------------------------------------------------------------------------
+    {
+        auto *s = inlay_surface_create(ctx, &desc);
+        if (!s) return check(false, "i2 #52 surface create");
+        static const char resp_script[] = R"JS(
+function render() {
+  return (
+    <Col id="r_root" cls="w-full">
+      <Box id="vp_box" cls="w-20 h-10 bg-[#112233] sm:w-40 md:w-80 md:bg-[#2266aa]" />
+      <Box id="ct_narrow" cls="w-[400px]">
+        <Box id="ct_s" cls="w-20 h-10 @sm:w-40 @md:w-80" />
+      </Box>
+      <Box id="ct_wide" cls="w-[640px]">
+        <Box id="ct_l" cls="w-20 h-10 @sm:w-40 @md:w-80" />
+      </Box>
+    </Col>
+  );
+}
+)JS";
+        ok &= check(inlay_surface_set_script(s, {resp_script, uint32_t(sizeof(resp_script) - 1u), true}),
+                    "i2 #52 responsive script loads");
+        InlaySurfaceViewDesc view = inlay_surface_view_desc_default();
+        view.id = etch_id("i2-resp-view");
+        view.width_px = 900.f;
+        view.height_px = 240.f;
+
+        auto step_w = [&](float w) {
+            view.width_px = w;
+            etch_begin_frame(ctx, &frame);
+            inlay_surface_view(s, &view);
+            etch_end_frame(ctx);
+        };
+
+        // First frame at 900px: md: active on viewport, @sm: active on 400px container, @md: active on 640px container
+        step_w(900.f);
+        uint32_t ncnt = 0u;
+        const auto *nodes = inlay_surface_nodes(s, &ncnt);
+        const EtchRect vp_900 = etch_element_bounds(find_surface_eid(nodes, ncnt, view.id, "vp_box"));
+        const EtchRect ct_s_b = etch_element_bounds(find_surface_eid(nodes, ncnt, view.id, "ct_s"));
+        const EtchRect ct_l_b = etch_element_bounds(find_surface_eid(nodes, ncnt, view.id, "ct_l"));
+        ok &= check(std::fabs(vp_900.w - 320.f) <= 1.f &&
+                        has_rect_prim(ctx, vp_900, etch_color_pack_rgba8(etch_rgba8(0x22, 0x66, 0xaa, 255)), 0u, false),
+                    "i2 #52 md: applies on first frame at 900px");
+        ok &= check(std::fabs(ct_s_b.w - 160.f) <= 1.f && std::fabs(ct_l_b.w - 320.f) <= 1.f,
+                    "i2 #52 @sm:/@md: evaluate against enclosing container width independently of viewport");
+
+        const uint64_t ticks_steady = inlay_surface_stats(s).js_ticks;
+        for (int i = 0; i < 4; ++i) step_w(900.f);
+        ok &= check(inlay_surface_stats(s).js_ticks == ticks_steady,
+                    "i2 #52 steady viewport runs 0 extra JS ticks");
+
+        // Resize to 520px (sm: active, md: inactive)
+        step_w(520.f);
+        nodes = inlay_surface_nodes(s, &ncnt);
+        const EtchRect vp_520 = etch_element_bounds(find_surface_eid(nodes, ncnt, view.id, "vp_box"));
+        ok &= check(std::fabs(vp_520.w - 160.f) <= 1.f &&
+                        has_rect_prim(ctx, vp_520, etch_color_pack_rgba8(etch_rgba8(0x11, 0x22, 0x33, 255)), 0u, false),
+                    "i2 #52 resize to 520px switches cleanly to sm:w-40 and base bg");
+
+        // Resize to 340px (base only)
+        step_w(340.f);
+        nodes = inlay_surface_nodes(s, &ncnt);
+        const EtchRect vp_340 = etch_element_bounds(find_surface_eid(nodes, ncnt, view.id, "vp_box"));
+        ok &= check(std::fabs(vp_340.w - 80.f) <= 1.f, "i2 #52 resize to 340px switches cleanly to base w-20");
+
+        inlay_surface_destroy(s);
+    }
+
+    // ------------------------------------------------------------------------
+    // 5. #53 Native Custom Slot First-Frame Measurement & A11y
+    // ------------------------------------------------------------------------
+    {
+        struct SlotState {
+            uint32_t measure_calls;
+            uint32_t render_calls;
+            float last_w;
+            float last_h;
+            char last_props[64];
+        };
+        SlotState sl = {0u, 0u, 0.f, 0.f, {}};
+        auto slot_measure = [](InlaySurface *, uint32_t, float, float, EtchStr,
+                               EtchVec2 *out_size, void *user) -> bool {
+            auto *st = static_cast<SlotState *>(user);
+            ++st->measure_calls;
+            *out_size = {215.f, 77.f};
+            return true;
+        };
+        auto slot_render = [](InlaySurface *, uint32_t, float w, float h, EtchStr props, void *user) {
+            auto *st = static_cast<SlotState *>(user);
+            ++st->render_calls;
+            st->last_w = w;
+            st->last_h = h;
+            const uint32_t n = props.length < 63u ? props.length : 63u;
+            if (n > 0u) std::memcpy(st->last_props, props.chars, n);
+            st->last_props[n] = '\0';
+        };
+
+        auto *s = inlay_surface_create(ctx, &desc);
+        if (!s) return check(false, "i2 #53 surface create");
+        ok &= check(inlay_surface_bind_slot_ex(s, ETCH_STR_LIT("telemetry"), slot_render, slot_measure,
+                                               ETCH_A11Y_FIGURE, ETCH_STR_LIT("Telemetry Chart"), &sl),
+                    "i2 #53 bind_slot_ex");
+        ok &= check(inlay_surface_set_script(
+                        s, ETCH_STR_LIT("function render(){return <Col id='sr'><Slot id='cs' name='telemetry' props={{k:7}} /></Col>;}")),
+                    "i2 #53 slot script loads");
+        uint32_t ncnt = 0u;
+        const auto *nodes = inlay_surface_nodes(s, &ncnt);
+        InlaySurfaceViewDesc view = inlay_surface_view_desc_default();
+        view.id = etch_id("i2-slot-view");
+        view.width_px = 400.f;
+        view.height_px = 200.f;
+        const uint32_t slot_eid = find_surface_eid(nodes, ncnt, view.id, "cs");
+
+        // Single frame must apply intrinsic measured dimensions and emit A11y role/label immediately!
+        etch_begin_frame(ctx, &frame);
+        inlay_surface_view(s, &view);
+        etch_end_frame(ctx);
+        const EtchRect sb = etch_element_bounds(slot_eid);
+        EtchA11yNode sa = {};
+        ok &= check(sl.measure_calls == 1u && sl.render_calls == 1u &&
+                        std::fabs(sl.last_w - 215.f) <= 0.5f && std::fabs(sl.last_h - 77.f) <= 0.5f &&
+                        std::fabs(sb.w - 215.f) <= 0.5f && std::fabs(sb.h - 77.f) <= 0.5f &&
+                        std::strstr(sl.last_props, "\"k\":7") != nullptr,
+                    "i2 #53 slot measure_callback sets exact intrinsic box bounds on frame 1");
+        ok &= check(etch_find_a11y_node(slot_eid, &sa, ctx, nullptr) &&
+                        sa.role == ETCH_A11Y_FIGURE && str_eq(sa.label, "Telemetry Chart"),
+                    "i2 #53 slot emits A11y role & label");
+        inlay_surface_destroy(s);
+    }
+
+    // ------------------------------------------------------------------------
+    // 6. #54 Grouped Form Validation, Error Association, resetKey & Submit
+    // ------------------------------------------------------------------------
+    {
+        auto *s = inlay_surface_create(ctx, &desc);
+        if (!s) return check(false, "i2 #54 surface create");
+        static const char form_script[] = R"JS(
+function render(st) {
+  return (
+    <Form id="fm" width={280} resetKey={String(st.rk || 0)}
+          onSubmit={(vals, state) => { state.submitted = vals; }}
+          onInvalid={(fields, state) => { state.invalid = fields; }}>
+      <Input id="fm_email" name="email" value={st.email || ''} required minLength={5} width={240}
+             onChange={(v, state) => { state.email = v; }} />
+      <Input id="fm_tag" name="tag" value={st.tag || ''} maxLength={4} width={240}
+             onChange={(v, state) => { state.tag = v; }} />
+      <Button id="fm_btn" type="submit" width={100} height={30}>Submit</Button>
+    </Form>
+  );
+}
+function onEvent(n, v, st) {
+  if (n === 'fill') { st.email = v.email; st.tag = v.tag; }
+  if (n === 'reset') { st.rk = (st.rk || 0) + 1; }
+}
+)JS";
+        ok &= check(inlay_surface_set_script(s, {form_script, uint32_t(sizeof(form_script) - 1u), true}),
+                    "i2 #54 form script loads");
+        InlaySurfaceViewDesc view = inlay_surface_view_desc_default();
+        view.id = etch_id("i2-form-view");
+        view.width_px = 320.f;
+        view.height_px = 260.f;
+        auto step = [&] {
+            etch_begin_frame(ctx, &frame);
+            inlay_surface_view(s, &view);
+            etch_end_frame(ctx);
+        };
+        step();
+        uint32_t ncnt = 0u;
+        const auto *nodes = inlay_surface_nodes(s, &ncnt);
+        const uint32_t email_eid = find_surface_eid(nodes, ncnt, view.id, "fm_email");
+        const uint32_t btn_eid = find_surface_eid(nodes, ncnt, view.id, "fm_btn");
+
+        // Submit while required email is empty -> blocked, onInvalid fires, A11y INVALID set!
+        ok &= check(etch_perform_a11y_action(btn_eid, ETCH_A11Y_ACT_PRESS, 0.f, {}, ctx, nullptr),
+                    "i2 #54 press submit (invalid)");
+        step();
+        step();
+        auto sj = inlay_surface_state_json(s);
+        EtchA11yNode ea = {};
+        ok &= check(sj.chars && std::strstr(sj.chars, "submitted") == nullptr &&
+                        std::strstr(sj.chars, "\"invalid\":[\"email\"]") != nullptr &&
+                        etch_find_a11y_node(email_eid, &ea, ctx, nullptr) &&
+                        (ea.state_flags & ETCH_A11Y_STATE_INVALID) != 0u,
+                    "i2 #54 invalid form blocks onSubmit, fires onInvalid, marks ETCH_A11Y_STATE_INVALID");
+
+        // Violate both minLength and maxLength
+        ok &= check(inlay_surface_dispatch(s, ETCH_STR_LIT("fill"), ETCH_STR_LIT("{\"email\":\"abc\",\"tag\":\"12345\"}")),
+                    "i2 #54 fill invalid lengths");
+        step();
+        ok &= check(etch_perform_a11y_action(btn_eid, ETCH_A11Y_ACT_PRESS, 0.f, {}, ctx, nullptr),
+                    "i2 #54 press submit (min/max fail)");
+        step();
+        step();
+        sj = inlay_surface_state_json(s);
+        ok &= check(sj.chars && std::strstr(sj.chars, "submitted") == nullptr &&
+                        std::strstr(sj.chars, "\"email\"") != nullptr &&
+                        std::strstr(sj.chars, "\"tag\"") != nullptr,
+                    "i2 #54 minLength & maxLength failures reported together");
+
+        // resetKey clears validation error state
+        ok &= check(inlay_surface_dispatch(s, ETCH_STR_LIT("reset"), ETCH_STR_LIT("null")), "i2 #54 resetKey");
+        step();
+        EtchA11yNode ea_reset = {};
+        ok &= check(etch_find_a11y_node(email_eid, &ea_reset, ctx, nullptr) &&
+                        (ea_reset.state_flags & ETCH_A11Y_STATE_INVALID) == 0u,
+                    "i2 #54 resetKey clears form validation error state");
+
+        // Fill valid values -> submit succeeds with JSON object {"email":"...","tag":"..."}
+        ok &= check(inlay_surface_dispatch(s, ETCH_STR_LIT("fill"), ETCH_STR_LIT("{\"email\":\"a@b.co\",\"tag\":\"ok\"}")),
+                    "i2 #54 fill valid values");
+        step();
+        ok &= check(etch_perform_a11y_action(btn_eid, ETCH_A11Y_ACT_PRESS, 0.f, {}, ctx, nullptr),
+                    "i2 #54 press submit (valid)");
+        step();
+        step();
+        sj = inlay_surface_state_json(s);
+        ok &= check(sj.chars &&
+                        std::strstr(sj.chars, "\"submitted\":{\"email\":\"a@b.co\",\"tag\":\"ok\"}") != nullptr,
+                    "i2 #54 valid form submits JSON object with field values");
+        inlay_surface_destroy(s);
+    }
+
+    // ------------------------------------------------------------------------
+    // 7. #59 Scoped Event Routing & stopPropagation (Nested Button-in-Card)
+    // ------------------------------------------------------------------------
+    {
+        auto *s = inlay_surface_create(ctx, &desc);
+        if (!s) return check(false, "i2 #59 surface create");
+        static const char prop_script[] = R"JS(
+function render() {
+  return (
+    <Col id="p_root" width={320} padding={8}>
+      <Card id="p_card" width={280} height={130} padding={12} gap={8}
+            onClick={(st) => { st.card = (st.card || 0) + 1; }}>
+        <Button id="p_btn" width={110} height={32}
+                onClick={(st) => { st.btn = (st.btn || 0) + 1; }}>Inner</Button>
+        <Box id="p_stop" stopPropagation width={110} height={32} bg="#334455"
+             onClick={(st) => { st.stop = (st.stop || 0) + 1; }} />
+      </Card>
+    </Col>
+  );
+}
+)JS";
+        ok &= check(inlay_surface_set_script(s, {prop_script, uint32_t(sizeof(prop_script) - 1u), true}),
+                    "i2 #59 stopPropagation script loads");
+        InlaySurfaceViewDesc view = inlay_surface_view_desc_default();
+        view.id = etch_id("i2-prop-view");
+        view.width_px = 340.f;
+        view.height_px = 180.f;
+        auto step = [&] {
+            etch_begin_frame(ctx, &frame);
+            inlay_surface_view(s, &view);
+            etch_end_frame(ctx);
+        };
+        auto click_pt = [&](float x, float y) {
+            frame.pointer_pos = {x, y};
+            frame.pointer_down = true;
+            step();
+            frame.pointer_down = false;
+            step();
+            frame.pointer_pos = default_ptr;
+            step();
+        };
+        step();
+        step();
+        uint32_t ncnt = 0u;
+        const auto *nodes = inlay_surface_nodes(s, &ncnt);
+        const EtchRect card_b = etch_element_bounds(find_surface_eid(nodes, ncnt, view.id, "p_card"));
+        const EtchRect btn_b = etch_element_bounds(find_surface_eid(nodes, ncnt, view.id, "p_btn"));
+        const EtchRect stop_b = etch_element_bounds(find_surface_eid(nodes, ncnt, view.id, "p_stop"));
+
+        click_pt(btn_b.x + btn_b.w * 0.5f, btn_b.y + btn_b.h * 0.5f);
+        auto sj = inlay_surface_state_json(s);
+        ok &= check(sj.chars && std::strstr(sj.chars, "\"btn\":1") != nullptr &&
+                        std::strstr(sj.chars, "\"card\"") == nullptr,
+                    "i2 #59 clicking nested Button does not trigger parent Card onClick");
+
+        click_pt(stop_b.x + stop_b.w * 0.5f, stop_b.y + stop_b.h * 0.5f);
+        sj = inlay_surface_state_json(s);
+        ok &= check(sj.chars && std::strstr(sj.chars, "\"stop\":1") != nullptr &&
+                        std::strstr(sj.chars, "\"card\"") == nullptr,
+                    "i2 #59 stopPropagation Box isolates click from parent Card");
+
+        click_pt(card_b.x + card_b.w - 10.f, card_b.y + 10.f);
+        sj = inlay_surface_state_json(s);
+        ok &= check(sj.chars && std::strstr(sj.chars, "\"card\":1") != nullptr,
+                    "i2 #59 clicking parent Card outside isolated children still fires Card onClick");
+        inlay_surface_destroy(s);
+    }
+
+    // ------------------------------------------------------------------------
+    // 8. #27/#28 CodeEditor ghostText & searchQuery Bridge
+    // ------------------------------------------------------------------------
+    {
+        auto *s = inlay_surface_create(ctx, &desc);
+        auto *buf = etch_create_text_buffer(ETCH_STR_LIT("int main() {\n  return 0;\n}\n"), 128u);
+        if (!s || !buf) {
+            if (buf) etch_destroy_text_buffer(buf);
+            if (s) inlay_surface_destroy(s);
+            return check(false, "i2 #27/#28 create surface/buffer");
+        }
+        ok &= check(inlay_surface_bind_text_buffer(s, ETCH_STR_LIT("ed_buf"), buf),
+                    "i2 #27/#28 bind text buffer");
+        static const char ed_script[] = R"JS(
+function render() {
+  return <CodeEditor id="ced" buffer="ed_buf" ghostText=" // completed" searchQuery="main" width={360} height={180} />;
+}
+)JS";
+        ok &= check(inlay_surface_set_script(s, {ed_script, uint32_t(sizeof(ed_script) - 1u), true}),
+                    "i2 #27/#28 CodeEditor script loads");
+        InlaySurfaceViewDesc view = inlay_surface_view_desc_default();
+        view.id = etch_id("i2-editor-view");
+        view.width_px = 400.f;
+        view.height_px = 220.f;
+        const uint64_t ticks0 = inlay_surface_stats(s).js_ticks;
+        for (int i = 0; i < 2; ++i) {
+            etch_begin_frame(ctx, &frame);
+            inlay_surface_view(s, &view);
+            etch_end_frame(ctx);
+        }
+        uint32_t ncnt = 0u;
+        const auto *nodes = inlay_surface_nodes(s, &ncnt);
+        const EtchRect eb = etch_element_bounds(find_surface_eid(nodes, ncnt, view.id, "ced"));
+        ok &= check(!inlay_surface_stats(s).has_error &&
+                        inlay_surface_stats(s).js_ticks == ticks0 &&
+                        eb.w >= 359.f && eb.h >= 179.f,
+                    "i2 #27/#28 CodeEditor ghostText & searchQuery bridge renders cleanly with 0 idle JS ticks");
+        inlay_surface_bind_text_buffer(s, ETCH_STR_LIT("ed_buf"), nullptr);
+        inlay_surface_set_script(s, ETCH_STR_LIT("function render(){return <Text>done</Text>;}"));
+        etch_begin_frame(ctx, &frame);
+        inlay_surface_view(s, &view);
+        etch_end_frame(ctx);
+        etch_destroy_text_buffer(buf);
+        inlay_surface_destroy(s);
+    }
+
+    // ------------------------------------------------------------------------
+    // 9. #45 TypeScript .d.ts Export
+    // ------------------------------------------------------------------------
+    {
+        auto *s = inlay_surface_create(ctx, &desc);
+        auto *doc = inlay_doc_create(ctx, nullptr);
+        auto *buf = etch_create_text_buffer(ETCH_STR_LIT("x"), 32u);
+        auto dummy_read = [](uint32_t, InlayModelRow *, void *) -> bool { return false; };
+        auto *model = inlay_model_create(dummy_read, nullptr);
+        auto dummy_act = [](InlaySurface *, EtchStr, void *) {};
+        auto dummy_slot = [](InlaySurface *, uint32_t, float, float, EtchStr, void *) {};
+        if (s && doc && buf && model) {
+            ok &= check(inlay_surface_bind_action(s, ETCH_STR_LIT("save_doc"), dummy_act, nullptr) &&
+                            inlay_surface_allow_async_action(s, ETCH_STR_LIT("load_remote")) &&
+                            inlay_surface_bind_slot(s, ETCH_STR_LIT("viewport_slot"), dummy_slot, nullptr) &&
+                            inlay_surface_bind_document(s, ETCH_STR_LIT("readme_md"), doc) &&
+                            inlay_surface_bind_text_buffer(s, ETCH_STR_LIT("code_buf"), buf) &&
+                            inlay_surface_bind_model(s, ETCH_STR_LIT("list_model"), model),
+                        "i2 #45 bind all surface resources");
+            const uint32_t req = inlay_surface_export_dts(s, nullptr, 0u);
+            ok &= check(req > 256u, "i2 #45 export_dts size query");
+            char tiny[16] = {};
+            const uint32_t tiny_ret = inlay_surface_export_dts(s, tiny, uint32_t(sizeof(tiny)));
+            ok &= check(tiny_ret == req && tiny[15] == '\0', "i2 #45 export_dts truncates safely with NUL");
+            auto *dts = static_cast<char *>(std::malloc(size_t(req) + 1u));
+            if (dts) {
+                const uint32_t got = inlay_surface_export_dts(s, dts, req + 1u);
+                ok &= check(got == req && dts[req] == '\0' &&
+                                std::strstr(dts, "export type ActionName = 'save_doc';") != nullptr &&
+                                std::strstr(dts, "export type AsyncActionName = 'load_remote';") != nullptr &&
+                                std::strstr(dts, "export type SlotName = 'viewport_slot';") != nullptr &&
+                                std::strstr(dts, "export type DocumentName = 'readme_md';") != nullptr &&
+                                std::strstr(dts, "export type BufferName = 'code_buf';") != nullptr &&
+                                std::strstr(dts, "export type ModelName = 'list_model';") != nullptr &&
+                                std::strstr(dts, "declare function action(") != nullptr &&
+                                std::strstr(dts, "declare function request<") != nullptr &&
+                                std::strstr(dts, "declare namespace ui {") != nullptr &&
+                                std::strstr(dts, "declare namespace JSX {") != nullptr &&
+                                std::strstr(dts, "interface IntrinsicElements") != nullptr,
+                            "i2 #45 export_dts contains all bound unions, functions, ui namespace & JSX types");
+                std::free(dts);
+            } else {
+                ok &= check(false, "i2 #45 alloc dts buffer");
+            }
+            inlay_surface_bind_document(s, ETCH_STR_LIT("readme_md"), nullptr);
+            inlay_surface_bind_text_buffer(s, ETCH_STR_LIT("code_buf"), nullptr);
+            inlay_surface_bind_model(s, ETCH_STR_LIT("list_model"), nullptr);
+        } else {
+            ok &= check(false, "i2 #45 create fixtures");
+        }
+        if (model) inlay_model_destroy(model);
+        if (buf) etch_destroy_text_buffer(buf);
+        if (doc) inlay_doc_destroy(doc);
+        if (s) inlay_surface_destroy(s);
+    }
+
+    return ok;
+}
 } // namespace
 int main(int argc, char **argv) {
     auto config = etch_context_desc_default();
@@ -2974,6 +3671,7 @@ int main(int argc, char **argv) {
         inlay_surface_destroy(missing);
     }
     ok &= test_scoped_hooks_cls_cache_and_dark(context, functional_desc);
+    ok &= test_i2_audit_features(context, functional_desc);
     inlay_surface_destroy(surface);
     etch_destroy_context(context);
     std::puts(ok ? "Sandbox reactive/HMR PASS" : "Sandbox reactive/HMR FAIL");

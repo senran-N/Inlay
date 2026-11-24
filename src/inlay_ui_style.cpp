@@ -5,7 +5,20 @@
 #include <cstdlib>
 #include <cstring>
 
+void inlay_ui_note_responsive_cls(InlaySurface* s) noexcept;
+
 namespace {
+
+inline uint8_t responsive_width_bucket(float w) noexcept {
+    if (w < 360.0f) return 0u;
+    if (w < 480.0f) return 1u;
+    if (w < 560.0f) return 2u;
+    if (w < 768.0f) return 3u;
+    if (w < 840.0f) return 4u;
+    if (w < 1024.0f) return 5u;
+    if (w < 1280.0f) return 6u;
+    return 7u;
+}
 
 constexpr uint32_t kMaxColorTweens = 256u;
 
@@ -1524,11 +1537,14 @@ uint64_t cls_hash64(const char* chars, size_t len) noexcept {
 }
 
 void inlay_ui_apply_cls_parse(InlaySurface* s, const char* cls, size_t cls_len,
-                              InlayUiKind kind, NodeStyle& st) {
+                              InlayUiKind kind, NodeStyle& st, bool* out_saw_responsive) {
     int8_t axis_override = -1; // -1 = unchanged, 0 = row, 1 = col
     int8_t pending_items = -1; // -1 = none, 0 = start, 1 = center, 2 = end
     bool saw_gap_x = false;
     bool saw_gap_y = false;
+
+    const float vp_w = (s->last_view_width_px > 0.0f) ? s->last_view_width_px : s->current_container_width_px;
+    const float ct_w = (s->current_container_width_px > 0.0f) ? s->current_container_width_px : s->last_view_width_px;
 
     size_t pos = 0u;
     while (pos < cls_len) {
@@ -1538,6 +1554,51 @@ void inlay_ui_apply_cls_parse(InlaySurface* s, const char* cls, size_t cls_len,
         while (pos < cls_len && !is_ascii_space(cls[pos])) ++pos;
         const char* tok = cls + start;
         size_t len = pos - start;
+
+        if (inlay_ui_str_eq(tok, len, "@container")) {
+            continue;
+        }
+
+        // Parse optional responsive / container-query prefix (`sm:`, `md:`, `lg:`, `xl:`, `@sm:`, `@md:`, `@lg:`).
+        float min_req_w = -1.0f;
+        bool is_container_bp = false;
+        if (starts_with(tok, len, "sm:")) {
+            min_req_w = 480.0f;
+            tok += 3u;
+            len -= 3u;
+        } else if (starts_with(tok, len, "md:")) {
+            min_req_w = 768.0f;
+            tok += 3u;
+            len -= 3u;
+        } else if (starts_with(tok, len, "lg:")) {
+            min_req_w = 1024.0f;
+            tok += 3u;
+            len -= 3u;
+        } else if (starts_with(tok, len, "xl:")) {
+            min_req_w = 1280.0f;
+            tok += 3u;
+            len -= 3u;
+        } else if (starts_with(tok, len, "@sm:")) {
+            min_req_w = 360.0f;
+            is_container_bp = true;
+            tok += 4u;
+            len -= 4u;
+        } else if (starts_with(tok, len, "@md:")) {
+            min_req_w = 560.0f;
+            is_container_bp = true;
+            tok += 4u;
+            len -= 4u;
+        } else if (starts_with(tok, len, "@lg:")) {
+            min_req_w = 840.0f;
+            is_container_bp = true;
+            tok += 4u;
+            len -= 4u;
+        }
+        if (min_req_w > 0.0f) {
+            if (out_saw_responsive) *out_saw_responsive = true;
+            const float eff_w = is_container_bp ? ct_w : vp_w;
+            if (eff_w < min_req_w || len == 0u) continue;
+        }
 
         // Parse optional `dark:` theme modifier (`dark:bg-*`, `dark:border-*`, `dark:text-*`).
         if (starts_with(tok, len, "dark:")) {
@@ -2535,7 +2596,8 @@ void inlay_ui_apply_cls_parse(InlaySurface* s, const char* cls, size_t cls_len,
     // Resolve final container axis before committing axis-dependent `items-*` and `gap-y-*`.
     const bool default_col =
         kind == INLAY_UI_SCROLL || kind == INLAY_UI_CARD ||
-        kind == INLAY_UI_MODAL || kind == INLAY_UI_POPOVER;
+        kind == INLAY_UI_MODAL || kind == INLAY_UI_POPOVER ||
+        kind == INLAY_UI_FORM;
     const bool is_col = (axis_override >= 0)
         ? (axis_override == 1)
         : (((st.flags & NfColumn) != 0u) || default_col);
@@ -2564,17 +2626,31 @@ void inlay_ui_apply_cls(InlaySurface* s, const char* cls, size_t cls_len,
                         InlayUiKind kind, NodeStyle& st) {
     if (!s || !cls || cls_len == 0u) return;
 
-    // Bypass cache if node already carries cold state or exceeds cache string cap.
-    if (st.cold_idx != INLAY_UI_NONE || cls_len > kClsCacheMaxStrLen) {
-        inlay_ui_apply_cls_parse(s, cls, cls_len, kind, st);
+    const float vp_w = (s->last_view_width_px > 0.0f) ? s->last_view_width_px : s->current_container_width_px;
+    const float ct_w = (s->current_container_width_px > 0.0f) ? s->current_container_width_px : s->last_view_width_px;
+    const uint8_t vp_bp = responsive_width_bucket(vp_w);
+    const uint8_t ct_bp = responsive_width_bucket(ct_w);
+
+    // Bypass cache if node already carries cold state, container width diverges from viewport bucket,
+    // or string exceeds cache cap.
+    if (st.cold_idx != INLAY_UI_NONE || cls_len > kClsCacheMaxStrLen || vp_bp != ct_bp) {
+        bool saw_responsive = false;
+        inlay_ui_apply_cls_parse(s, cls, cls_len, kind, st, &saw_responsive);
+        if (saw_responsive) {
+            inlay_ui_note_responsive_cls(s);
+        }
         return;
     }
 
     const bool default_col_kind =
         kind == INLAY_UI_SCROLL || kind == INLAY_UI_CARD ||
-        kind == INLAY_UI_MODAL || kind == INLAY_UI_POPOVER;
+        kind == INLAY_UI_MODAL || kind == INLAY_UI_POPOVER ||
+        kind == INLAY_UI_FORM;
+    // key_flags layout: bit0=init_col, bit1=default_col_kind, bit2=has_cold,
+    //                   bits3..5=bp_bucket (0..7), bit6=has_responsive, bit7=valid
     const uint8_t key_bits = static_cast<uint8_t>(((st.flags & NfColumn) != 0u ? 1u : 0u) |
-                                                  (default_col_kind ? 2u : 0u));
+                                                  (default_col_kind ? 2u : 0u) |
+                                                  ((ct_bp & 0x07u) << 3));
     const uint64_t h = cls_hash64(cls, cls_len);
     const uint32_t base_slot = static_cast<uint32_t>(h & (kClsCacheSets - 1u)) * kClsCacheWays;
 
@@ -2582,12 +2658,15 @@ void inlay_ui_apply_cls(InlaySurface* s, const char* cls, size_t cls_len,
         for (uint32_t w = 0u; w < kClsCacheWays; ++w) {
             auto& e = s->cls_cache[base_slot + w];
             if ((e.key_flags & 0x80u) != 0u && e.hash == h && e.str_len == uint16_t(cls_len) &&
-                (e.key_flags & 0x03u) == key_bits &&
+                (e.key_flags & 0x3Bu) == key_bits &&
                 std::memcmp(s->cls_cache_strs + e.str_off, cls, cls_len) == 0)
             {
                 e.last_hit = ++s->cls_cache_clock;
                 st = e.style;
                 st.cold_idx = INLAY_UI_NONE;
+                if ((e.key_flags & 0x40u) != 0u) {
+                    inlay_ui_note_responsive_cls(s);
+                }
                 if ((e.key_flags & 0x04u) != 0u) {
                     ColdVisualStyle* cold = inlay_ui_ensure_cold(s, st);
                     if (!cold) return;
@@ -2600,7 +2679,11 @@ void inlay_ui_apply_cls(InlaySurface* s, const char* cls, size_t cls_len,
 
     const uint32_t prev_shadows = s->shadow_pool_count;
     const uint32_t prev_grads = s->gradient_pool_count;
-    inlay_ui_apply_cls_parse(s, cls, cls_len, kind, st);
+    bool saw_responsive = false;
+    inlay_ui_apply_cls_parse(s, cls, cls_len, kind, st, &saw_responsive);
+    if (saw_responsive) {
+        inlay_ui_note_responsive_cls(s);
+    }
     if (JS_HasException(s->js) || s->shadow_pool_count != prev_shadows || s->gradient_pool_count != prev_grads) {
         return;
     }
@@ -2640,12 +2723,13 @@ void inlay_ui_apply_cls(InlaySurface* s, const char* cls, size_t cls_len,
     s->cls_cache_str_used += uint32_t(cls_len);
     dst.style = st;
     dst.style.cold_idx = INLAY_UI_NONE;
+    const uint8_t resp_bit = saw_responsive ? 0x40u : 0x00u;
     const ColdVisualStyle* cold = inlay_ui_get_cold(s, st);
     if (cold) {
         dst.cold = *cold;
-        dst.key_flags = static_cast<uint8_t>(0x80u | 0x04u | key_bits);
+        dst.key_flags = static_cast<uint8_t>(0x80u | 0x04u | resp_bit | key_bits);
     } else {
-        dst.key_flags = static_cast<uint8_t>(0x80u | key_bits);
+        dst.key_flags = static_cast<uint8_t>(0x80u | resp_bit | key_bits);
     }
 }
 

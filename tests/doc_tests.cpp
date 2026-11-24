@@ -2022,6 +2022,201 @@ int main(int argc,char** argv) {
   ok &= i1;
  }
 
+ // Track I3 checks: #26 Mermaid layout cache, #22 semantic A11y, #23 HTML5 & SVG exports, #42 async image loader.
+ {
+  bool i3=true;
+  bool i3_cache=true,i3_a11y=true,i3_html=true,i3_dsvg=true,i3_msvg=true,i3_loader=true;
+  auto fr=etch_frame_desc_default();fr.viewport_w=760;fr.viewport_h=960;
+
+  // 1. #26 Mermaid cross-frame layout cache & #22 Semantic A11y nodes
+  if(auto* doc3=inlay_doc_create(ctx,nullptr)) {
+   const EtchStr rich_md=ETCH_STR_LIT(
+    "# Heading One\n\n"
+    "## Heading Two\n\n"
+    "Visit [Etch Docs](https://example.org/docs) and note `<tag>&\"q\"`.\n\n"
+    "```cpp\nint x = 1 < 2;\n```\n\n"
+    "> Quoted note\n\n"
+    "- Item A\n- Item B\n\n"
+    "| Col1 | Col2 |\n| --- | --- |\n| V1 | V2 |\n\n"
+    "---\n\n"
+    "![Logo](logo.png)\n\n"
+    "$$\n\\frac{a+b}{c}\n$$\n\n"
+    "```mermaid\nflowchart TD\nA[Start] --> B[End]\n```\n");
+   i3 &= inlay_doc_set_utf8(doc3,rich_md);
+
+   auto v=inlay_doc_view_desc_default();
+   v.id=etch_id("i3-doc-view");v.width_px=640;v.height_px=0;
+
+   uint32_t entries=0;uint64_t hits=0,misses=0;
+   etch_begin_frame(ctx,&fr);inlay_doc_view(doc3,&v);etch_end_frame(ctx);
+   inlay_doc_diagram_cache_stats(doc3,&entries,&hits,&misses);
+   i3_cache &= entries==1u && misses==1ull && hits==0ull;
+
+   // Second & third frames must hit cache without incrementing misses!
+   etch_begin_frame(ctx,&fr);inlay_doc_view(doc3,&v);etch_end_frame(ctx);
+   etch_begin_frame(ctx,&fr);inlay_doc_view(doc3,&v);etch_end_frame(ctx);
+   inlay_doc_diagram_cache_stats(doc3,&entries,&hits,&misses);
+   i3_cache &= entries==1u && misses==1ull && hits==2ull;
+
+   // Verify #22 Semantic A11y nodes emitted on last frame
+   const auto str_contains=[](EtchStr hay,const char* needle) noexcept -> bool {
+    const size_t nlen=std::strlen(needle);
+    if(!hay.chars || nlen==0u || hay.length<nlen)return false;
+    for(uint32_t off=0u;off+nlen<=hay.length;++off) {
+     if(std::memcmp(hay.chars+off,needle,nlen)==0)return true;
+    }
+    return false;
+   };
+   bool saw_doc=false,saw_h1=false,saw_h2=false,saw_link=false,saw_math=false,saw_fig=false;
+   const uint32_t acount=etch_a11y_node_count(ctx,nullptr);
+   for(uint32_t ai=0;ai<acount;++ai) {
+    EtchA11yNode n={};
+    if(!etch_get_a11y_node(ai,&n,ctx,nullptr))continue;
+    if(n.role==ETCH_A11Y_DOCUMENT) saw_doc=true;
+    if(n.role==ETCH_A11Y_HEADING) {
+     if(std::fabs(n.value_num-1.0f)<0.01f && str_equal(n.label,ETCH_STR_LIT("Heading One"))) saw_h1=true;
+     if(std::fabs(n.value_num-2.0f)<0.01f && str_equal(n.label,ETCH_STR_LIT("Heading Two"))) saw_h2=true;
+    }
+    if(n.role==ETCH_A11Y_LINK) {
+     if(str_equal(n.label,ETCH_STR_LIT("Etch Docs")) &&
+        str_equal(n.value_text,ETCH_STR_LIT("https://example.org/docs")) &&
+        (n.actions_mask & etch_a11y_action_bit(ETCH_A11Y_ACT_PRESS))!=0u) saw_link=true;
+    }
+    if(n.role==ETCH_A11Y_MATH) {
+     if(str_equal(n.label,ETCH_STR_LIT("Math formula")) &&
+        str_contains(n.value_text,"\\frac{a+b}{c}")) saw_math=true;
+    }
+    if(n.role==ETCH_A11Y_FIGURE) {
+     if(str_equal(n.label,ETCH_STR_LIT("Diagram")) &&
+        str_contains(n.value_text,"Flowchart: 2 nodes, 1 edges")) saw_fig=true;
+    }
+   }
+   i3_a11y &= saw_doc && saw_h1 && saw_h2 && saw_link && saw_math && saw_fig;
+
+   // 2. #23 Semantic HTML5 export
+   const uint32_t html_need=inlay_doc_export_html(doc3,nullptr,0u);
+   i3_html &= html_need>128u;
+   char* html_buf=static_cast<char*>(SDL_malloc(size_t(html_need)+1u));
+   if(html_buf) {
+    const uint32_t html_got=inlay_doc_export_html(doc3,html_buf,html_need+1u);
+    i3_html &= html_got==html_need && html_buf[html_need]=='\0';
+    i3_html &= std::strstr(html_buf,"<h1>Heading One</h1>")!=nullptr;
+    i3_html &= std::strstr(html_buf,"<h2>Heading Two</h2>")!=nullptr;
+    i3_html &= std::strstr(html_buf,"<a href=\"https://example.org/docs\">Etch Docs</a>")!=nullptr;
+    i3_html &= std::strstr(html_buf,"<code>&lt;tag&gt;&amp;&quot;q&quot;</code>")!=nullptr;
+    i3_html &= std::strstr(html_buf,"<pre><code class=\"language-cpp\">int x = 1 &lt; 2;")!=nullptr;
+    i3_html &= std::strstr(html_buf,"<blockquote><p>Quoted note</p></blockquote>")!=nullptr;
+    i3_html &= std::strstr(html_buf,"<ul>")!=nullptr && std::strstr(html_buf,"<li>Item A</li>")!=nullptr;
+    i3_html &= std::strstr(html_buf,"<table>")!=nullptr && std::strstr(html_buf,"<th>Col1</th>")!=nullptr && std::strstr(html_buf,"<td>V1</td>")!=nullptr;
+    i3_html &= std::strstr(html_buf,"<hr>")!=nullptr;
+    i3_html &= std::strstr(html_buf,"<figure><img src=\"logo.png\" alt=\"Logo\"></figure>")!=nullptr;
+    i3_html &= std::strstr(html_buf,"<div class=\"math\">")!=nullptr;
+    i3_html &= std::strstr(html_buf,"<div class=\"mermaid\">")!=nullptr;
+    SDL_free(html_buf);
+   } else i3_html=false;
+
+   // Clearing doc frees diagram cache
+   inlay_doc_clear(doc3);
+   inlay_doc_diagram_cache_stats(doc3,&entries,&hits,&misses);
+   i3_cache &= entries==0u && hits==0ull && misses==0ull;
+   inlay_doc_destroy(doc3);
+  } else i3=false;
+
+  // 3. #23 Standalone Vector SVG exports (both OUTSIDE and INSIDE an active Etch frame!)
+  const EtchStr dg_src=ETCH_STR_LIT(
+   "flowchart TD\n"
+   "subgraph Group1\n"
+   "A([Start]) --> B{Check}\n"
+   "B -. retry .-> C((Done))\n"
+   "end\n");
+  const EtchStr seq_src=ETCH_STR_LIT("sequenceDiagram\nAlice->>Bob: Hello\nBob-->>Alice: Hi\n");
+  const EtchStr math_src=ETCH_STR_LIT("\\frac{a+b}{\\sqrt{x^2+1}}");
+
+  const auto check_diagram_svg=[](EtchStr src,bool expect_shapes) -> bool {
+   const uint32_t need=inlay_diagram_export_svg(src,nullptr,nullptr,0u);
+   if(need<64u)return false;
+   char* buf=static_cast<char*>(SDL_malloc(size_t(need)+1u));
+   if(!buf)return false;
+   const uint32_t got=inlay_diagram_export_svg(src,nullptr,buf,need+1u);
+   bool ok_s = got==need && buf[need]=='\0' &&
+               std::strstr(buf,"<svg xmlns=\"http://www.w3.org/2000/svg\"")!=nullptr &&
+               std::strstr(buf,"<defs>")!=nullptr &&
+               std::strstr(buf,"</svg>")!=nullptr;
+   if(expect_shapes) {
+    ok_s &= std::strstr(buf,"<polygon")!=nullptr &&
+            std::strstr(buf,"<circle")!=nullptr &&
+            std::strstr(buf,"stroke-dasharray")!=nullptr;
+   }
+   SDL_free(buf);
+   return ok_s;
+  };
+  const auto check_math_svg=[](EtchStr src) -> bool {
+   const uint32_t need=inlay_math_export_svg(src,nullptr,nullptr,0u);
+   if(need<64u)return false;
+   char* buf=static_cast<char*>(SDL_malloc(size_t(need)+1u));
+   if(!buf)return false;
+   const uint32_t got=inlay_math_export_svg(src,nullptr,buf,need+1u);
+   const bool ok_m = got==need && buf[need]=='\0' &&
+                     std::strstr(buf,"<svg xmlns=\"http://www.w3.org/2000/svg\"")!=nullptr &&
+                     std::strstr(buf,"<line")!=nullptr &&
+                     std::strstr(buf,"<polyline")!=nullptr &&
+                     std::strstr(buf,"<text")!=nullptr &&
+                     std::strstr(buf,"</svg>")!=nullptr;
+   SDL_free(buf);
+   return ok_m;
+  };
+  // Outside active frame:
+  i3_dsvg &= check_diagram_svg(dg_src,true) && check_diagram_svg(seq_src,false);
+  i3_msvg &= check_math_svg(math_src);
+  // Inside active frame:
+  etch_begin_frame(ctx,&fr);
+  i3_dsvg &= check_diagram_svg(dg_src,true);
+  i3_msvg &= check_math_svg(math_src);
+  etch_end_frame(ctx);
+
+  // 4. #42 Non-blocking Async Image Loader (SVG + raster BMP + cancel + resolve + epoch)
+  if(auto* loader=inlay_image_loader_create(ctx,nullptr)) {
+   static const char kSvgBytes[]="<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"24\" height=\"24\"><rect width=\"24\" height=\"24\" fill=\"#4f6ef7\"/></svg>";
+   static const uint8_t kBmp1x1[58]={
+    0x42,0x4D, 0x3A,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x36,0x00,0x00,0x00,
+    0x28,0x00,0x00,0x00, 0x01,0x00,0x00,0x00, 0x01,0x00,0x00,0x00, 0x01,0x00, 0x18,0x00,
+    0x00,0x00,0x00,0x00, 0x04,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00, 0x00,0x00,0x00,0x00, 0xFF,0x80,0x40,0x00
+   };
+   const uint32_t ep0=inlay_image_loader_epoch(loader);
+   i3_loader &= inlay_image_loader_status(loader,ETCH_STR_LIT("icon.svg"))==INLAY_IMAGE_STATUS_IDLE;
+   i3_loader &= inlay_image_loader_request_memory(loader,ETCH_STR_LIT("icon.svg"),kSvgBytes,sizeof(kSvgBytes)-1u,true);
+   i3_loader &= inlay_image_loader_request_memory(loader,ETCH_STR_LIT("dot.bmp"),kBmp1x1,sizeof(kBmp1x1),true);
+   i3_loader &= inlay_image_loader_request_memory(loader,ETCH_STR_LIT("cancel.bmp"),kBmp1x1,sizeof(kBmp1x1),true);
+   inlay_image_loader_cancel(loader,ETCH_STR_LIT("cancel.bmp"));
+   i3_loader &= inlay_image_loader_status(loader,ETCH_STR_LIT("cancel.bmp"))==INLAY_IMAGE_STATUS_IDLE;
+
+   for(int iter=0;iter<200;++iter) {
+    (void)inlay_image_loader_poll(loader,4u);
+    if(inlay_image_loader_status(loader,ETCH_STR_LIT("icon.svg"))==INLAY_IMAGE_STATUS_READY &&
+       inlay_image_loader_status(loader,ETCH_STR_LIT("dot.bmp"))==INLAY_IMAGE_STATUS_READY) break;
+    SDL_Delay(5);
+   }
+   i3_loader &= inlay_image_loader_status(loader,ETCH_STR_LIT("icon.svg"))==INLAY_IMAGE_STATUS_READY;
+   i3_loader &= inlay_image_loader_status(loader,ETCH_STR_LIT("dot.bmp"))==INLAY_IMAGE_STATUS_READY;
+   i3_loader &= inlay_image_loader_status(loader,ETCH_STR_LIT("cancel.bmp"))==INLAY_IMAGE_STATUS_IDLE;
+   i3_loader &= inlay_image_loader_epoch(loader)>=ep0+2u;
+
+   InlayImageResult res_svg={},res_bmp={},res_cancel={};
+   i3_loader &= inlay_image_loader_resolve(ETCH_STR_LIT("icon.svg"),&res_svg,loader) &&
+                res_svg.texture!=nullptr && res_svg.width_px>0.f && res_svg.height_px>0.f;
+   i3_loader &= inlay_image_loader_resolve(ETCH_STR_LIT("dot.bmp"),&res_bmp,loader) &&
+                res_bmp.texture!=nullptr && res_bmp.width_px==1.f && res_bmp.height_px==1.f;
+   i3_loader &= !inlay_image_loader_resolve(ETCH_STR_LIT("cancel.bmp"),&res_cancel,loader);
+   inlay_image_loader_destroy(loader);
+  } else i3_loader=false;
+
+  i3 &= i3_cache && i3_a11y && i3_html && i3_dsvg && i3_msvg && i3_loader;
+  if(!i3)std::fprintf(stderr,"Track I3 failed: cache=%d a11y=%d html=%d dsvg=%d msvg=%d loader=%d\n",
+                      i3_cache,i3_a11y,i3_html,i3_dsvg,i3_msvg,i3_loader);
+  ok &= i3;
+ }
+
  inlay_doc_destroy(reference);inlay_doc_destroy(streamed);etch_destroy_context(ctx);
  ok &= flow_document(nullptr);
  std::printf("32KB streaming equivalence: %s\n",ok ? "PASS" : "FAIL");return ok ? 0 : 1;

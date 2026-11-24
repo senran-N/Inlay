@@ -92,11 +92,28 @@ switches (`hover:`, `active:`, `focus:`, and live `dark:` prefixes). Declarative
 functional components support call-path and `key`-scoped `useState`, `useRef`,
 `useMemo`, `useCallback`, and `useEffect` (with automatic unmount cleanup).
 Define `const Panel = memo(PanelBody)` at script scope to reuse a keyed
-component's JS tree while its props remain shallow-equal. Pass external
-state as props, including revisions for mutable data. Setters inside a
-memoized subtree invalidate its memoized ancestors. An optional second
-argument compares the previous and next props. Native nodes still rebuild
-on a surface update.
+component's JS tree and materialize cached native UI subtrees while its props
+and responsive breakpoint remain unchanged (`inlay_surface_memo_reused_nodes`).
+Responsive and container-query prefixes (`sm:`, `md:`, `lg:`, `xl:`, `@sm:`,
+`@md:`, `@lg:`) work inside `cls`. Bind reusable host row/tree data sources via
+`InlayModel` + `inlay_surface_bind_model`, custom measured/accessible slots via
+`inlay_surface_bind_slot_ex`, grouped `<Form>` validation/submit, scoped
+`stopPropagation` routing, action permission policies + audit hooks
+(`inlay_surface_set_action_policy`, `inlay_surface_set_action_audit_hook`), and
+export typed host declarations with `inlay_surface_export_dts`.
+
+For AI workbenches, rich exports, media, and portals, Inlay also provides
+`InlayStream` (stable 64-bit IDs, delta appends, resumable cursor, JSON
+session persistence), verifiable Generative UI schema validation & safe surface
+rendering (`inlay_genui_*`), W3C DTCG Design Token import/export
+(`inlay_tokens_*`), cross-frame Mermaid layout caching
+(`inlay_doc_diagram_cache_stats`), semantic document/heading/link/math/diagram
+A11y emission, semantic HTML5 & standalone vector SVG export
+(`inlay_doc_export_html`, `inlay_diagram_export_svg`, `inlay_math_export_svg`),
+a non-blocking `InlayImageLoader` with bounded VRAM LRU eviction, and Portal
+navigation/origin policies, history, and bidirectional messaging
+(`inlay_portal_set_policy`, `inlay_portal_post_message`,
+`inlay_portal_poll_message`, `inlay_portal_end_frame_sync`).
 Wrap a panel in `<ErrorBoundary render={() => <Panel/>} fallback={(err, retry) => <Button text={String(err)} onClick={retry}/>}/>`
 or pass the same props to `ui.errorBoundary`. A synchronous render exception
 unmounts that subtree and displays the fallback. Sibling panels keep their

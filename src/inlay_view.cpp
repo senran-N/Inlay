@@ -5,7 +5,278 @@
 #include <cmath>
 #include <cstdlib>
 
+struct InlayDiagramCache {
+ static constexpr uint32_t kMaxEntries = 32u;
+ struct Entry {
+  bool occupied;
+  uint64_t lru_clock;
+  uint64_t source_hash;
+  uint32_t source_len;
+  uint32_t width_bucket;
+  uint32_t font_bucket;
+  uint32_t font_ids_key;
+  InlayDiagramResult result;
+  InlayDiagramMeta meta;
+  InlayDiagramNode* nodes;
+  InlayDiagramEdge* edges;
+  InlayDiagramShape* shapes;
+  uint8_t* edge_styles;
+  InlayDiagramSubgraph* subgraphs;
+  InlayDiagramEdgePath* edge_paths;
+  EtchVec2* waypoints;
+  char* str_buf;
+  uint32_t str_len;
+ };
+ Entry entries[kMaxEntries];
+ uint32_t entry_count;
+ uint64_t clock;
+ uint64_t hits;
+ uint64_t misses;
+};
+
 namespace {
+
+struct DiagramCacheKey {
+ uint64_t source_hash;
+ uint32_t source_len;
+ uint32_t width_bucket;
+ uint32_t font_bucket;
+ uint32_t font_ids_key;
+};
+
+DiagramCacheKey make_diagram_cache_key(EtchStr body, const InlayDiagramDesc& ddesc) noexcept {
+ DiagramCacheKey k = {};
+ k.source_hash = inlay_fnv1a_64(body.chars, body.length);
+ k.source_len = body.length;
+ k.width_bucket = static_cast<uint32_t>(std::lround(std::fmax(0.f, ddesc.max_width_px) * 2.0f));
+ k.font_bucket = static_cast<uint32_t>(std::lround(std::fmax(0.f, ddesc.font_size_px) * 4.0f));
+ const uint32_t f0 = ddesc.has_custom_fonts ? uint32_t(ddesc.font_id) : 0xFFFFu;
+ const uint32_t f1 = ddesc.has_custom_fonts ? uint32_t(ddesc.bold_font_id) : 0xFFFFu;
+ k.font_ids_key = (f0 & 0xFFFFu) | ((f1 & 0xFFFFu) << 16);
+ return k;
+}
+
+void free_diagram_cache_entry(InlayDiagramCache::Entry* e) noexcept {
+ if (!e || !e->occupied) return;
+ SDL_free(e->nodes);
+ SDL_free(e->edges);
+ SDL_free(e->shapes);
+ SDL_free(e->edge_styles);
+ SDL_free(e->subgraphs);
+ SDL_free(e->edge_paths);
+ SDL_free(e->waypoints);
+ SDL_free(e->str_buf);
+ *e = {};
+}
+
+InlayDiagramCache::Entry* diagram_cache_find(InlayDiagramCache* cache, const DiagramCacheKey& k) noexcept {
+ if (!cache) return nullptr;
+ for (uint32_t i = 0u; i < InlayDiagramCache::kMaxEntries; ++i) {
+  auto& e = cache->entries[i];
+  if (e.occupied && e.source_hash == k.source_hash && e.source_len == k.source_len &&
+      e.width_bucket == k.width_bucket && e.font_bucket == k.font_bucket && e.font_ids_key == k.font_ids_key) {
+   e.lru_clock = ++cache->clock;
+   return &e;
+  }
+ }
+ return nullptr;
+}
+
+bool diagram_cache_store(InlayDiagramCache* cache, const DiagramCacheKey& k,
+                         const InlayDiagramResult& res, const InlayDiagramMeta& meta) noexcept {
+ if (!cache || !res.valid) return false;
+ uint32_t slot = InlayDiagramCache::kMaxEntries;
+ for (uint32_t i = 0u; i < InlayDiagramCache::kMaxEntries; ++i) {
+  if (!cache->entries[i].occupied) { slot = i; break; }
+ }
+ bool replacing = false;
+ if (slot == InlayDiagramCache::kMaxEntries) {
+  slot = 0u;
+  uint64_t oldest = cache->entries[0].lru_clock;
+  for (uint32_t i = 1u; i < InlayDiagramCache::kMaxEntries; ++i) {
+   if (cache->entries[i].lru_clock < oldest) {
+    oldest = cache->entries[i].lru_clock;
+    slot = i;
+   }
+  }
+  replacing = true;
+ }
+
+ uint32_t total_str = 0u;
+ for (uint32_t i = 0u; i < res.node_count; ++i) {
+  total_str += res.nodes[i].id.length + res.nodes[i].label.length;
+ }
+ for (uint32_t i = 0u; i < res.edge_count; ++i) {
+  total_str += res.edges[i].label.length;
+ }
+ for (uint32_t i = 0u; i < meta.subgraph_count; ++i) {
+  total_str += meta.subgraphs[i].title.length;
+ }
+
+ InlayDiagramCache::Entry e = {};
+ bool ok = true;
+ if (res.node_count > 0u) {
+  e.nodes = static_cast<InlayDiagramNode*>(SDL_malloc(size_t(res.node_count) * sizeof(InlayDiagramNode)));
+  if (!e.nodes) ok = false;
+  if (ok && meta.shapes) {
+   e.shapes = static_cast<InlayDiagramShape*>(SDL_malloc(size_t(res.node_count) * sizeof(InlayDiagramShape)));
+   if (!e.shapes) ok = false;
+  }
+ }
+ if (ok && res.edge_count > 0u) {
+  e.edges = static_cast<InlayDiagramEdge*>(SDL_malloc(size_t(res.edge_count) * sizeof(InlayDiagramEdge)));
+  if (!e.edges) ok = false;
+  if (ok && meta.edge_styles) {
+   e.edge_styles = static_cast<uint8_t*>(SDL_malloc(size_t(res.edge_count)));
+   if (!e.edge_styles) ok = false;
+  }
+  if (ok && meta.edge_paths) {
+   e.edge_paths = static_cast<InlayDiagramEdgePath*>(SDL_malloc(size_t(res.edge_count) * sizeof(InlayDiagramEdgePath)));
+   if (!e.edge_paths) ok = false;
+  }
+ }
+ if (ok && meta.subgraph_count > 0u && meta.subgraphs) {
+  e.subgraphs = static_cast<InlayDiagramSubgraph*>(SDL_malloc(size_t(meta.subgraph_count) * sizeof(InlayDiagramSubgraph)));
+  if (!e.subgraphs) ok = false;
+ }
+ if (ok && meta.waypoint_count > 0u && meta.waypoints) {
+  e.waypoints = static_cast<EtchVec2*>(SDL_malloc(size_t(meta.waypoint_count) * sizeof(EtchVec2)));
+  if (!e.waypoints) ok = false;
+ }
+ if (ok && total_str > 0u) {
+  e.str_buf = static_cast<char*>(SDL_malloc(total_str));
+  if (!e.str_buf) ok = false;
+ }
+ if (!ok) {
+  e.occupied = true;
+  free_diagram_cache_entry(&e);
+  return false;
+ }
+
+ uint32_t soff = 0u;
+ const auto copy_str = [&](EtchStr s) noexcept -> EtchStr {
+  if (!s.length || !s.chars) return {};
+  std::memcpy(e.str_buf + soff, s.chars, s.length);
+  EtchStr out = {e.str_buf + soff, s.length, false};
+  soff += s.length;
+  return out;
+ };
+ for (uint32_t i = 0u; i < res.node_count; ++i) {
+  e.nodes[i] = res.nodes[i];
+  e.nodes[i].id = copy_str(res.nodes[i].id);
+  e.nodes[i].label = copy_str(res.nodes[i].label);
+ }
+ if (e.shapes) std::memcpy(e.shapes, meta.shapes, size_t(res.node_count) * sizeof(InlayDiagramShape));
+ for (uint32_t i = 0u; i < res.edge_count; ++i) {
+  e.edges[i] = res.edges[i];
+  e.edges[i].label = copy_str(res.edges[i].label);
+ }
+ if (e.edge_styles) std::memcpy(e.edge_styles, meta.edge_styles, size_t(res.edge_count));
+ if (e.edge_paths) std::memcpy(e.edge_paths, meta.edge_paths, size_t(res.edge_count) * sizeof(InlayDiagramEdgePath));
+ for (uint32_t i = 0u; i < meta.subgraph_count; ++i) {
+  e.subgraphs[i] = meta.subgraphs[i];
+  e.subgraphs[i].title = copy_str(meta.subgraphs[i].title);
+ }
+ if (e.waypoints) std::memcpy(e.waypoints, meta.waypoints, size_t(meta.waypoint_count) * sizeof(EtchVec2));
+
+ e.str_len = soff;
+ e.occupied = true;
+ e.lru_clock = ++cache->clock;
+ e.source_hash = k.source_hash;
+ e.source_len = k.source_len;
+ e.width_bucket = k.width_bucket;
+ e.font_bucket = k.font_bucket;
+ e.font_ids_key = k.font_ids_key;
+ e.result = res;
+ e.result.nodes = e.nodes;
+ e.result.edges = e.edges;
+ e.meta = meta;
+ e.meta.shapes = e.shapes;
+ e.meta.edge_styles = e.edge_styles;
+ e.meta.subgraphs = e.subgraphs;
+ e.meta.edge_paths = e.edge_paths;
+ e.meta.waypoints = e.waypoints;
+
+ if (replacing) free_diagram_cache_entry(&cache->entries[slot]);
+ else ++cache->entry_count;
+ cache->entries[slot] = e;
+ return true;
+}
+
+bool diagram_cache_materialize(EtchContext* ctx, const InlayDiagramCache::Entry& e,
+                               InlayDiagramResult* out_res, InlayDiagramMeta* out_meta) noexcept {
+ *out_res = e.result;
+ *out_meta = e.meta;
+ char* a_str = nullptr;
+ if (e.str_len > 0u) {
+  a_str = static_cast<char*>(etch_frame_arena_alloc(ctx, e.str_len, 1));
+  if (!a_str) return false;
+  std::memcpy(a_str, e.str_buf, e.str_len);
+ }
+ const auto remap = [&](EtchStr s) noexcept -> EtchStr {
+  if (!s.length || !s.chars || !a_str) return {};
+  return {a_str + (s.chars - e.str_buf), s.length, false};
+ };
+ if (e.result.node_count > 0u) {
+  auto* a_nodes = static_cast<InlayDiagramNode*>(
+   etch_frame_arena_alloc(ctx, size_t(e.result.node_count) * sizeof(InlayDiagramNode), alignof(InlayDiagramNode)));
+  if (!a_nodes) return false;
+  for (uint32_t i = 0u; i < e.result.node_count; ++i) {
+   a_nodes[i] = e.nodes[i];
+   a_nodes[i].id = remap(e.nodes[i].id);
+   a_nodes[i].label = remap(e.nodes[i].label);
+  }
+  out_res->nodes = a_nodes;
+  if (e.shapes) {
+   auto* a_shapes = static_cast<InlayDiagramShape*>(
+    etch_frame_arena_alloc(ctx, size_t(e.result.node_count) * sizeof(InlayDiagramShape), alignof(InlayDiagramShape)));
+   if (!a_shapes) return false;
+   std::memcpy(a_shapes, e.shapes, size_t(e.result.node_count) * sizeof(InlayDiagramShape));
+   out_meta->shapes = a_shapes;
+  }
+ }
+ if (e.result.edge_count > 0u) {
+  auto* a_edges = static_cast<InlayDiagramEdge*>(
+   etch_frame_arena_alloc(ctx, size_t(e.result.edge_count) * sizeof(InlayDiagramEdge), alignof(InlayDiagramEdge)));
+  if (!a_edges) return false;
+  for (uint32_t i = 0u; i < e.result.edge_count; ++i) {
+   a_edges[i] = e.edges[i];
+   a_edges[i].label = remap(e.edges[i].label);
+  }
+  out_res->edges = a_edges;
+  if (e.edge_styles) {
+   auto* a_es = static_cast<uint8_t*>(etch_frame_arena_alloc(ctx, size_t(e.result.edge_count), 1));
+   if (!a_es) return false;
+   std::memcpy(a_es, e.edge_styles, size_t(e.result.edge_count));
+   out_meta->edge_styles = a_es;
+  }
+  if (e.edge_paths) {
+   auto* a_ep = static_cast<InlayDiagramEdgePath*>(
+    etch_frame_arena_alloc(ctx, size_t(e.result.edge_count) * sizeof(InlayDiagramEdgePath), alignof(InlayDiagramEdgePath)));
+   if (!a_ep) return false;
+   std::memcpy(a_ep, e.edge_paths, size_t(e.result.edge_count) * sizeof(InlayDiagramEdgePath));
+   out_meta->edge_paths = a_ep;
+  }
+ }
+ if (e.meta.subgraph_count > 0u && e.subgraphs) {
+  auto* a_sg = static_cast<InlayDiagramSubgraph*>(
+   etch_frame_arena_alloc(ctx, size_t(e.meta.subgraph_count) * sizeof(InlayDiagramSubgraph), alignof(InlayDiagramSubgraph)));
+  if (!a_sg) return false;
+  for (uint32_t i = 0u; i < e.meta.subgraph_count; ++i) {
+   a_sg[i] = e.subgraphs[i];
+   a_sg[i].title = remap(e.subgraphs[i].title);
+  }
+  out_meta->subgraphs = a_sg;
+ }
+ if (e.meta.waypoint_count > 0u && e.waypoints) {
+  auto* a_wp = static_cast<EtchVec2*>(
+   etch_frame_arena_alloc(ctx, size_t(e.meta.waypoint_count) * sizeof(EtchVec2), alignof(EtchVec2)));
+  if (!a_wp) return false;
+  std::memcpy(a_wp, e.waypoints, size_t(e.meta.waypoint_count) * sizeof(EtchVec2));
+  out_meta->waypoints = a_wp;
+ }
+ return true;
+}
 
 EtchStr slice(EtchStr source, uint32_t start, uint32_t n) noexcept {
  return {source.chars + start, n, false};
@@ -143,6 +414,8 @@ float native_math_box(EtchStr source, float font, uint32_t id, float max_width, 
  box.clip_children = true;
  if (top_pad > 0.f) box.padding = {0, 0, top_pad, 0};
  etch_begin_box(&box);
+ etch_emit_a11y_node(id, ETCH_A11Y_MATH, ETCH_STR_LIT("Math formula"), copied,
+                     ETCH_A11Y_STATE_NONE, 0u, 0.f, {});
  if (needs_hscroll || needs_vscroll) {
   auto content = etch_box_desc_default();
   content.width = etch_sizing_fixed(width);
@@ -1553,6 +1826,16 @@ float rich_line(InlayMeasure* m, EtchStr line, uint32_t base_id, float font, Inl
    apply_segment_selection(m, desc.id, seg_start, total_text_bytes);
    record_vis_seg(m, {desc.id, row_index, block_index, seg_start, total_text_bytes, base_font, 0, font, line_height, true});
    *io_doc_cursor += total_text_bytes;
+  }
+ }
+ for (uint32_t i = 0; i < count; ++i) {
+  const auto& t = m->tokens[low + i];
+  if ((t.flags & InlayInlineLink) && spans[i].id && spans[i].text.length) {
+   const EtchStr url = (t.flags & InlayInlineUrlInPool)
+    ? EtchStr{m->doc->ast_text + t.url_offset, t.url_length, false}
+    : slice(source, t.url_offset, t.url_length);
+   etch_emit_a11y_node(spans[i].id, ETCH_A11Y_LINK, spans[i].text, url,
+                       ETCH_A11Y_STATE_NONE, etch_a11y_action_bit(ETCH_A11Y_ACT_PRESS), 0.f, {});
   }
  }
  if (!estimate) return 0;
@@ -3281,6 +3564,10 @@ INLAY_API InlayDocResult inlay_doc_view(InlayDoc* doc, const InlayDocViewDesc* i
   result.visible_end = visible.end_index;
   result.at_bottom = visible.at_bottom;
  }
+ const uint32_t doc_a11y_actions = flow ? 0u
+  : (etch_a11y_action_bit(ETCH_A11Y_ACT_INCREMENT) | etch_a11y_action_bit(ETCH_A11Y_ACT_DECREMENT));
+ etch_emit_a11y_node(view.id, ETCH_A11Y_DOCUMENT, ETCH_STR_LIT("Document"), {},
+                     ETCH_A11Y_STATE_NONE, doc_a11y_actions, 0.f, {});
  const auto theme = etch_get_theme(doc->context);
  const EtchStr source = doc_source_str(doc);
  PendingTaskToggle pending_toggle = {};
@@ -3437,6 +3724,29 @@ INLAY_API InlayDocResult inlay_doc_view(InlayDoc* doc, const InlayDocViewDesc* i
    info.offset > 0u && source.chars[info.offset - 1u] != '\n' &&
    b.kind != INLAY_CODE_BLOCK && b.kind != INLAY_TABLE && b.kind != INLAY_THEMATIC_BREAK && b.kind != INLAY_IMAGE && b.kind != INLAY_FOOTNOTE ? &box : nullptr;
   if (!pending_box) etch_begin_box(&box);
+  if (b.kind == INLAY_HEADING && info.first) {
+   const uint32_t h_lvl = b.level < 1u ? 1u : (b.level > 6u ? 6u : b.level);
+   EtchStr h_label = {};
+   if (measure->plain_text && info.doc_text_offset < measure->plain_len) {
+    uint32_t h_end = info.doc_text_offset + info.doc_text_length;
+    for (uint32_t j = i + 1u; j < measure->count && measure->rows[j].block == info.block; ++j) {
+     const uint32_t re = measure->rows[j].doc_text_offset + measure->rows[j].doc_text_length;
+     if (re > h_end) h_end = re;
+    }
+    if (h_end > measure->plain_len) h_end = measure->plain_len;
+    if (h_end > info.doc_text_offset) {
+     h_label = {measure->plain_text + info.doc_text_offset, h_end - info.doc_text_offset, false};
+    }
+   }
+   if (!h_label.length) {
+    const auto& full_h = doc->blocks[info.block];
+    uint32_t hl = full_h.content_length;
+    while (hl > 0u && (source.chars[full_h.content_offset + hl - 1u] == '\n' ||
+                       source.chars[full_h.content_offset + hl - 1u] == '\r')) --hl;
+    h_label = slice(source, full_h.content_offset, hl);
+   }
+   etch_emit_a11y_node(row_id, ETCH_A11Y_HEADING, h_label, {}, ETCH_A11Y_STATE_NONE, 0u, float(h_lvl), {});
+  }
 
   float styled_height = 0;
   if (b.kind == INLAY_THEMATIC_BREAK) {
@@ -3466,17 +3776,33 @@ INLAY_API InlayDocResult inlay_doc_view(InlayDoc* doc, const InlayDocViewDesc* i
    InlayDiagramMeta diagram_meta = {};
    InlayDiagramDesc ddesc = inlay_diagram_desc_default();
    if (full.complete) {
-    auto* copy = body.length ? static_cast<char*>(etch_frame_arena_alloc(doc->context, body.length, 1)) : nullptr;
-    if (copy) { std::memcpy(copy, body.chars, body.length); copied = {copy, body.length, false}; }
-    if (!body.length || copy) {
-     ddesc.font_size_px = view.font_size_px;
-     ddesc.max_width_px = full_scale ? 0.f : inner_w;
-     if (style.font_id != ETCH_INVALID_FONT || style.bold_font_id != ETCH_INVALID_FONT) {
-      ddesc.has_custom_fonts = true;
-      ddesc.font_id = style.font_id;
-      ddesc.bold_font_id = style.bold_font_id;
+    ddesc.font_size_px = view.font_size_px;
+    ddesc.max_width_px = full_scale ? 0.f : inner_w;
+    if (style.font_id != ETCH_INVALID_FONT || style.bold_font_id != ETCH_INVALID_FONT) {
+     ddesc.has_custom_fonts = true;
+     ddesc.font_id = style.font_id;
+     ddesc.bold_font_id = style.bold_font_id;
+    }
+    if (!doc->diagram_cache) {
+     doc->diagram_cache = static_cast<InlayDiagramCache*>(SDL_calloc(1u, sizeof(InlayDiagramCache)));
+    }
+    const DiagramCacheKey dkey = make_diagram_cache_key(body, ddesc);
+    InlayDiagramCache::Entry* cached_entry = diagram_cache_find(doc->diagram_cache, dkey);
+    if (cached_entry && diagram_cache_materialize(doc->context, *cached_entry, &diagram_result, &diagram_meta)) {
+     ++doc->diagram_cache->hits;
+     copied = {};
+    } else {
+     auto* copy = body.length ? static_cast<char*>(etch_frame_arena_alloc(doc->context, body.length, 1)) : nullptr;
+     if (copy) { std::memcpy(copy, body.chars, body.length); copied = {copy, body.length, false}; }
+     if (!body.length || copy) {
+      diagram_result = inlay_diagram_layout_ex(copied, &ddesc, &diagram_meta);
+      if (doc->diagram_cache) {
+       ++doc->diagram_cache->misses;
+       if (diagram_result.valid) {
+        diagram_cache_store(doc->diagram_cache, dkey, diagram_result, diagram_meta);
+       }
+      }
      }
-     diagram_result = inlay_diagram_layout_ex(copied, &ddesc, &diagram_meta);
     }
    }
 
@@ -3549,6 +3875,9 @@ INLAY_API InlayDocResult inlay_doc_view(InlayDoc* doc, const InlayDocViewDesc* i
     ph.color = !full.complete ? muted_col : (style.code_color.a != 0 ? style.code_color : theme.text_code);
     ph.wrap = true;
     etch_text(body.length ? body : ETCH_STR_LIT("..."), &ph);
+    etch_emit_a11y_node(etch_id_index(row_id, 7), ETCH_A11Y_FIGURE, ETCH_STR_LIT("Diagram"),
+                        full.complete ? ETCH_STR_LIT("Mermaid diagram") : ETCH_STR_LIT("Loading diagram"),
+                        ETCH_A11Y_STATE_NONE, 0u, 0.f, {});
    } else {
     const float dw = diagram_result.width;
     const float dh = diagram_result.height;
@@ -3564,6 +3893,17 @@ INLAY_API InlayDocResult inlay_doc_view(InlayDoc* doc, const InlayDocViewDesc* i
     dbox.scroll_x = needs_hscroll;
     dbox.clip_children = true;
     etch_begin_box(&dbox);
+    {
+     char fig_summary[128];
+     const int n = diagram_result.sequence
+      ? std::snprintf(fig_summary, sizeof(fig_summary), "Sequence diagram: %u participants, %u messages",
+                      diagram_result.node_count, diagram_result.edge_count)
+      : std::snprintf(fig_summary, sizeof(fig_summary), "Flowchart: %u nodes, %u edges",
+                      diagram_result.node_count, diagram_result.edge_count);
+     const EtchStr fig_val = n > 0 ? EtchStr{fig_summary, static_cast<uint32_t>(n), false} : EtchStr{};
+     etch_emit_a11y_node(dbox.id, ETCH_A11Y_FIGURE, ETCH_STR_LIT("Diagram"), fig_val,
+                         ETCH_A11Y_STATE_NONE, 0u, 0.f, {});
+    }
     if (needs_hscroll || needs_vscroll) {
      auto dcontent = etch_box_desc_default();
      dcontent.width = etch_sizing_fixed(dw);
@@ -3930,4 +4270,20 @@ INLAY_API InlayDocResult inlay_doc_view(InlayDoc* doc, const InlayDocViewDesc* i
  }
  return result;
 }
+
+INLAY_API void inlay_doc_diagram_cache_stats(const InlayDoc* doc, uint32_t* out_entries, uint64_t* out_hits, uint64_t* out_misses) {
+ const InlayDiagramCache* c = doc ? doc->diagram_cache : nullptr;
+ if (out_entries) *out_entries = c ? c->entry_count : 0u;
+ if (out_hits) *out_hits = c ? c->hits : 0ull;
+ if (out_misses) *out_misses = c ? c->misses : 0ull;
+}
+} // extern "C"
+
+void inlay_doc_free_diagram_cache(InlayDoc* doc) noexcept {
+ if (!doc || !doc->diagram_cache) return;
+ for (uint32_t i = 0u; i < InlayDiagramCache::kMaxEntries; ++i) {
+  free_diagram_cache_entry(&doc->diagram_cache->entries[i]);
+ }
+ SDL_free(doc->diagram_cache);
+ doc->diagram_cache = nullptr;
 }

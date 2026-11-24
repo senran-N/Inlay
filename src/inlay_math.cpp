@@ -1,8 +1,51 @@
 #include "inlay_internal.h"
 #include <cmath>
+#include <cstddef>
+#include <cstdio>
 #include <cstring>
 
 namespace {
+struct MathChunk {
+    MathChunk* next;
+    size_t used;
+    size_t cap;
+    size_t reserved;
+    uint8_t data[16];
+};
+
+struct MathHeapArena {
+    MathChunk* head;
+    void* alloc(size_t bytes, size_t align) noexcept {
+        if (align < 1u) align = 1u;
+        if (bytes == 0u) bytes = 1u;
+        if (head) {
+            const size_t cur = (head->used + align - 1u) & ~(align - 1u);
+            if (cur + bytes <= head->cap) {
+                head->used = cur + bytes;
+                return head->data + cur;
+            }
+        }
+        const size_t need = bytes + align + 2048u;
+        const size_t chunk_cap = need > 8192u ? need : 8192u;
+        auto* c = static_cast<MathChunk*>(SDL_malloc(offsetof(MathChunk, data) + chunk_cap));
+        if (!c) return nullptr;
+        c->next = head;
+        c->used = 0u;
+        c->cap = chunk_cap;
+        head = c;
+        const size_t cur = (c->used + align - 1u) & ~(align - 1u);
+        c->used = cur + bytes;
+        return c->data + cur;
+    }
+    void destroy() noexcept {
+        while (head) {
+            MathChunk* nx = head->next;
+            SDL_free(head);
+            head = nx;
+        }
+    }
+};
+
 enum Kind : uint8_t { Row, Glyph, Fraction, Root, Scripts, Accent, Grid, Delimited, Limits, Space };
 enum MathStyle : uint8_t { StyleDisplay = 0, StyleText = 1, StyleScript = 2, StyleScriptScript = 3 };
 enum MathClass : uint8_t { ClOrd = 0, ClOp = 1, ClBin = 2, ClRel = 3, ClOpen = 4, ClClose = 5, ClPunct = 6 };
@@ -33,6 +76,8 @@ struct Parser {
     InlayMathError error;
     uint32_t depth;
     float base_size;
+    MathHeapArena* heap;
+    bool use_etch_fonts;
 };
 
 float style_scale(MathStyle st) noexcept {
@@ -75,17 +120,25 @@ StyleState sub_style(StyleState st) noexcept {
     return { next, true };
 }
 
-float math_axis(float size) noexcept {
-    const auto m = etch_font_metrics(ETCH_FONT_SANS, size);
-    return m.ascent * 0.36f;
+float math_axis(float size, bool use_etch_fonts = true) noexcept {
+    if (use_etch_fonts) {
+        const auto m = etch_font_metrics(ETCH_FONT_SANS, size);
+        return m.ascent * 0.36f;
+    }
+    return size * 0.80f * 0.36f;
 }
 
 float rule_thickness(float size) noexcept {
     return std::fmax(1.0f, size * 0.062f);
 }
 
+void* math_alloc(Parser* p, size_t bytes, size_t align) noexcept {
+    if (p->heap) return p->heap->alloc(bytes, align);
+    return etch_frame_arena_alloc(etch_current_context(), bytes, align);
+}
+
 Box* make(Parser* p, Kind kind, float size, MathClass cls = ClOrd) noexcept {
-    auto* box = static_cast<Box*>(etch_frame_arena_alloc(etch_current_context(), sizeof(Box), alignof(Box)));
+    auto* box = static_cast<Box*>(math_alloc(p, sizeof(Box), alignof(Box)));
     if (!box) { p->valid = false; return nullptr; }
     *box = {};
     box->kind = kind;
@@ -101,11 +154,26 @@ Box* glyph(Parser* p, EtchStr text, float size, uint16_t font_id = ETCH_FONT_SAN
     box->text = text;
     box->font_id = font_id;
     box->flags = flags;
-    const auto measure = etch_measure_text(text, font_id, size, 0);
-    const auto metrics = etch_font_metrics(font_id, size);
-    box->width = measure.x;
-    box->ascent = metrics.ascent;
-    box->descent = metrics.descent;
+    if (p->use_etch_fonts) {
+        const auto measure = etch_measure_text(text, font_id, size, 0);
+        const auto metrics = etch_font_metrics(font_id, size);
+        box->width = measure.x;
+        box->ascent = metrics.ascent;
+        box->descent = metrics.descent;
+    } else {
+        size_t pos = 0u;
+        float units = 0.0f;
+        while (pos < text.length) {
+            const uint32_t cp = inlay_utf8_next(text.chars, text.length, &pos);
+            if (cp == 'i' || cp == 'l' || cp == '.' || cp == ',' || cp == ';' || cp == '|' || cp == '(' || cp == ')') units += 0.34f;
+            else if (cp >= 0x2200u && cp <= 0x22FFu) units += 0.72f;
+            else if (cp > 0x2E7Fu) units += 1.0f;
+            else units += 0.56f;
+        }
+        box->width = units * size;
+        box->ascent = size * 0.80f;
+        box->descent = size * 0.22f;
+    }
     return box;
 }
 
@@ -220,7 +288,7 @@ Box* make_fraction_box(Parser* p, StyleState st, bool no_rule) noexcept {
     if (!box->a) return nullptr;
     box->b = atom(p, den_st);
     if (!box->b) return nullptr;
-    const float axis = math_axis(size);
+    const float axis = math_axis(size, p->use_etch_fonts);
     const float rule_t = no_rule ? 0.0f : rule_thickness(size);
     const float rule_gap = (st.style == StyleDisplay) ? std::fmax(2.6f, size * 0.16f) : std::fmax(2.0f, size * 0.12f);
     const float half_sep = rule_gap + rule_t * 0.5f;
@@ -398,7 +466,7 @@ Box* atom_impl(Parser* p, StyleState st) noexcept {
             y[ridx] = y[ridx - 1] + descents[ridx - 1] + size * 0.35f + ascents[ridx];
         }
         const float total = ascents[0] + y[row] + descents[row];
-        const float axis = math_axis(size);
+        const float axis = math_axis(size, p->use_etch_fonts);
         const float grid_ascent = total * 0.5f + axis;
         for (auto* cell = grid->first; cell; cell = cell->next) {
             const uint32_t cidx = uint32_t(cell->ax);
@@ -465,7 +533,7 @@ Box* atom_impl(Parser* p, StyleState st) noexcept {
             if (p->pos >= source.length || source.chars[p->pos] != ']') { p->valid = false; return nullptr; }
             const EtchStr idx_src = { source.chars + idx_start, p->pos - idx_start, false };
             ++p->pos;
-            Parser sub_p = { idx_src, 0, true, 0u, INLAY_MATH_ERROR_NONE, p->depth, p->base_size };
+            Parser sub_p = { idx_src, 0, true, 0u, INLAY_MATH_ERROR_NONE, p->depth, p->base_size, p->heap, p->use_etch_fonts };
             box->b = expression(&sub_p, { StyleScriptScript, true }, false);
             if (!box->b || !sub_p.valid) {
                 p->error_offset = idx_start + (sub_p.error == INLAY_MATH_ERROR_NONE ? sub_p.pos : sub_p.error_offset);
@@ -537,7 +605,7 @@ Box* atom_impl(Parser* p, StyleState st) noexcept {
         if (!close || !p->valid) return nullptr;
         auto* box = make(p, Delimited, size, ClOrd);
         if (!box) return nullptr;
-        auto* delimiters = static_cast<char*>(etch_frame_arena_alloc(etch_current_context(), 2, 1));
+        auto* delimiters = static_cast<char*>(math_alloc(p, 2, 1));
         if (!delimiters) { p->valid = false; return nullptr; }
         delimiters[0] = open;
         delimiters[1] = close;
@@ -603,7 +671,7 @@ Box* atom_impl(Parser* p, StyleState st) noexcept {
             if (g && big_op) {
                 // Vertically center scaled display operators on the surrounding math axis.
                 const float total = g->ascent + g->descent;
-                const float target_a = total * 0.5f + math_axis(size);
+                const float target_a = total * 0.5f + math_axis(size, p->use_etch_fonts);
                 g->ascent = target_a;
                 g->descent = std::fmax(0.0f, total - target_a);
             }
@@ -993,6 +1061,267 @@ void draw(const Box* box, float x, float y, EtchColor color) noexcept {
         }
     }
 }
+struct MathSvgOut {
+    char* buf;
+    uint32_t cap;
+    uint32_t len;
+
+    void write(const char* s, uint32_t n) noexcept {
+        if (!n) return;
+        if (buf && cap > 0u && len + 1u < cap) {
+            const uint32_t avail = (cap - 1u) - len;
+            const uint32_t cp = n < avail ? n : avail;
+            if (cp > 0u) std::memcpy(buf + len, s, cp);
+        }
+        len += n;
+    }
+    void write_lit(const char* lit) noexcept {
+        write(lit, static_cast<uint32_t>(std::strlen(lit)));
+    }
+    void write_num(float v) noexcept {
+        char tmp[32];
+        const int n = std::snprintf(tmp, sizeof(tmp), "%.2f", std::isfinite(v) ? v : 0.0f);
+        if (n <= 0) return;
+        uint32_t l = static_cast<uint32_t>(n);
+        while (l > 1u && tmp[l - 1u] == '0') --l;
+        if (l > 1u && tmp[l - 1u] == '.') --l;
+        write(tmp, l);
+    }
+    void write_escaped(const char* s, uint32_t n) noexcept {
+        uint32_t run = 0u;
+        for (uint32_t i = 0u; i < n; ++i) {
+            const char* rep = nullptr;
+            switch (s[i]) {
+                case '&': rep = "&amp;"; break;
+                case '<': rep = "&lt;"; break;
+                case '>': rep = "&gt;"; break;
+                case '"': rep = "&quot;"; break;
+                default: break;
+            }
+            if (rep) {
+                if (i > run) write(s + run, i - run);
+                write_lit(rep);
+                run = i + 1u;
+            }
+        }
+        if (n > run) write(s + run, n - run);
+    }
+};
+
+void svg_emit_line(MathSvgOut* out, float x1, float y1, float x2, float y2, float thick, const char* col) noexcept {
+    out->write_lit("<line x1=\""); out->write_num(x1);
+    out->write_lit("\" y1=\""); out->write_num(y1);
+    out->write_lit("\" x2=\""); out->write_num(x2);
+    out->write_lit("\" y2=\""); out->write_num(y2);
+    out->write_lit("\" stroke=\""); out->write_lit(col);
+    out->write_lit("\" stroke-width=\""); out->write_num(thick);
+    out->write_lit("\"/>\n");
+}
+
+void svg_emit_delimiter(MathSvgOut* out, char mark, float sx, float top, float bottom, float size,
+                        bool right_side, const char* col) noexcept {
+    if (mark == '.') return;
+    const float thick = rule_thickness(size);
+    const float w = size * 0.36f;
+    if (mark == '[' || mark == ']') {
+        const float stem = sx + (right_side ? w * 0.78f : w * 0.22f);
+        const float edge = sx + (right_side ? w * 0.20f : w * 0.80f);
+        out->write_lit("<polyline fill=\"none\" stroke=\""); out->write_lit(col);
+        out->write_lit("\" stroke-width=\""); out->write_num(thick);
+        out->write_lit("\" points=\"");
+        out->write_num(edge); out->write_lit(","); out->write_num(top); out->write_lit(" ");
+        out->write_num(stem); out->write_lit(","); out->write_num(top); out->write_lit(" ");
+        out->write_num(stem); out->write_lit(","); out->write_num(bottom); out->write_lit(" ");
+        out->write_num(edge); out->write_lit(","); out->write_num(bottom);
+        out->write_lit("\"/>\n");
+    } else if (mark == '|') {
+        const float cx = sx + w * 0.5f;
+        svg_emit_line(out, cx, top, cx, bottom, thick, col);
+    } else if (mark == 'V') {
+        svg_emit_line(out, sx + w * 0.32f, top, sx + w * 0.32f, bottom, thick, col);
+        svg_emit_line(out, sx + w * 0.68f, top, sx + w * 0.68f, bottom, thick, col);
+    } else if (mark == '<' || mark == '>') {
+        const float mid = (top + bottom) * 0.5f;
+        const float tip = sx + (right_side ? w * 0.82f : w * 0.18f);
+        const float edge = sx + (right_side ? w * 0.18f : w * 0.82f);
+        out->write_lit("<polyline fill=\"none\" stroke=\""); out->write_lit(col);
+        out->write_lit("\" stroke-width=\""); out->write_num(thick);
+        out->write_lit("\" points=\"");
+        out->write_num(edge); out->write_lit(","); out->write_num(top); out->write_lit(" ");
+        out->write_num(tip); out->write_lit(","); out->write_num(mid); out->write_lit(" ");
+        out->write_num(edge); out->write_lit(","); out->write_num(bottom);
+        out->write_lit("\"/>\n");
+    } else if (mark == '{' || mark == '}') {
+        const float edge = sx + (right_side ? w * 0.15f : w * 0.85f);
+        const float stem = sx + (right_side ? w * 0.52f : w * 0.48f);
+        const float tip = sx + (right_side ? w * 0.88f : w * 0.12f);
+        const float mid = (top + bottom) * 0.5f;
+        out->write_lit("<path fill=\"none\" stroke=\""); out->write_lit(col);
+        out->write_lit("\" stroke-width=\""); out->write_num(thick);
+        out->write_lit("\" d=\"M "); out->write_num(edge); out->write_lit(" "); out->write_num(top);
+        out->write_lit(" Q "); out->write_num(stem); out->write_lit(" "); out->write_num(top);
+        out->write_lit(" "); out->write_num(stem); out->write_lit(" "); out->write_num((top + mid) * 0.5f);
+        out->write_lit(" Q "); out->write_num(stem); out->write_lit(" "); out->write_num(mid);
+        out->write_lit(" "); out->write_num(tip); out->write_lit(" "); out->write_num(mid);
+        out->write_lit(" Q "); out->write_num(stem); out->write_lit(" "); out->write_num(mid);
+        out->write_lit(" "); out->write_num(stem); out->write_lit(" "); out->write_num((bottom + mid) * 0.5f);
+        out->write_lit(" Q "); out->write_num(stem); out->write_lit(" "); out->write_num(bottom);
+        out->write_lit(" "); out->write_num(edge); out->write_lit(" "); out->write_num(bottom);
+        out->write_lit("\"/>\n");
+    } else {
+        const float h = bottom - top;
+        const float tip_x = sx + (right_side ? w * 0.22f : w * 0.78f);
+        const float arch_x = sx + (right_side ? w * 0.90f : w * 0.10f);
+        out->write_lit("<path fill=\"none\" stroke=\""); out->write_lit(col);
+        out->write_lit("\" stroke-width=\""); out->write_num(thick);
+        out->write_lit("\" d=\"M "); out->write_num(tip_x); out->write_lit(" "); out->write_num(top);
+        out->write_lit(" C "); out->write_num(arch_x); out->write_lit(" "); out->write_num(top + h * 0.24f);
+        out->write_lit(" "); out->write_num(arch_x); out->write_lit(" "); out->write_num(bottom - h * 0.24f);
+        out->write_lit(" "); out->write_num(tip_x); out->write_lit(" "); out->write_num(bottom);
+        out->write_lit("\"/>\n");
+    }
+}
+
+void svg_emit_box(const Box* box, float x, float y, const char* col, bool use_etch_fonts, MathSvgOut* out) noexcept {
+    if (!box || box->kind == Space) return;
+    if (box->kind == Glyph) {
+        const char* family = (box->font_id == ETCH_FONT_MONO) ? "ui-monospace, monospace" : "STIX Two Math, Cambria Math, serif";
+        out->write_lit("<text x=\""); out->write_num(x);
+        out->write_lit("\" y=\""); out->write_num(y + box->ay);
+        out->write_lit("\" font-family=\""); out->write_lit(family);
+        out->write_lit("\" font-size=\""); out->write_num(box->size);
+        if (box->font_id == ETCH_FONT_ITALIC) out->write_lit("\" font-style=\"italic");
+        if (box->font_id == ETCH_FONT_BOLD) out->write_lit("\" font-weight=\"bold");
+        out->write_lit("\" fill=\""); out->write_lit(col);
+        out->write_lit("\">");
+        out->write_escaped(box->text.chars, box->text.length);
+        out->write_lit("</text>\n");
+        return;
+    }
+    if (box->kind == Grid || box->kind == Delimited) {
+        if (box->kind == Delimited) svg_emit_box(box->a, x + box->ax, y, col, use_etch_fonts, out);
+        for (const auto* child = box->first; child; child = child->next) {
+            svg_emit_box(child, x + child->ax, y + child->ay, col, use_etch_fonts, out);
+        }
+        if (box->text.length >= 2u) {
+            const float half_t = rule_thickness(box->size) * 0.5f;
+            const float top = y - box->ascent + half_t;
+            const float bottom = y + box->descent - half_t;
+            const float delim_w = box->size * 0.36f;
+            svg_emit_delimiter(out, box->text.chars[0], x, top, bottom, box->size, false, col);
+            svg_emit_delimiter(out, box->text.chars[1], x + box->width - delim_w, top, bottom, box->size, true, col);
+        }
+        return;
+    }
+    if (box->kind == Row) {
+        for (const auto* child = box->first; child; child = child->next) {
+            svg_emit_box(child, x, y, col, use_etch_fonts, out);
+            x += child->width;
+        }
+        return;
+    }
+    if (box->a) svg_emit_box(box->a, x + box->ax, y + box->ay, col, use_etch_fonts, out);
+    if (box->b) svg_emit_box(box->b, x + box->bx, y + box->by, col, use_etch_fonts, out);
+    if (box->c) svg_emit_box(box->c, x + box->cx, y + box->cy, col, use_etch_fonts, out);
+    if (box->kind == Fraction && !(box->flags & 2u)) {
+        const float inset = std::fmin(box->width * 0.1f, box->size * 0.04f);
+        const float ry = y - math_axis(box->size, use_etch_fonts);
+        svg_emit_line(out, x + inset, ry, x + box->width - inset, ry, rule_thickness(box->size), col);
+    }
+    if (box->kind == Root && box->a) {
+        const float hook_w = box->size * 0.62f;
+        const float left = x + box->ax - hook_w;
+        const float rule_t = rule_thickness(box->size);
+        const float bar_clear = std::fmax(2.5f, box->size * 0.16f);
+        const float bar_y = y - box->a->ascent - bar_clear - rule_t * 0.5f;
+        const float valley_y = y + box->descent - rule_t * 0.25f;
+        const float rad_h = std::fmax(rule_t * 4.0f, valley_y - bar_y);
+        const float shoulder_y = valley_y - std::fmin(rad_h * 0.45f, box->size * 0.55f);
+        const float tick_drop = std::fmin(rad_h * 0.16f, box->size * 0.11f);
+        const float x_join = x + box->ax;
+        const float x_tip = left + hook_w * 0.02f;
+        const float x_sh = left + hook_w * 0.25f;
+        const float x_val = left + hook_w * 0.50f;
+        out->write_lit("<polyline fill=\"none\" stroke=\""); out->write_lit(col);
+        out->write_lit("\" stroke-width=\""); out->write_num(rule_t);
+        out->write_lit("\" stroke-linejoin=\"miter\" points=\"");
+        out->write_num(x_tip); out->write_lit(","); out->write_num(shoulder_y + tick_drop); out->write_lit(" ");
+        out->write_num(x_sh); out->write_lit(","); out->write_num(shoulder_y); out->write_lit(" ");
+        out->write_num(x_val); out->write_lit(","); out->write_num(valley_y); out->write_lit(" ");
+        out->write_num(x_join); out->write_lit(","); out->write_num(bar_y); out->write_lit(" ");
+        out->write_num(x + box->width); out->write_lit(","); out->write_num(bar_y);
+        out->write_lit("\"/>\n");
+    }
+    if (box->kind == Accent) {
+        const auto ak = static_cast<AccentKind>(box->sub_kind);
+        const float thick = rule_thickness(box->size);
+        const float italic_shift = (box->a && box->a->kind == Glyph && box->a->font_id == ETCH_FONT_ITALIC)
+            ? std::fmin(box->size * 0.06f, box->width * 0.12f)
+            : 0.0f;
+        if (ak == AccOverline) {
+            svg_emit_line(out, x, y - box->ascent + box->size * 0.08f, x + box->width, y - box->ascent + box->size * 0.08f, thick, col);
+        } else if (ak == AccUnderline) {
+            svg_emit_line(out, x, y + box->descent - box->size * 0.06f, x + box->width, y + box->descent - box->size * 0.06f, thick, col);
+        } else if (ak == AccBar) {
+            const float bw = std::fmax(box->width * 0.8f, box->size * 0.36f);
+            const float bx0 = x + (box->width - bw) * 0.5f + italic_shift * 0.5f;
+            svg_emit_line(out, bx0, y - box->ascent + box->size * 0.09f, bx0 + bw, y - box->ascent + box->size * 0.09f, thick, col);
+        } else if (ak == AccHat) {
+            const float top = y - box->ascent + box->size * 0.05f;
+            const float aw = (box->flags & 4u) ? box->width : std::fmin(box->width, box->size * 0.52f);
+            const float ax0 = x + (box->width - aw) * 0.5f + ((box->flags & 4u) ? 0.0f : italic_shift);
+            out->write_lit("<polyline fill=\"none\" stroke=\""); out->write_lit(col);
+            out->write_lit("\" stroke-width=\""); out->write_num(thick);
+            out->write_lit("\" points=\"");
+            out->write_num(ax0); out->write_lit(","); out->write_num(top + box->size * 0.18f); out->write_lit(" ");
+            out->write_num(ax0 + aw * 0.5f); out->write_lit(","); out->write_num(top); out->write_lit(" ");
+            out->write_num(ax0 + aw); out->write_lit(","); out->write_num(top + box->size * 0.18f);
+            out->write_lit("\"/>\n");
+        } else if (ak == AccVec) {
+            const float top = y - box->ascent + box->size * 0.05f;
+            const float mid_y = top + box->size * 0.09f;
+            const float head = std::fmin(box->size * 0.18f, box->width * 0.38f);
+            svg_emit_line(out, x, mid_y, x + box->width, mid_y, thick, col);
+            out->write_lit("<polyline fill=\"none\" stroke=\""); out->write_lit(col);
+            out->write_lit("\" stroke-width=\""); out->write_num(thick);
+            out->write_lit("\" points=\"");
+            out->write_num(x + box->width - head); out->write_lit(","); out->write_num(top); out->write_lit(" ");
+            out->write_num(x + box->width); out->write_lit(","); out->write_num(mid_y); out->write_lit(" ");
+            out->write_num(x + box->width - head); out->write_lit(","); out->write_num(top + box->size * 0.18f);
+            out->write_lit("\"/>\n");
+        } else if (ak == AccTilde) {
+            const float top = y - box->ascent + box->size * 0.14f;
+            const float aw = (box->flags & 4u) ? box->width : std::fmin(box->width, box->size * 0.55f);
+            const float ax0 = x + (box->width - aw) * 0.5f + ((box->flags & 4u) ? 0.0f : italic_shift);
+            const float amp = box->size * 0.10f;
+            out->write_lit("<path fill=\"none\" stroke=\""); out->write_lit(col);
+            out->write_lit("\" stroke-width=\""); out->write_num(thick);
+            out->write_lit("\" d=\"M "); out->write_num(ax0); out->write_lit(" "); out->write_num(top);
+            out->write_lit(" C "); out->write_num(ax0 + aw * 0.33f); out->write_lit(" "); out->write_num(top - amp * 2.0f);
+            out->write_lit(" "); out->write_num(ax0 + aw * 0.67f); out->write_lit(" "); out->write_num(top + amp * 2.0f);
+            out->write_lit(" "); out->write_num(ax0 + aw); out->write_lit(" "); out->write_num(top);
+            out->write_lit("\"/>\n");
+        } else if (ak == AccDot || ak == AccDDot) {
+            const float r = std::fmax(1.2f, box->size * 0.06f);
+            const float cy = y - box->ascent + box->size * 0.12f;
+            const float cx = x + box->width * 0.5f + italic_shift;
+            const auto emit_dot = [&](float dcx) noexcept {
+                out->write_lit("<circle cx=\""); out->write_num(dcx);
+                out->write_lit("\" cy=\""); out->write_num(cy);
+                out->write_lit("\" r=\""); out->write_num(r);
+                out->write_lit("\" fill=\""); out->write_lit(col);
+                out->write_lit("\"/>\n");
+            };
+            if (ak == AccDot) {
+                emit_dot(cx);
+            } else {
+                const float dx = std::fmax(r * 1.6f, box->size * 0.11f);
+                emit_dot(cx - dx);
+                emit_dot(cx + dx);
+            }
+        }
+    }
+}
 } // namespace
 
 bool inlay_math_prepare(EtchStr tex, float font_size_px, bool display_style, InlayMathPrepared* out) noexcept {
@@ -1004,7 +1333,7 @@ bool inlay_math_prepare(EtchStr tex, float font_size_px, bool display_style, Inl
     {
         return false;
     }
-    Parser parser = { tex, 0, true, 0u, INLAY_MATH_ERROR_NONE, 0u, font_size_px };
+    Parser parser = { tex, 0, true, 0u, INLAY_MATH_ERROR_NONE, 0u, font_size_px, nullptr, true };
     const StyleState init_st = { display_style ? StyleDisplay : StyleText, false };
     const auto* box = expression(&parser, init_st, false);
     if (!box || !parser.valid) {
@@ -1037,5 +1366,52 @@ INLAY_API InlayMathResult inlay_draw_math(EtchStr tex, const InlayMathDesc* desc
     if (!inlay_math_prepare(tex, desc.font_size_px, true, &prep)) return prep.metrics;
     inlay_math_draw_prepared(prep, desc.pos, desc.color);
     return prep.metrics;
+}
+INLAY_API uint32_t inlay_math_export_svg(EtchStr tex, const InlayMathDesc* desc_in, char* out_buf, uint32_t cap) {
+    InlayMathDesc desc = {};
+    desc.struct_size = static_cast<uint32_t>(sizeof(InlayMathDesc));
+    desc.font_size_px = 20.0f;
+    desc.color = { 30u, 30u, 36u, 255u };
+    if (desc_in && !inlay_read_abi_struct(desc_in, &desc)) {
+        if (out_buf && cap > 0u) out_buf[0] = '\0';
+        return 0u;
+    }
+    if ((!tex.chars && tex.length) || tex.length > 65536u ||
+        !std::isfinite(desc.font_size_px) || desc.font_size_px < 6.0f || desc.font_size_px > 256.0f) {
+        if (out_buf && cap > 0u) out_buf[0] = '\0';
+        return 0u;
+    }
+    auto* ctx = etch_current_context();
+    const bool use_etch_fonts = ctx && etch_frame_in_progress(ctx);
+    MathHeapArena heap = {};
+    Parser parser = { tex, 0u, true, 0u, INLAY_MATH_ERROR_NONE, 0u, desc.font_size_px, &heap, use_etch_fonts };
+    const StyleState init_st = { StyleDisplay, false };
+    const Box* box = expression(&parser, init_st, false);
+    if (!box || !parser.valid) {
+        heap.destroy();
+        if (out_buf && cap > 0u) out_buf[0] = '\0';
+        return 0u;
+    }
+    const EtchColor col = desc.color.a != 0u ? desc.color : EtchColor{ 30u, 30u, 36u, 255u };
+    char col_hex[16];
+    std::snprintf(col_hex, sizeof(col_hex), "#%02x%02x%02x", unsigned(col.r), unsigned(col.g), unsigned(col.b));
+
+    const float pad = 4.0f;
+    const float svg_w = std::fmax(1.0f, box->width + 2.0f * pad);
+    const float svg_h = std::fmax(1.0f, (box->ascent + box->descent) + 2.0f * pad);
+    MathSvgOut out = { out_buf, cap, 0u };
+    out.write_lit("<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 ");
+    out.write_num(svg_w); out.write_lit(" "); out.write_num(svg_h);
+    out.write_lit("\" width=\""); out.write_num(svg_w);
+    out.write_lit("\" height=\""); out.write_num(svg_h);
+    out.write_lit("\">\n");
+    svg_emit_box(box, pad, pad + box->ascent, col_hex, use_etch_fonts, &out);
+    out.write_lit("</svg>\n");
+
+    heap.destroy();
+    if (out_buf && cap > 0u) {
+        out_buf[out.len < cap - 1u ? out.len : (cap - 1u)] = '\0';
+    }
+    return out.len;
 }
 }

@@ -7,6 +7,8 @@
 #include <cstdlib>
 #include <cstring>
 
+bool inlay_ui_model_read(const InlayModel* model, uint32_t index, InlayModelRow* out_row) noexcept;
+
 namespace {
 
 constexpr uint32_t kRetainedDocs = 16u;
@@ -14,11 +16,58 @@ constexpr uint32_t kTermCacheCap = 8u;
 constexpr uint32_t kVListCacheCap = 16u;
 constexpr uint32_t kTableSortCacheCap = 8u;
 constexpr uint32_t kSkeletonCacheCap = 64u;
+constexpr uint32_t kMaxModelSelections = 32u;
 constexpr uint32_t kTableCellHardCap = 262144u;
 constexpr uint32_t kTableRowHardCap = 65536u;
 constexpr uint32_t kTableColHardCap = 16384u;
 constexpr uint32_t kMenuItemHardCap = 16384u;
 constexpr uint32_t kMaxEventJsonBytes = 65536u;
+
+struct ModelSelectionEntry {
+    const InlaySurface* surface;
+    uint32_t element_id;
+    uint64_t selected_row_id;
+    uint32_t selected_index;
+    bool has_selection;
+    uint64_t last_used_frame;
+};
+
+ModelSelectionEntry g_model_selections[kMaxModelSelections] = {};
+uint32_t g_model_selection_count = 0u;
+
+ModelSelectionEntry* find_or_add_model_selection(const InlaySurface* s, uint32_t element_id) noexcept {
+    for (uint32_t i = 0u; i < g_model_selection_count; ++i) {
+        if (g_model_selections[i].surface == s && g_model_selections[i].element_id == element_id) {
+            g_model_selections[i].last_used_frame = s->frame_counter;
+            return &g_model_selections[i];
+        }
+    }
+    ModelSelectionEntry* entry = nullptr;
+    if (g_model_selection_count < kMaxModelSelections) {
+        entry = &g_model_selections[g_model_selection_count++];
+    } else {
+        uint32_t victim = 0u;
+        for (uint32_t i = 1u; i < g_model_selection_count; ++i) {
+            if (g_model_selections[i].last_used_frame < g_model_selections[victim].last_used_frame) {
+                victim = i;
+            }
+        }
+        entry = &g_model_selections[victim];
+    }
+    *entry = {};
+    entry->surface = s;
+    entry->element_id = element_id;
+    entry->last_used_frame = s->frame_counter;
+    return entry;
+}
+
+void purge_model_selections(const InlaySurface* s) noexcept {
+    for (uint32_t i = g_model_selection_count; i > 0u; --i) {
+        if (g_model_selections[i - 1u].surface == s) {
+            g_model_selections[i - 1u] = g_model_selections[--g_model_selection_count];
+        }
+    }
+}
 
 // ============================================================================
 // Common JS Prop, Text Pool, Color & JSON Payload Helpers
@@ -244,6 +293,12 @@ void frame_json_lit(FrameJsonBuf& b, const char* lit) noexcept {
 void frame_json_u32(FrameJsonBuf& b, uint32_t v) noexcept {
     char tmp[16] = {};
     const int n = std::snprintf(tmp, sizeof(tmp), "%u", v);
+    if (n > 0) frame_json_raw(b, tmp, static_cast<uint32_t>(n));
+}
+
+void frame_json_u64(FrameJsonBuf& b, uint64_t v) noexcept {
+    char tmp[24] = {};
+    const int n = std::snprintf(tmp, sizeof(tmp), "%llu", static_cast<unsigned long long>(v));
     if (n > 0) frame_json_raw(b, tmp, static_cast<uint32_t>(n));
 }
 
@@ -1175,87 +1230,104 @@ bool parse_virtual_list_widget(InlaySurface* s, JSValueConst props, bool has_pro
             if (JS_HasException(s->js)) return false;
         }
 
-        // Detect windowed renderItem callback mode (inlay_ui.cpp coordinates child generation via s->vlist_cache).
-        const JSValue render_fn = JS_GetPropertyStr(s->js, props, "renderItem");
-        if (JS_IsFunction(s->js, render_fn)) {
-            st.flags2 |= Nf2HasValue;
-            if (!has_win_start) {
-                if (const auto* win = find_vlist_cache(s, path_id)) {
-                    spec.window_start = win->first_index;
+        // Optional 0-JS-tick host model mode: model: "boundModelName"
+        const TextSlice model_name = inlay_ui_string_slice_prop(s, props, "model");
+        if (JS_HasException(s->js)) return false;
+        if (model_name.len > 0u) {
+            auto* cold = inlay_ui_ensure_cold(s, st);
+            if (!cold) return false;
+            cold->placeholder = model_name;
+            st.flags2 |= Nf2Leaf;
+            int32_t sel_idx = -1;
+            if (inlay_ui_opt_int_prop(s, props, "selectedRow", -1, 100000000, &sel_idx) ||
+                inlay_ui_opt_int_prop(s, props, "selectedIndex", -1, 100000000, &sel_idx)) {
+                st.int_value = sel_idx;
+                st.flags2 |= Nf2HasMin;
+            }
+            if (JS_HasException(s->js)) return false;
+        } else {
+            // Detect windowed renderItem callback mode (inlay_ui.cpp coordinates child generation via s->vlist_cache).
+            const JSValue render_fn = JS_GetPropertyStr(s->js, props, "renderItem");
+            if (JS_IsFunction(s->js, render_fn)) {
+                st.flags2 |= Nf2HasValue;
+                if (!has_win_start) {
+                    if (const auto* win = find_vlist_cache(s, path_id)) {
+                        spec.window_start = win->first_index;
+                    }
                 }
             }
-        }
-        JS_FreeValue(s->js, render_fn);
+            JS_FreeValue(s->js, render_fn);
 
-        // Optional 0-JS-tick data mode: items: (string | { title/label, subtitle/desc, badge, meta })[]
-        const JSValue items_v = JS_GetPropertyStr(s->js, props, "items");
-        if (JS_IsArray(items_v)) {
-            uint32_t arr_len = 0u;
-            if (read_array_length(s, items_v, &arr_len)) {
-                constexpr uint32_t kMaxDataItems = kTableCellHardCap / 4u;
-                const uint32_t data_count = arr_len > kMaxDataItems ? kMaxDataItems : arr_len;
-                if (data_count > 0u) {
-                    const uint32_t cell_off = inlay_ui_alloc_pool(
-                        s, s->table_cells, s->table_cell_count, s->table_cell_cap,
-                        data_count * 4u, kTableCellHardCap);
-                    if (cell_off == INLAY_UI_NONE) {
-                        JS_FreeValue(s->js, items_v);
-                        return false;
-                    }
-                    auto* cold = inlay_ui_ensure_cold(s, st);
-                    if (!cold) {
-                        JS_FreeValue(s->js, items_v);
-                        return false;
-                    }
-                    cold->item_offset = cell_off;
-                    st.int_value = static_cast<int32_t>(data_count);
-                    st.flags2 |= Nf2Selected;
-
-                    for (uint32_t i = 0u; i < data_count; ++i) {
-                        if ((i & 63u) == 0u && inlay_ui_check_watchdog(s)) {
-                            JS_ThrowInternalError(s->js, "UI conversion deadline exceeded");
+            // Optional 0-JS-tick data mode: items: (string | { title/label, subtitle/desc, badge, meta })[]
+            const JSValue items_v = JS_GetPropertyStr(s->js, props, "items");
+            if (JS_IsArray(items_v)) {
+                uint32_t arr_len = 0u;
+                if (read_array_length(s, items_v, &arr_len)) {
+                    constexpr uint32_t kMaxDataItems = kTableCellHardCap / 4u;
+                    const uint32_t data_count = arr_len > kMaxDataItems ? kMaxDataItems : arr_len;
+                    if (data_count > 0u) {
+                        const uint32_t cell_off = inlay_ui_alloc_pool(
+                            s, s->table_cells, s->table_cell_count, s->table_cell_cap,
+                            data_count * 4u, kTableCellHardCap);
+                        if (cell_off == INLAY_UI_NONE) {
                             JS_FreeValue(s->js, items_v);
                             return false;
                         }
-                        const JSValue iv = JS_GetPropertyUint32(s->js, items_v, i);
-                        TextSlice title = {};
-                        TextSlice subtitle = {};
-                        TextSlice badge = {};
-                        TextSlice meta = {};
-                        if (JS_IsObject(iv) && !JS_IsNull(iv)) {
-                            title = inlay_ui_string_slice_prop(s, iv, "title");
-                            if (!title.len && !JS_HasException(s->js))
-                                title = inlay_ui_string_slice_prop(s, iv, "label");
-                            if (!JS_HasException(s->js)) {
-                                subtitle = inlay_ui_string_slice_prop(s, iv, "subtitle");
-                                if (!subtitle.len && !JS_HasException(s->js))
-                                    subtitle = inlay_ui_string_slice_prop(s, iv, "desc");
+                        auto* cold = inlay_ui_ensure_cold(s, st);
+                        if (!cold) {
+                            JS_FreeValue(s->js, items_v);
+                            return false;
+                        }
+                        cold->item_offset = cell_off;
+                        st.int_value = static_cast<int32_t>(data_count);
+                        st.flags2 |= Nf2Selected;
+
+                        for (uint32_t i = 0u; i < data_count; ++i) {
+                            if ((i & 63u) == 0u && inlay_ui_check_watchdog(s)) {
+                                JS_ThrowInternalError(s->js, "UI conversion deadline exceeded");
+                                JS_FreeValue(s->js, items_v);
+                                return false;
                             }
-                            if (!JS_HasException(s->js))
-                                badge = inlay_ui_string_slice_prop(s, iv, "badge");
-                            if (!JS_HasException(s->js))
-                                meta = inlay_ui_string_slice_prop(s, iv, "meta");
-                        } else if (!JS_IsUndefined(iv) && !JS_IsNull(iv)) {
-                            title = inlay_ui_copy_text_slice(s, iv);
+                            const JSValue iv = JS_GetPropertyUint32(s->js, items_v, i);
+                            TextSlice title = {};
+                            TextSlice subtitle = {};
+                            TextSlice badge = {};
+                            TextSlice meta = {};
+                            if (JS_IsObject(iv) && !JS_IsNull(iv)) {
+                                title = inlay_ui_string_slice_prop(s, iv, "title");
+                                if (!title.len && !JS_HasException(s->js))
+                                    title = inlay_ui_string_slice_prop(s, iv, "label");
+                                if (!JS_HasException(s->js)) {
+                                    subtitle = inlay_ui_string_slice_prop(s, iv, "subtitle");
+                                    if (!subtitle.len && !JS_HasException(s->js))
+                                        subtitle = inlay_ui_string_slice_prop(s, iv, "desc");
+                                }
+                                if (!JS_HasException(s->js))
+                                    badge = inlay_ui_string_slice_prop(s, iv, "badge");
+                                if (!JS_HasException(s->js))
+                                    meta = inlay_ui_string_slice_prop(s, iv, "meta");
+                            } else if (!JS_IsUndefined(iv) && !JS_IsNull(iv)) {
+                                title = inlay_ui_copy_text_slice(s, iv);
+                            }
+                            JS_FreeValue(s->js, iv);
+                            if (JS_HasException(s->js)) {
+                                JS_FreeValue(s->js, items_v);
+                                return false;
+                            }
+                            s->table_cells[cell_off + i * 4u + 0u] = title;
+                            s->table_cells[cell_off + i * 4u + 1u] = subtitle;
+                            s->table_cells[cell_off + i * 4u + 2u] = badge;
+                            s->table_cells[cell_off + i * 4u + 3u] = meta;
                         }
-                        JS_FreeValue(s->js, iv);
-                        if (JS_HasException(s->js)) {
-                            JS_FreeValue(s->js, items_v);
-                            return false;
-                        }
-                        s->table_cells[cell_off + i * 4u + 0u] = title;
-                        s->table_cells[cell_off + i * 4u + 1u] = subtitle;
-                        s->table_cells[cell_off + i * 4u + 2u] = badge;
-                        s->table_cells[cell_off + i * 4u + 3u] = meta;
+                    } else {
+                        st.int_value = 0;
+                        st.flags2 |= Nf2Selected;
                     }
-                } else {
-                    st.int_value = 0;
-                    st.flags2 |= Nf2Selected;
+                    if (!has_count) spec.total_count = data_count;
                 }
-                if (!has_count) spec.total_count = data_count;
             }
+            JS_FreeValue(s->js, items_v);
         }
-        JS_FreeValue(s->js, items_v);
     }
 
     s->vlist_specs[idx] = spec;
@@ -1484,6 +1556,34 @@ bool parse_tree_widget(InlaySurface* s, JSValueConst props, bool has_props, Node
         bool guide = true;
         if (inlay_ui_opt_bool_prop(s, props, "showIndentGuide", &guide)) {
             st.int_value = guide ? 1 : -1;
+        }
+        const TextSlice model_name = inlay_ui_string_slice_prop(s, props, "model");
+        if (JS_HasException(s->js)) return false;
+        if (model_name.len > 0u) {
+            auto* cold = inlay_ui_ensure_cold(s, st);
+            if (!cold) return false;
+            cold->placeholder = model_name;
+            st.flags2 |= Nf2Leaf;
+        }
+        float rh = 0.f;
+        if (inlay_ui_opt_number_prop(s, props, "rowHeight", &rh, false, 16.0, 128.0)) {
+            st.value = rh;
+            st.flags2 |= Nf2HasValue;
+        }
+        if (JS_HasException(s->js)) return false;
+        float indent = 0.f;
+        if (inlay_ui_opt_number_prop(s, props, "indent", &indent, false, 4.0, 64.0)) {
+            auto* cold = inlay_ui_ensure_cold(s, st);
+            if (!cold) return false;
+            cold->min_val = indent;
+            st.flags2 |= Nf2HasMin;
+        }
+        if (JS_HasException(s->js)) return false;
+        if (!has_event(st.action, st.handler)) {
+            if (!inlay_ui_parse_event_prop(s, props, "onSelect", &st.action, &st.handler)) {
+                inlay_ui_parse_event_prop(s, props, "onClick", &st.action, &st.handler);
+            }
+            if (JS_HasException(s->js)) return false;
         }
     }
     return true;
@@ -2264,19 +2364,28 @@ void draw_virtual_list_widget(InlaySurface* s, const InlayUiNode& node, const No
     const VirtualListSpec& spec = s->vlist_specs[st.ext_idx];
     const ColdVisualStyle* cold = inlay_ui_get_cold(s, st);
 
-    const bool data_mode = (st.flags2 & Nf2Selected) != 0u;
-    const bool has_render_item = (st.flags2 & Nf2HasValue) != 0u;
+    const bool model_mode = (st.flags2 & Nf2Leaf) != 0u && cold && cold->placeholder.len > 0u;
+    const bool data_mode = !model_mode && (st.flags2 & Nf2Selected) != 0u;
+    const bool has_render_item = !model_mode && (st.flags2 & Nf2HasValue) != 0u;
+
+    const InlayModel* model = nullptr;
+    if (model_mode) {
+        const uint32_t ci = inlay_ui_content_index(s, INLAY_UI_VIRTUAL_LIST, inlay_ui_slice(s, cold->placeholder));
+        if (ci < s->content_count) model = static_cast<const InlayModel*>(s->content[ci].resource);
+    }
 
     uint32_t child_count = 0u;
-    if (!data_mode) {
+    if (!model_mode && !data_mode) {
         for (uint32_t at = node.first_child; at != INLAY_UI_NONE; at = s->nodes[at].next_sibling) {
             ++child_count;
         }
     }
 
-    const uint32_t total_count = spec.total_count > 0u
-        ? spec.total_count
-        : (data_mode ? static_cast<uint32_t>(st.int_value > 0 ? st.int_value : 0) : child_count);
+    const uint32_t total_count = model_mode
+        ? (model ? inlay_model_count(model) : 0u)
+        : (spec.total_count > 0u
+            ? spec.total_count
+            : (data_mode ? static_cast<uint32_t>(st.int_value > 0 ? st.int_value : 0) : child_count));
 
     auto vd = etch_virtual_list_desc_default();
     vd.id = id;
@@ -2296,6 +2405,122 @@ void draw_virtual_list_widget(InlaySurface* s, const InlayUiNode& node, const No
     vd.stick_to_bottom = spec.stick_to_bottom;
 
     const EtchVirtualListSlice slice = etch_begin_virtual_list(&vd);
+
+    if (model_mode) {
+        ModelSelectionEntry* sel = find_or_add_model_selection(s, id);
+        const bool controlled_sel = (st.flags2 & Nf2HasMin) != 0u;
+        const bool dark = inlay_is_dark_theme(theme);
+        const EtchColor hover_bg = (cold && cold->hover_bg.set)
+            ? inlay_ui_resolve_color(cold->hover_bg, theme, theme.surface_hover)
+            : (dark ? etch_rgba8(255, 255, 255, 10) : etch_rgba8(15, 23, 42, 8));
+        const float font_px = (st.flags & NfHasSize) && st.font_size > 0.f ? st.font_size : 13.5f;
+        const EtchColor primary_fg = resolve_ref(st.color, theme, theme.text_primary);
+        const bool has_select_ev = has_event(st.action, st.handler);
+
+        for (uint32_t i = slice.first_index; i < slice.end_index; ++i) {
+            InlayModelRow mrow = {};
+            const bool has_row = model && inlay_ui_model_read(model, i, &mrow);
+            const bool is_selected = controlled_sel
+                ? (st.int_value >= 0 && static_cast<uint32_t>(st.int_value) == i)
+                : (sel && sel->has_selection &&
+                   (has_row && mrow.row_id != 0u ? (sel->selected_row_id == mrow.row_id) : (sel->selected_index == i)));
+
+            const uint32_t row_id = etch_id_index(id, 0x710000u + i);
+            auto row = etch_box_desc_default();
+            row.id = row_id;
+            row.axis = ETCH_AXIS_ROW;
+            row.width = etch_sizing_grow(0.f, 0.f);
+            row.height = etch_sizing_fixed(vd.item_height_px);
+            row.padding = etch_padding_xy(12.f, 0.f);
+            row.gap = 10.f;
+            row.align_y = ETCH_ALIGN_Y_CENTER;
+            row.background = is_selected ? theme.surface_selected : EtchColor{};
+            row.hover_background = is_selected ? theme.surface_selected : hover_bg;
+            row.border_sides = {0.f, 0.f, 0.f, 1.f};
+            row.border_color = theme.border_subtle;
+            row.focusable = true;
+            etch_begin_box(&row);
+
+            const EtchStr label_ft = (has_row && mrow.label.length > 0u) ? inlay_ui_frame_text(s, mrow.label) : EtchStr{};
+            const EtchStr detail_ft = (has_row && mrow.detail.length > 0u) ? inlay_ui_frame_text(s, mrow.detail) : EtchStr{};
+            const EtchStr badge_ft = (has_row && mrow.badge.length > 0u) ? inlay_ui_frame_text(s, mrow.badge) : EtchStr{};
+
+            etch_emit_a11y_node(row_id, ETCH_A11Y_LIST_ITEM, label_ft, detail_ft,
+                                is_selected ? uint32_t(ETCH_A11Y_STATE_SELECTED) : 0u, 3u, 0.f, {});
+
+            if (has_row) {
+                auto left = etch_box_desc_default();
+                left.axis = ETCH_AXIS_COL;
+                left.width = etch_sizing_grow(0.f, 0.f);
+                left.height = etch_sizing_fit(0.f, 0.f);
+                left.gap = 1.f;
+                left.shrink_width = true;
+                etch_begin_box(&left);
+
+                if (label_ft.length > 0u) {
+                    auto td = etch_text_desc_default();
+                    td.font_size_px = font_px;
+                    td.font_id = (st.flags & NfHasFontId) ? st.font_id : uint16_t(ETCH_FONT_SANS);
+                    td.color = primary_fg;
+                    td.wrap = false;
+                    td.ellipsis = true;
+                    etch_text(label_ft, &td);
+                }
+                if (detail_ft.length > 0u) {
+                    auto sd = etch_text_desc_default();
+                    sd.font_size_px = std::fmax(10.f, font_px - 2.f);
+                    sd.color = theme.text_muted;
+                    sd.wrap = false;
+                    sd.ellipsis = true;
+                    etch_text(detail_ft, &sd);
+                }
+                etch_end_box();
+
+                if (badge_ft.length > 0u) {
+                    auto b = etch_box_desc_default();
+                    b.padding = etch_padding_xy(7.f, 2.f);
+                    b.background = theme.surface_subtle;
+                    b.border_width = 1.f;
+                    b.border_color = theme.border_subtle;
+                    b.radius = etch_corners_all(theme.radius_pill_px);
+                    b.align_y = ETCH_ALIGN_Y_CENTER;
+                    etch_begin_box(&b);
+                    auto bt = etch_text_desc_default();
+                    bt.font_size_px = 11.f;
+                    bt.font_id = uint16_t(ETCH_FONT_MEDIUM);
+                    bt.color = theme.text_secondary;
+                    bt.wrap = false;
+                    etch_text(badge_ft, &bt);
+                    etch_end_box();
+                }
+            }
+            etch_end_box();
+
+            if (etch_hovered(row_id)) etch_set_cursor(ETCH_CURSOR_HAND);
+            if (is_activated(row_id)) {
+                if (!controlled_sel && sel) {
+                    sel->has_selection = true;
+                    sel->selected_row_id = has_row ? mrow.row_id : 0u;
+                    sel->selected_index = i;
+                    etch_request_redraw(s->etch);
+                }
+                if (has_select_ev) {
+                    const uint32_t cap = frame_json_cap(label_ft.length, 64u);
+                    auto jb = frame_json_begin(s->etch, cap);
+                    frame_json_lit(jb, "{\"index\":");
+                    frame_json_u32(jb, i);
+                    frame_json_lit(jb, ",\"rowId\":");
+                    frame_json_u64(jb, has_row ? mrow.row_id : 0u);
+                    frame_json_lit(jb, ",\"label\":");
+                    frame_json_quoted(jb, label_ft);
+                    frame_json_lit(jb, "}");
+                    queue_slice_event(s, events, st.action, st.handler, frame_json_finish(jb), true);
+                }
+            }
+        }
+        etch_end_virtual_list();
+        return;
+    }
 
     if (data_mode) {
         const uint32_t data_count = st.int_value > 0 ? static_cast<uint32_t>(st.int_value) : 0u;
@@ -2651,6 +2876,166 @@ void draw_table_widget(InlaySurface* s, const NodeStyle& st, uint32_t id,
 
 void draw_tree_widget(InlaySurface* s, const InlayUiNode& node, const NodeStyle& st,
                       uint32_t id, const EtchTheme& theme, bool use_layer, WidgetEvents* events) {
+    const ColdVisualStyle* cold = inlay_ui_get_cold(s, st);
+    const bool model_mode = (st.flags2 & Nf2Leaf) != 0u && cold && cold->placeholder.len > 0u;
+
+    if (model_mode) {
+        const InlayModel* model = nullptr;
+        const uint32_t ci = inlay_ui_content_index(s, INLAY_UI_VIRTUAL_LIST, inlay_ui_slice(s, cold->placeholder));
+        if (ci < s->content_count) model = static_cast<const InlayModel*>(s->content[ci].resource);
+
+        const uint32_t total = model ? inlay_model_count(model) : 0u;
+        const float row_h = (st.flags2 & Nf2HasValue) && st.value > 0.f ? st.value : 28.f;
+        const float indent_px = (st.flags2 & Nf2HasMin) && cold && cold->min_val > 0.f ? cold->min_val : 16.f;
+        const float font_px = (st.flags & NfHasSize) && st.font_size > 0.f ? st.font_size : 13.f;
+        const uint16_t font_id = (st.flags & NfHasFontId) ? st.font_id : uint16_t(ETCH_FONT_SANS);
+        const EtchColor fg_col = resolve_ref(st.color, theme, theme.text_primary);
+        const EtchColor hov_col = (cold && cold->hover_bg.set)
+            ? inlay_ui_resolve_color(cold->hover_bg, theme, theme.surface_hover)
+            : theme.surface_hover;
+        const bool has_select_ev = has_event(st.action, st.handler);
+        ModelSelectionEntry* sel = find_or_add_model_selection(s, id);
+
+        const auto draw_row = [&](uint32_t i) {
+            InlayModelRow mrow = {};
+            const bool has_row = model && inlay_ui_model_read(model, i, &mrow);
+            const bool is_selected = sel && sel->has_selection &&
+                (has_row && mrow.row_id != 0u ? (sel->selected_row_id == mrow.row_id) : (sel->selected_index == i));
+            const uint32_t depth = has_row ? (mrow.depth > 32u ? 32u : mrow.depth) : 0u;
+            const uint32_t row_id = etch_id_index(id, 0x730000u + i);
+
+            auto row = etch_box_desc_default();
+            row.id = row_id;
+            row.axis = ETCH_AXIS_ROW;
+            row.width = etch_sizing_grow(0.f, 0.f);
+            row.height = etch_sizing_fixed(row_h);
+            row.padding = {8.f + float(depth) * indent_px, 8.f, 0.f, 0.f};
+            row.gap = 6.f;
+            row.align_y = ETCH_ALIGN_Y_CENTER;
+            row.radius = etch_corners_all(theme.radius_small_px);
+            row.background = is_selected ? theme.surface_selected : EtchColor{};
+            row.hover_background = is_selected ? theme.surface_selected : hov_col;
+            row.focusable = true;
+            etch_begin_box(&row);
+
+            const EtchStr label_ft = (has_row && mrow.label.length > 0u) ? inlay_ui_frame_text(s, mrow.label) : EtchStr{};
+            const EtchStr detail_ft = (has_row && mrow.detail.length > 0u) ? inlay_ui_frame_text(s, mrow.detail) : EtchStr{};
+            const EtchStr badge_ft = (has_row && mrow.badge.length > 0u) ? inlay_ui_frame_text(s, mrow.badge) : EtchStr{};
+            const uint32_t a11y_states = (is_selected ? uint32_t(ETCH_A11Y_STATE_SELECTED) : 0u) |
+                                         (has_row && mrow.has_children && mrow.expanded ? uint32_t(ETCH_A11Y_STATE_EXPANDED) : 0u);
+            etch_emit_a11y_node(row_id, ETCH_A11Y_TREE_ITEM, label_ft, detail_ft, a11y_states, 3u, 0.f, {});
+
+            auto chev = etch_box_desc_default();
+            chev.width = etch_sizing_fixed(12.f);
+            chev.height = etch_sizing_fixed(row_h);
+            etch_begin_box(&chev);
+            if (has_row && mrow.has_children) {
+                const float cy = row_h * 0.5f;
+                const EtchVec2 pts_col[3] = {{4.f, cy - 3.5f}, {8.f, cy}, {4.f, cy + 3.5f}};
+                const EtchVec2 pts_exp[3] = {{2.5f, cy - 2.f}, {6.f, cy + 2.f}, {9.5f, cy - 2.f}};
+                auto pl = etch_polyline_desc_default();
+                pl.points = mrow.expanded ? pts_exp : pts_col;
+                pl.point_count = 3u;
+                pl.color = theme.text_muted;
+                pl.thickness = 1.4f;
+                etch_draw_polyline(&pl);
+            }
+            etch_end_box();
+
+            if (label_ft.length > 0u) {
+                auto td = etch_text_desc_default();
+                td.font_size_px = font_px;
+                td.font_id = font_id;
+                td.color = fg_col;
+                td.wrap = false;
+                td.ellipsis = true;
+                etch_text(label_ft, &td);
+            }
+            if (detail_ft.length > 0u) {
+                auto sd = etch_text_desc_default();
+                sd.font_size_px = std::fmax(10.f, font_px - 1.5f);
+                sd.color = theme.text_muted;
+                sd.wrap = false;
+                sd.ellipsis = true;
+                etch_text(detail_ft, &sd);
+            }
+            if (badge_ft.length > 0u) {
+                auto b = etch_box_desc_default();
+                b.padding = etch_padding_xy(6.f, 1.f);
+                b.background = theme.surface_subtle;
+                b.radius = etch_corners_all(theme.radius_pill_px);
+                etch_begin_box(&b);
+                auto bt = etch_text_desc_default();
+                bt.font_size_px = 10.5f;
+                bt.color = theme.text_secondary;
+                bt.wrap = false;
+                etch_text(badge_ft, &bt);
+                etch_end_box();
+            }
+            etch_end_box();
+
+            if (etch_hovered(row_id)) etch_set_cursor(ETCH_CURSOR_HAND);
+            if (is_activated(row_id)) {
+                if (sel) {
+                    sel->has_selection = true;
+                    sel->selected_row_id = has_row ? mrow.row_id : 0u;
+                    sel->selected_index = i;
+                    etch_request_redraw(s->etch);
+                }
+                if (has_select_ev) {
+                    const uint32_t cap = frame_json_cap(label_ft.length, 96u);
+                    auto jb = frame_json_begin(s->etch, cap);
+                    frame_json_lit(jb, "{\"index\":");
+                    frame_json_u32(jb, i);
+                    frame_json_lit(jb, ",\"rowId\":");
+                    frame_json_u64(jb, has_row ? mrow.row_id : 0u);
+                    frame_json_lit(jb, ",\"depth\":");
+                    frame_json_u32(jb, depth);
+                    frame_json_lit(jb, ",\"label\":");
+                    frame_json_quoted(jb, label_ft);
+                    frame_json_lit(jb, ",\"expanded\":");
+                    frame_json_bool(jb, has_row && mrow.expanded);
+                    frame_json_lit(jb, "}");
+                    queue_slice_event(s, events, st.action, st.handler, frame_json_finish(jb), true);
+                }
+            }
+        };
+
+        if (has_explicit_h(s, st, cold)) {
+            auto vd = etch_virtual_list_desc_default();
+            vd.id = id;
+            vd.item_count = total;
+            vd.item_height_px = row_h;
+            vd.row_gap_px = (st.flags & NfHasGap) ? std::fmax(0.f, st.gap) : 1.f;
+            vd.width = inlay_ui_resolve_sizing(s, st, cold, false, etch_sizing_grow(0.f, 0.f));
+            vd.height = inlay_ui_resolve_sizing(s, st, cold, true, etch_sizing_fixed(240.f));
+            if (st.flags & NfHasPadding) vd.padding = st.padding;
+            else vd.padding = etch_padding_all(4.f);
+            if (st.bg.set) vd.background = inlay_ui_resolve_color(st.bg, theme, theme.bg_surface);
+            if (st.border_color.set) vd.border_color = inlay_ui_resolve_color(st.border_color, theme, theme.border_subtle);
+            if (st.flags & NfHasBorderWidth) vd.border_width = std::fmax(0.f, st.border_width);
+            if (st.flags & NfRadiusSet) vd.radius = inlay_ui_resolve_corners(st, cold, theme, theme.radius_panel_px);
+            const EtchVirtualListSlice slice = etch_begin_virtual_list(&vd);
+            etch_emit_a11y_node(id, ETCH_A11Y_TREE, {}, {}, 0u, 0u, 0.f, {});
+            for (uint32_t i = slice.first_index; i < slice.end_index; ++i) draw_row(i);
+            etch_end_virtual_list();
+        } else {
+            auto box = etch_box_desc_default();
+            box.width = etch_sizing_grow(0.f, 0.f);
+            box.height = etch_sizing_fit(0.f, 0.f);
+            box.padding = etch_padding_all(4.f);
+            box.gap = 1.f;
+            inlay_ui_populate_box_desc(s, st, theme, id, box, use_layer);
+            box.axis = ETCH_AXIS_COL;
+            etch_begin_box(&box);
+            etch_emit_a11y_node(id, ETCH_A11Y_TREE, {}, {}, 0u, 0u, 0.f, {});
+            const uint32_t limit = total < 512u ? total : 512u;
+            for (uint32_t i = 0u; i < limit; ++i) draw_row(i);
+            etch_end_box();
+        }
+        return;
+    }
+
     auto box = etch_box_desc_default();
     box.width = etch_sizing_grow(0.f, 0.f);
     box.height = etch_sizing_fit(0.f, 0.f);
@@ -3615,6 +4000,7 @@ void inlay_ui_trim_document_cache(InlaySurface* s) noexcept {
 
 void inlay_ui_free_widget_caches(InlaySurface* s) noexcept {
     if (!s) return;
+    purge_model_selections(s);
 
     if (s->doc_cache) {
         for (uint32_t i = 0u; i < s->doc_cache_count; ++i) {

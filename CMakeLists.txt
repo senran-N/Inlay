@@ -27,7 +27,7 @@ function(inlay_cpp target)
   target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic -Werror -fno-exceptions -fno-rtti)
  endif()
 endfunction()
-add_library(inlay STATIC src/inlay_c.cpp src/inlay_doc.cpp src/inlay_view.cpp src/inlay_math.cpp src/inlay_diagram.cpp src/inlay_inbox.cpp)
+add_library(inlay STATIC src/inlay_c.cpp src/inlay_doc.cpp src/inlay_view.cpp src/inlay_math.cpp src/inlay_diagram.cpp src/inlay_inbox.cpp src/inlay_stream.cpp src/inlay_genui.cpp src/inlay_tokens.cpp src/inlay_image_loader.cpp)
 add_library(Inlay::inlay ALIAS inlay)
 inlay_cpp(inlay)
 target_compile_definitions(inlay PRIVATE INLAY_BUILD)
@@ -51,7 +51,8 @@ set(_inlay_ui_header_deps
  "${CMAKE_CURRENT_SOURCE_DIR}/src/inlay_ui_internal.h")
 set_source_files_properties(
  src/inlay_c.cpp src/inlay_doc.cpp src/inlay_view.cpp src/inlay_math.cpp
- src/inlay_diagram.cpp src/inlay_inbox.cpp src/inlay_portal.cpp src/inlay_portal_webview2.cpp
+ src/inlay_diagram.cpp src/inlay_inbox.cpp src/inlay_stream.cpp src/inlay_genui.cpp
+ src/inlay_tokens.cpp src/inlay_image_loader.cpp src/inlay_portal.cpp src/inlay_portal_webview2.cpp
  PROPERTIES OBJECT_DEPENDS "${_inlay_header_deps}")
 set_source_files_properties(
  src/inlay_ui.cpp
@@ -134,6 +135,11 @@ if(INLAY_BUILD_TESTS)
  target_link_libraries(inlay_tests PRIVATE Inlay::inlay)
  add_test(NAME streaming_equivalence COMMAND inlay_tests)
  set_tests_properties(streaming_equivalence PROPERTIES TIMEOUT 90)
+ add_executable(inlay_workbench_tests tests/workbench_features_tests.cpp)
+ inlay_cpp(inlay_workbench_tests)
+ target_link_libraries(inlay_workbench_tests PRIVATE Inlay::inlay)
+ add_test(NAME workbench_features COMMAND inlay_workbench_tests)
+ set_tests_properties(workbench_features PROPERTIES TIMEOUT 60)
  if(INLAY_ENABLE_SCRIPT)
   add_executable(inlay_ui_tests tests/ui_tests.cpp)
   inlay_cpp(inlay_ui_tests)
@@ -152,7 +158,7 @@ if(INLAY_BUILD_TESTS)
  endif()
  add_test(NAME inlay_c_abi_smoke COMMAND inlay_c_abi_smoke)
  if(WIN32)
-  foreach(target inlay_tests inlay_c_abi_smoke)
+  foreach(target inlay_tests inlay_workbench_tests inlay_c_abi_smoke)
    add_custom_command(TARGET ${target} POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_RUNTIME_DLLS:${target}> $<TARGET_FILE_DIR:${target}> COMMAND_EXPAND_LISTS)
   endforeach()
  endif()

@@ -267,7 +267,10 @@ struct InlayDoc {
  InlayMeasure* views;
  uint32_t view_count,view_capacity;
  char utf8_carry[4];uint8_t utf8_carry_len;
+ struct InlayDiagramCache* diagram_cache;
 };
+
+void inlay_doc_free_diagram_cache(InlayDoc* doc) noexcept;
 
 const InlayRefDef* inlay_doc_find_ref_def(const InlayDoc* doc,const char* label,uint32_t len) noexcept;
 void inlay_doc_parse_pending(InlayDoc* doc) noexcept;

@@ -723,11 +723,52 @@ const InlayPortalBackendVTable api = {
     nullptr, bounds,         ack,          set_radius};
 } // namespace
 
+bool inlay_portal_webview2_post_message(void *backend, EtchStr msg) noexcept {
+  if (!backend || !msg.chars || msg.length == 0u || msg.length > 65536u ||
+      std::memchr(msg.chars, 0, msg.length))
+    return false;
+  auto *p = static_cast<WebPortal *>(backend);
+  if (p->closed || !p->web)
+    return false;
+  wchar_t *wmsg = wide(msg.chars, msg.length);
+  if (!wmsg)
+    return false;
+  const HRESULT hr = p->web->PostWebMessageAsString(wmsg);
+  std::free(wmsg);
+  return SUCCEEDED(hr);
+}
+
+bool inlay_portal_webview2_nav_action(void *backend, int action) noexcept {
+  if (!backend)
+    return false;
+  auto *p = static_cast<WebPortal *>(backend);
+  if (p->closed || !p->web)
+    return false;
+  switch (action) {
+  case 0:
+    return SUCCEEDED(p->web->GoBack());
+  case 1:
+    return SUCCEEDED(p->web->GoForward());
+  case 2:
+    return SUCCEEDED(p->web->Reload());
+  default:
+    return false;
+  }
+}
+
 extern "C" INLAY_API const InlayPortalBackendVTable *
 inlay_portal_webview2_backend(void) {
   return &api;
 }
 #else
+bool inlay_portal_webview2_post_message(void *, EtchStr) noexcept {
+  return false;
+}
+
+bool inlay_portal_webview2_nav_action(void *, int) noexcept {
+  return false;
+}
+
 extern "C" INLAY_API const InlayPortalBackendVTable *
 inlay_portal_webview2_backend(void) {
   return nullptr;

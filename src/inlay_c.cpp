@@ -161,4 +161,25 @@ INLAY_API InlayPortalWebView2Options inlay_portal_webview2_options_default(void)
  o.struct_size = uint32_t(sizeof(InlayPortalWebView2Options));
  return o;
 }
+
+INLAY_API InlayActionPolicy inlay_action_policy_default(void) {
+ InlayActionPolicy p = {};
+ p.struct_size = uint32_t(sizeof(InlayActionPolicy));
+ p.permission = INLAY_ACTION_READ;
+ return p;
+}
+
+INLAY_API InlayImageLoaderDesc inlay_image_loader_desc_default(void) {
+ InlayImageLoaderDesc d = {};
+ d.struct_size = uint32_t(sizeof(InlayImageLoaderDesc));
+ d.max_entries = 128u;
+ d.max_vram_bytes = 64u * 1024u * 1024u;
+ return d;
+}
+
+INLAY_API InlayPortalPolicy inlay_portal_policy_default(void) {
+ InlayPortalPolicy p = {};
+ p.struct_size = uint32_t(sizeof(InlayPortalPolicy));
+ return p;
+}
 }
