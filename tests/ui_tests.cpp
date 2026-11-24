@@ -2930,10 +2930,11 @@ function render() {
                 ok &= check(mdata.reads > 0u && mdata.reads < 256u && inlay_surface_stats(s).js_ticks == ticks0,
                             "i2 #51 1M-row model renders only visible slice with 0 JS ticks");
 
-                // Scroll to row 500,000 and select it natively
+                // Scroll to row 500,000 and select it natively (row_id = 501000)
                 etch_virtual_list_scroll_to_row(vlist_eid, 500000u, 30.f, ETCH_ALIGN_Y_TOP);
                 step();
-                const uint32_t row500k_eid = etch_id_index(vlist_eid, 0x710000u + 500000u);
+                const uint32_t row500k_eid =
+                    etch_id_index(vlist_eid, static_cast<uint32_t>(501000ull ^ (501000ull >> 32)));
                 ok &= check(etch_perform_a11y_action(row500k_eid, ETCH_A11Y_ACT_PRESS, 0.f, {}, ctx, nullptr),
                             "i2 #51 select row 500000 via A11y");
                 step();
@@ -3369,6 +3370,480 @@ function render() {
 
     return ok;
 }
+
+bool test_wave2_track_i2(EtchContext *ctx, const InlaySurfaceDesc &desc, const char *hmr_path) {
+    bool ok = true;
+    auto frame = etch_frame_desc_default();
+    frame.viewport_w = 1024;
+    frame.viewport_h = 720;
+
+    auto find_text_prefix = [](const InlaySurface *s, const char *prefix) -> EtchStr {
+        uint32_t cnt = 0u;
+        const auto *nodes = inlay_surface_nodes(s, &cnt);
+        const size_t plen = std::strlen(prefix);
+        for (uint32_t i = 0u; i < cnt; ++i) {
+            if (nodes[i].kind == INLAY_UI_TEXT && nodes[i].text.chars && nodes[i].text.length >= plen &&
+                std::memcmp(nodes[i].text.chars, prefix, plen) == 0) {
+                return nodes[i].text;
+            }
+        }
+        return {};
+    };
+
+    // ------------------------------------------------------------------------
+    // R03: True Transactional HMR Staging (runtime throw inside render())
+    // ------------------------------------------------------------------------
+    if (hmr_path && hmr_path[0]) {
+        char r03_path[2048] = {};
+        std::snprintf(r03_path, sizeof(r03_path), "%s.r03.js", hmr_path);
+        static const char good_v1[] = R"JS(
+setTimeout(() => { state.timerFired = true; }, 35);
+function render(st) {
+  return (
+    <Col id="r03_root" width={300} gap={6}>
+      <Button id="r03_btn" width={120} height={32}
+              onClick={(s) => { s.clicks = (s.clicks || 0) + 1; }}>Click</Button>
+      <Text id="r03_txt">{'Clicks:' + (st.clicks || 0)}</Text>
+    </Col>
+  );
+}
+)JS";
+        static const char bad_render_throw[] =
+            "function render(st) { throw new Error('candidate render boom'); }";
+        static const char good_v2[] =
+            "function render(st) { return <Text id=\"r03_ok\">{'Recovered:' + (st.clicks || 0)}</Text>; }";
+
+        auto *s = inlay_surface_create(ctx, &desc);
+        ok &= check(s != nullptr && write_file(r03_path, good_v1) && inlay_surface_enable_hmr(s, r03_path),
+                    "R03 initial valid HMR script mounts");
+        if (s) {
+            InlaySurfaceViewDesc view = inlay_surface_view_desc_default();
+            view.id = etch_id("w2-r03-view");
+            view.width_px = 320.f;
+            view.height_px = 180.f;
+            auto step = [&] {
+                etch_begin_frame(ctx, &frame);
+                inlay_surface_view(s, &view);
+                etch_end_frame(ctx);
+            };
+            step();
+
+            uint32_t cnt_before = 0u;
+            const auto *nodes_before = inlay_surface_nodes(s, &cnt_before);
+            const uint32_t btn_eid = find_surface_eid(nodes_before, cnt_before, view.id, "r03_btn");
+            ok &= check(cnt_before >= 3u && inlay_surface_next_timer_ms(s) >= 0,
+                        "R03 live tree and timer active before candidate HMR");
+
+            ok &= check(write_file(r03_path, bad_render_throw) && !inlay_surface_poll_hmr(s),
+                        "R03 candidate throwing inside render() fails poll_hmr cleanly");
+            uint32_t cnt_after = 0u;
+            (void)inlay_surface_nodes(s, &cnt_after);
+            const EtchStr err = inlay_surface_error(s);
+            ok &= check(cnt_after == cnt_before && cnt_after > 0u &&
+                            inlay_surface_stats(s).has_error &&
+                            err.chars && std::strstr(err.chars, "candidate render boom") != nullptr &&
+                            inlay_surface_next_timer_ms(s) >= 0,
+                        "R03 failed render() keeps live node_count, timer, and reports candidate error");
+
+            ok &= check(etch_perform_a11y_action(btn_eid, ETCH_A11Y_ACT_PRESS, 0.f, {}, ctx, nullptr),
+                        "R03 click old live button after failed HMR");
+            step();
+            step();
+            const EtchStr clicks_txt = find_text_prefix(s, "Clicks:");
+            const EtchStr st_json = inlay_surface_state_json(s);
+            ok &= check(str_eq(clicks_txt, "Clicks:1") &&
+                            st_json.chars && std::strstr(st_json.chars, "\"clicks\":1") != nullptr,
+                        "R03 old live button stays interactive and updates state");
+
+            SDL_Delay(55u);
+            step();
+            const EtchStr st_timer = inlay_surface_state_json(s);
+            ok &= check(st_timer.chars && std::strstr(st_timer.chars, "\"timerFired\":true") != nullptr,
+                        "R03 old live timer survives failed HMR and fires");
+
+            ok &= check(write_file(r03_path, good_v2) && inlay_surface_poll_hmr(s) &&
+                            !inlay_surface_stats(s).has_error &&
+                            str_eq(find_text_prefix(s, "Recovered:"), "Recovered:1"),
+                        "R03 subsequent valid HMR commits cleanly and preserves state");
+            inlay_surface_destroy(s);
+        }
+        std::remove(r03_path);
+    }
+
+    // ------------------------------------------------------------------------
+    // I01: Range-Aware InlayModel Notifications, Anchor Preservation & Wake-Up
+    // ------------------------------------------------------------------------
+    {
+        struct DynRow {
+            uint64_t id;
+            char label[32];
+        };
+        struct DynModelData {
+            DynRow rows[256];
+            uint32_t count;
+        };
+        auto *data = static_cast<DynModelData *>(std::calloc(1u, sizeof(DynModelData)));
+        ok &= check(data != nullptr, "I01 alloc backing model");
+        if (data) {
+            data->count = 120u;
+            for (uint32_t i = 0u; i < data->count; ++i) {
+                data->rows[i].id = 0x100000001ull + uint64_t(i);
+                std::snprintf(data->rows[i].label, sizeof(data->rows[i].label), "Row %u", i);
+            }
+            auto read_dyn = [](uint32_t index, InlayModelRow *out_row, void *user) -> bool {
+                const auto *d = static_cast<const DynModelData *>(user);
+                if (index >= d->count) return false;
+                out_row->row_id = d->rows[index].id;
+                out_row->label = {d->rows[index].label, static_cast<uint32_t>(std::strlen(d->rows[index].label)), true};
+                return true;
+            };
+            InlayModel *model = inlay_model_create(read_dyn, data);
+            ok &= check(model != nullptr, "I01 create model");
+            if (model) {
+                InlayModelChange ch = {};
+                ok &= check(!inlay_model_last_change(model, &ch), "I01 last_change false before mutations");
+                inlay_model_bind_context(model, ctx);
+                inlay_model_set_count(model, data->count);
+                ok &= check(inlay_model_last_change(model, &ch) &&
+                                ch.kind == INLAY_MODEL_CHANGE_RESET && ch.count == 120u,
+                            "I01 set_count records RESET change");
+
+                auto *s = inlay_surface_create(ctx, &desc);
+                if (s) {
+                    ok &= check(inlay_surface_bind_model(s, ETCH_STR_LIT("dyn"), model) &&
+                                    inlay_surface_set_script(
+                                        s, ETCH_STR_LIT("function render(){return <VirtualList id='i01_vl' model='dyn' width={360} height={150} itemHeight={30} />;}")),
+                                "I01 bind and mount VirtualList");
+                    uint32_t ncnt = 0u;
+                    const auto *nodes = inlay_surface_nodes(s, &ncnt);
+                    InlaySurfaceViewDesc view = inlay_surface_view_desc_default();
+                    view.id = etch_id("w2-i01-view");
+                    view.width_px = 380.f;
+                    view.height_px = 180.f;
+                    const uint32_t vl_eid = find_surface_eid(nodes, ncnt, view.id, "i01_vl");
+                    auto step = [&] {
+                        etch_begin_frame(ctx, &frame);
+                        inlay_surface_view(s, &view);
+                        etch_end_frame(ctx);
+                    };
+                    for (int i = 0; i < 6; ++i) step();
+
+                    inlay_model_notify_change(model, 10u, 2u);
+                    ok &= check(etch_needs_redraw(ctx) &&
+                                    inlay_model_last_change(model, &ch) &&
+                                    ch.kind == INLAY_MODEL_CHANGE_UPDATE &&
+                                    ch.first_row == 10u && ch.count == 2u,
+                                "I01 notify_change records range and wakes bound context");
+
+                    etch_virtual_list_scroll_to_row(vl_eid, 40u, 30.f, ETCH_ALIGN_Y_TOP);
+                    step();
+                    step();
+                    const double scroll_before = etch_virtual_list_scroll_offset(vl_eid);
+                    const uint64_t row40_id = 0x100000001ull + 40ull;
+                    const uint32_t row40_eid =
+                        etch_id_index(vl_eid, static_cast<uint32_t>(row40_id ^ (row40_id >> 32)));
+                    EtchA11yNode rn0 = {};
+                    ok &= check(scroll_before >= 1199.0 &&
+                                    etch_find_a11y_node(row40_eid, &rn0, ctx, nullptr) &&
+                                    str_eq(rn0.label, "Row 40"),
+                                "I01 row_id-keyed Etch ID matches Row 40 before prepend");
+
+                    // Prepend 5 rows above viewport -> scroll shifts by +150px and Row 40 stays anchored!
+                    std::memmove(&data->rows[5], &data->rows[0], size_t(data->count) * sizeof(DynRow));
+                    for (uint32_t i = 0u; i < 5u; ++i) {
+                        data->rows[i].id = 0x200000001ull + uint64_t(i);
+                        std::snprintf(data->rows[i].label, sizeof(data->rows[i].label), "New %u", i);
+                    }
+                    data->count += 5u;
+                    inlay_model_notify_insert(model, 0u, 5u);
+                    ok &= check(inlay_model_count(model) == 125u &&
+                                    etch_needs_redraw(ctx) &&
+                                    inlay_model_last_change(model, &ch) &&
+                                    ch.kind == INLAY_MODEL_CHANGE_INSERT &&
+                                    ch.first_row == 0u && ch.count == 5u,
+                                "I01 notify_insert updates count, last_change & redraw");
+                    step();
+                    const double scroll_after_ins = etch_virtual_list_scroll_offset(vl_eid);
+                    EtchA11yNode rn1 = {};
+                    ok &= check(std::fabs(scroll_after_ins - (scroll_before + 150.0)) < 1.0 &&
+                                    etch_find_a11y_node(row40_eid, &rn1, ctx, nullptr) &&
+                                    str_eq(rn1.label, "Row 40"),
+                                "I01 insert above viewport preserves scroll anchor & stable row_id");
+
+                    // Remove 3 rows above viewport -> scroll shifts by -90px!
+                    std::memmove(&data->rows[0], &data->rows[3], size_t(data->count - 3u) * sizeof(DynRow));
+                    data->count -= 3u;
+                    inlay_model_notify_remove(model, 0u, 3u);
+                    ok &= check(inlay_model_count(model) == 122u &&
+                                    inlay_model_last_change(model, &ch) &&
+                                    ch.kind == INLAY_MODEL_CHANGE_REMOVE &&
+                                    ch.first_row == 0u && ch.count == 3u,
+                                "I01 notify_remove updates count & last_change");
+                    step();
+                    const double scroll_after_rem = etch_virtual_list_scroll_offset(vl_eid);
+                    ok &= check(std::fabs(scroll_after_rem - (scroll_before + 60.0)) < 1.0,
+                                "I01 remove above viewport preserves scroll anchor");
+
+                    inlay_model_notify_move(model, 10u, 20u, 2u);
+                    ok &= check(inlay_model_last_change(model, &ch) &&
+                                    ch.kind == INLAY_MODEL_CHANGE_MOVE &&
+                                    ch.first_row == 10u && ch.dst_row == 20u && ch.count == 2u,
+                                "I01 notify_move records src, dst & count");
+
+                    inlay_surface_bind_model(s, ETCH_STR_LIT("dyn"), nullptr);
+                    inlay_surface_destroy(s);
+                }
+                inlay_model_destroy(model);
+            }
+
+            // Underflow clamp check on notify_remove
+            InlayModel *small_m = inlay_model_create(read_dyn, data);
+            if (small_m) {
+                inlay_model_set_count(small_m, 3u);
+                inlay_model_notify_remove(small_m, 0u, 10u);
+                InlayModelChange sc = {};
+                ok &= check(inlay_model_count(small_m) == 0u &&
+                                inlay_model_last_change(small_m, &sc) &&
+                                sc.kind == INLAY_MODEL_CHANGE_REMOVE && sc.count == 3u,
+                            "I01 notify_remove clamps underflow safely");
+                inlay_model_destroy(small_m);
+            }
+            std::free(data);
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // I02: Raised memo() Native Subtree Cache Budget (50 static + >256-node + 1 hot)
+    // ------------------------------------------------------------------------
+    {
+        auto *s = inlay_surface_create(ctx, &desc);
+        ok &= check(s != nullptr, "I02 surface create");
+        if (s) {
+            static const char memo_script[] = R"JS(
+let staticRuns = 0, bigRuns = 0, hot = 0;
+const StaticPanel = memo(function StaticPanel(p) {
+  ++staticRuns;
+  return <Box cls="p-1"><Text>{'Static ' + p.i}</Text></Box>;
+});
+const BigPanel = memo(function BigPanel() {
+  ++bigRuns;
+  const rows = [];
+  for (let i = 0; i < 300; ++i) rows.push(<Text key={i}>{'L' + i}</Text>);
+  return <Col>{rows}</Col>;
+});
+function render() {
+  const panels = [];
+  for (let i = 0; i < 50; ++i) panels.push(<StaticPanel key={i} i={i} />);
+  return (
+    <Col>
+      {panels}
+      <BigPanel />
+      <Text>{'Hot:' + hot + ':' + staticRuns + ':' + bigRuns}</Text>
+    </Col>
+  );
+}
+function onEvent(name) {
+  if (name === 'bump') ++hot;
+}
+)JS";
+            ok &= check(inlay_surface_set_script(s, {memo_script, uint32_t(sizeof(memo_script) - 1u), true}),
+                        "I02 50-static + 300-node memo script mounts");
+            ok &= check(str_eq(find_text_prefix(s, "Hot:"), "Hot:0:50:1"),
+                        "I02 initial render executes 50 static panels + 1 big panel");
+            const uint64_t reused0 = inlay_surface_memo_reused_nodes(s);
+            ok &= check(inlay_surface_dispatch(s, ETCH_STR_LIT("bump"), ETCH_STR_LIT("null")),
+                        "I02 hot update dispatches");
+            const uint64_t reused_delta = inlay_surface_memo_reused_nodes(s) - reused0;
+            ok &= check(str_eq(find_text_prefix(s, "Hot:"), "Hot:1:50:1") && reused_delta >= 400u,
+                        "I02 0 JS re-renders on 50 static + 300-node panels and native reuse >= 400 nodes");
+            inlay_surface_destroy(s);
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // I03: Real Layout-Width Driven @container Breakpoints (grow inside Flex split)
+    // ------------------------------------------------------------------------
+    {
+        auto *s = inlay_surface_create(ctx, &desc);
+        ok &= check(s != nullptr, "I03 surface create");
+        if (s) {
+            static const char ct_script[] = R"JS(
+function render() {
+  return (
+    <Row id="c_row" cls="w-full">
+      <Box id="c_side" cls="w-[300px] h-20" />
+      <Box id="c_pane" cls="@container grow">
+        <Box id="c_target" cls="w-20 h-10 bg-[#112233] @sm:w-40 @md:w-80 @md:bg-[#2266aa]" />
+      </Box>
+    </Row>
+  );
+}
+)JS";
+            ok &= check(inlay_surface_set_script(s, {ct_script, uint32_t(sizeof(ct_script) - 1u), true}),
+                        "I03 @container grow script mounts");
+            InlaySurfaceViewDesc view = inlay_surface_view_desc_default();
+            view.id = etch_id("w2-i03-view");
+            view.width_px = 700.f;
+            view.height_px = 160.f;
+            auto step_w = [&](float w) {
+                view.width_px = w;
+                etch_begin_frame(ctx, &frame);
+                inlay_surface_view(s, &view);
+                etch_end_frame(ctx);
+            };
+
+            // At 700px viewport with 300px sidebar, grow @container is 400px -> @sm (160px), NOT @md (320px)!
+            for (int i = 0; i < 3; ++i) step_w(700.f);
+            uint32_t ncnt = 0u;
+            const auto *nodes = inlay_surface_nodes(s, &ncnt);
+            const EtchRect tb_narrow = etch_element_bounds(find_surface_eid(nodes, ncnt, view.id, "c_target"));
+            ok &= check(std::fabs(tb_narrow.w - 160.f) <= 1.f &&
+                            has_rect_prim(ctx, tb_narrow, etch_color_pack_rgba8(etch_rgba8(0x11, 0x22, 0x33, 255)), 0u, false),
+                        "I03 grow @container at 400px resolves @sm:w-40 despite 700px viewport");
+            const uint64_t ticks_narrow = inlay_surface_stats(s).js_ticks;
+            for (int i = 0; i < 4; ++i) step_w(700.f);
+            ok &= check(inlay_surface_stats(s).js_ticks == ticks_narrow,
+                        "I03 steady @container settles with 0 idle JS ticks");
+
+            // Widen viewport to 960px -> grow @container becomes 660px -> @md:w-80 (320px) & #2266aa!
+            for (int i = 0; i < 3; ++i) step_w(960.f);
+            nodes = inlay_surface_nodes(s, &ncnt);
+            const EtchRect tb_wide = etch_element_bounds(find_surface_eid(nodes, ncnt, view.id, "c_target"));
+            ok &= check(std::fabs(tb_wide.w - 320.f) <= 1.f &&
+                            has_rect_prim(ctx, tb_wide, etch_color_pack_rgba8(etch_rgba8(0x22, 0x66, 0xaa, 255)), 0u, false),
+                        "I03 grow @container resized to 660px automatically switches to @md:w-80 & bg");
+            const uint64_t ticks_wide = inlay_surface_stats(s).js_ticks;
+            for (int i = 0; i < 4; ++i) step_w(960.f);
+            ok &= check(inlay_surface_stats(s).js_ticks == ticks_wide,
+                        "I03 resized @container settles with 0 idle JS ticks");
+            inlay_surface_destroy(s);
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // I06: Form Error Auto-Focus & Assertive A11y Announcement
+    // ------------------------------------------------------------------------
+    {
+        auto *s = inlay_surface_create(ctx, &desc);
+        ok &= check(s != nullptr, "I06 surface create");
+        if (s) {
+            static const char i06_script[] = R"JS(
+function render() {
+  return (
+    <Form id="i06_fm" width={280}>
+      <Input id="i06_email" name="email" value="" required width={240} />
+      <Input id="i06_note" name="note" value="ok" width={240} />
+      <Button id="i06_sub" type="submit" width={100} height={30}>Submit</Button>
+    </Form>
+  );
+}
+)JS";
+            ok &= check(inlay_surface_set_script(s, {i06_script, uint32_t(sizeof(i06_script) - 1u), true}),
+                        "I06 form script mounts");
+            InlaySurfaceViewDesc view = inlay_surface_view_desc_default();
+            view.id = etch_id("w2-i06-view");
+            view.width_px = 320.f;
+            view.height_px = 200.f;
+            uint32_t focused_id = 0u;
+            auto step = [&] {
+                etch_begin_frame(ctx, &frame);
+                inlay_surface_view(s, &view);
+                focused_id = etch_focused_id();
+                etch_end_frame(ctx);
+            };
+            step();
+            uint32_t ncnt = 0u;
+            const auto *nodes = inlay_surface_nodes(s, &ncnt);
+            const uint32_t email_eid = find_surface_eid(nodes, ncnt, view.id, "i06_email");
+            const uint32_t sub_eid = find_surface_eid(nodes, ncnt, view.id, "i06_sub");
+
+            EtchA11yLiveMode prio_before = ETCH_A11Y_LIVE_OFF;
+            uint64_t seq_before = 0u;
+            (void)etch_last_a11y_announcement(&prio_before, &seq_before, ctx, nullptr);
+
+            ok &= check(etch_perform_a11y_action(sub_eid, ETCH_A11Y_ACT_PRESS, 0.f, {}, ctx, nullptr),
+                        "I06 press invalid form submit");
+            step();
+            step();
+            EtchA11yLiveMode prio_after = ETCH_A11Y_LIVE_OFF;
+            uint64_t seq_after = 0u;
+            const EtchStr ann = etch_last_a11y_announcement(&prio_after, &seq_after, ctx, nullptr);
+            ok &= check(focused_id == email_eid, "I06 form validation failure auto-focuses first invalid input");
+            ok &= check(seq_after > seq_before && prio_after == ETCH_A11Y_LIVE_ASSERTIVE &&
+                            ann.chars && ann.length > 0u && std::strstr(ann.chars, "email") != nullptr,
+                        "I06 form validation failure fires assertive A11y announcement");
+            inlay_surface_destroy(s);
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // I07: Boundary-Local Event Error Isolation
+    // ------------------------------------------------------------------------
+    {
+        auto *s = inlay_surface_create(ctx, &desc);
+        ok &= check(s != nullptr, "I07 surface create");
+        if (s) {
+            static const char i07_script[] = R"JS(
+function render(st) {
+  return (
+    <Row id="i07_root" width={360} gap={12}>
+      <ErrorBoundary key="bad_panel"
+        render={() => (
+          <Button id="i07_bad" width={120} height={32}
+                  onClick={() => { throw new Error('click exploded'); }}>Crash</Button>
+        )}
+        fallback={(e) => <Text id="i07_fb">{'Caught:' + e.message}</Text>}
+      />
+      <Col id="i07_sib" gap={4}>
+        <Button id="i07_ok" width={120} height={32}
+                onClick={(state) => { state.ok = (state.ok || 0) + 1; }}>Healthy</Button>
+        <Text id="i07_cnt">{'Sibling:' + (st.ok || 0)}</Text>
+      </Col>
+    </Row>
+  );
+}
+)JS";
+            ok &= check(inlay_surface_set_script(s, {i07_script, uint32_t(sizeof(i07_script) - 1u), true}),
+                        "I07 error boundary event isolation script mounts");
+            InlaySurfaceViewDesc view = inlay_surface_view_desc_default();
+            view.id = etch_id("w2-i07-view");
+            view.width_px = 400.f;
+            view.height_px = 160.f;
+            auto step = [&] {
+                etch_begin_frame(ctx, &frame);
+                inlay_surface_view(s, &view);
+                etch_end_frame(ctx);
+            };
+            step();
+            uint32_t ncnt = 0u;
+            const auto *nodes = inlay_surface_nodes(s, &ncnt);
+            const uint32_t bad_eid = find_surface_eid(nodes, ncnt, view.id, "i07_bad");
+            const uint32_t ok_eid = find_surface_eid(nodes, ncnt, view.id, "i07_ok");
+
+            ok &= check(etch_perform_a11y_action(bad_eid, ETCH_A11Y_ACT_PRESS, 0.f, {}, ctx, nullptr),
+                        "I07 press crashing button inside ErrorBoundary");
+            step();
+            step();
+            ok &= check(!inlay_surface_stats(s).has_error &&
+                            str_eq(find_text_prefix(s, "Caught:"), "Caught:click exploded"),
+                        "I07 onClick throw degrades ONLY enclosing ErrorBoundary into fallback");
+
+            ok &= check(etch_perform_a11y_action(ok_eid, ETCH_A11Y_ACT_PRESS, 0.f, {}, ctx, nullptr),
+                        "I07 click healthy sibling button after isolated throw");
+            step();
+            step();
+            const EtchStr sj = inlay_surface_state_json(s);
+            ok &= check(!inlay_surface_stats(s).has_error &&
+                            str_eq(find_text_prefix(s, "Caught:"), "Caught:click exploded") &&
+                            str_eq(find_text_prefix(s, "Sibling:"), "Sibling:1") &&
+                            sj.chars && std::strstr(sj.chars, "\"ok\":1") != nullptr,
+                        "I07 sibling panel remains interactive and updates state cleanly");
+            inlay_surface_destroy(s);
+        }
+    }
+
+    return ok;
+}
 } // namespace
 int main(int argc, char **argv) {
     auto config = etch_context_desc_default();
@@ -3672,6 +4147,7 @@ int main(int argc, char **argv) {
     }
     ok &= test_scoped_hooks_cls_cache_and_dark(context, functional_desc);
     ok &= test_i2_audit_features(context, functional_desc);
+    ok &= test_wave2_track_i2(context, functional_desc, argc > 1 ? argv[1] : nullptr);
     inlay_surface_destroy(surface);
     etch_destroy_context(context);
     std::puts(ok ? "Sandbox reactive/HMR PASS" : "Sandbox reactive/HMR FAIL");

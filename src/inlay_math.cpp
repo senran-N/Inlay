@@ -421,6 +421,8 @@ Box* atom_impl(Parser* p, StyleState st) noexcept {
             if (!cell) break;
             cell->ax = float(column);
             cell->ay = float(row);
+            cell->bx = float(column);
+            cell->by = float(row);
             append(grid, cell);
             widths[column] = std::fmax(widths[column], cell->width);
             ascents[row] = std::fmax(ascents[row], cell->ascent);
@@ -1408,6 +1410,318 @@ INLAY_API uint32_t inlay_math_export_svg(EtchStr tex, const InlayMathDesc* desc_
     svg_emit_box(box, pad, pad + box->ascent, col_hex, use_etch_fonts, &out);
     out.write_lit("</svg>\n");
 
+    heap.destroy();
+    if (out_buf && cap > 0u) {
+        out_buf[out.len < cap - 1u ? out.len : (cap - 1u)] = '\0';
+    }
+    return out.len;
+}
+}
+
+namespace {
+const char* mathml_delim_str(char mark) noexcept {
+    switch (mark) {
+        case '(': return "(";
+        case ')': return ")";
+        case '[': return "[";
+        case ']': return "]";
+        case '{': return "{";
+        case '}': return "}";
+        case '|': return "|";
+        case 'V': return "‖";
+        case '<': return "⟨";
+        case '>': return "⟩";
+        default:  return nullptr;
+    }
+}
+
+bool mathml_is_ascii_digits(EtchStr s) noexcept {
+    if (!s.chars || s.length == 0u) return false;
+    for (uint32_t i = 0u; i < s.length; ++i) {
+        if (s.chars[i] < '0' || s.chars[i] > '9') return false;
+    }
+    return true;
+}
+
+bool mathml_is_digit_glyph(const Box* b) noexcept {
+    return b && b->kind == Glyph && b->mclass == ClOrd && b->font_id == ETCH_FONT_SANS &&
+           b->text.chars && b->text.length == 1u && b->text.chars[0] >= '0' && b->text.chars[0] <= '9';
+}
+
+bool mathml_is_decimal_dot_glyph(const Box* b) noexcept {
+    return b && b->kind == Glyph && b->mclass == ClOrd && b->font_id == ETCH_FONT_SANS &&
+           b->text.chars && b->text.length == 1u && b->text.chars[0] == '.';
+}
+
+bool mathml_has_space(EtchStr s) noexcept {
+    for (uint32_t i = 0u; i < s.length; ++i) {
+        if (s.chars[i] == ' ' || s.chars[i] == '\t') return true;
+    }
+    return false;
+}
+
+bool mathml_is_single_codepoint(EtchStr s) noexcept {
+    if (!s.chars || s.length == 0u) return false;
+    size_t pos = 0u;
+    (void)inlay_utf8_next(s.chars, s.length, &pos);
+    return pos == s.length;
+}
+
+void mathml_emit_box(const Box* box, MathSvgOut* out) noexcept;
+
+void mathml_emit_glyph(const Box* box, MathSvgOut* out) noexcept {
+    const EtchStr t = box->text;
+    if (!t.chars || t.length == 0u) {
+        out->write_lit("<mi></mi>");
+        return;
+    }
+    if (box->mclass == ClOp || box->mclass == ClBin || box->mclass == ClRel ||
+        box->mclass == ClOpen || box->mclass == ClClose || box->mclass == ClPunct)
+    {
+        out->write_lit("<mo>");
+        out->write_escaped(t.chars, t.length);
+        out->write_lit("</mo>");
+        return;
+    }
+    if (mathml_is_ascii_digits(t)) {
+        out->write_lit("<mn>");
+        out->write_escaped(t.chars, t.length);
+        out->write_lit("</mn>");
+        return;
+    }
+    if (mathml_has_space(t)) {
+        out->write_lit("<mtext>");
+        out->write_escaped(t.chars, t.length);
+        out->write_lit("</mtext>");
+        return;
+    }
+    if (box->font_id == ETCH_FONT_BOLD) {
+        out->write_lit("<mi mathvariant=\"bold\">");
+    } else if (box->font_id == ETCH_FONT_MONO) {
+        out->write_lit("<mi mathvariant=\"monospace\">");
+    } else if (box->font_id == ETCH_FONT_SANS && mathml_is_single_codepoint(t) &&
+               t.length == 1u && ((t.chars[0] >= 'a' && t.chars[0] <= 'z') || (t.chars[0] >= 'A' && t.chars[0] <= 'Z')))
+    {
+        out->write_lit("<mi mathvariant=\"normal\">");
+    } else {
+        out->write_lit("<mi>");
+    }
+    out->write_escaped(t.chars, t.length);
+    out->write_lit("</mi>");
+}
+
+void mathml_emit_row_items(const Box* row, bool wrap_in_mrow, MathSvgOut* out) noexcept {
+    uint32_t item_count = 0u;
+    for (const Box* ch = row->first; ch; ch = ch->next) {
+        if (ch->kind == Space) continue;
+        if (mathml_is_digit_glyph(ch)) {
+            while (ch->next) {
+                const Box* nx = ch->next;
+                if (mathml_is_digit_glyph(nx)) { ch = nx; continue; }
+                if (mathml_is_decimal_dot_glyph(nx) && mathml_is_digit_glyph(nx->next)) { ch = nx->next; continue; }
+                break;
+            }
+        }
+        ++item_count;
+    }
+    if (item_count == 0u) {
+        if (wrap_in_mrow) out->write_lit("<mrow></mrow>");
+        return;
+    }
+    const bool emit_mrow = wrap_in_mrow && item_count > 1u;
+    if (emit_mrow) out->write_lit("<mrow>");
+    for (const Box* ch = row->first; ch; ch = ch->next) {
+        if (ch->kind == Space) continue;
+        if (mathml_is_digit_glyph(ch)) {
+            out->write_lit("<mn>");
+            out->write_escaped(ch->text.chars, ch->text.length);
+            while (ch->next) {
+                const Box* nx = ch->next;
+                if (mathml_is_digit_glyph(nx)) {
+                    out->write_escaped(nx->text.chars, nx->text.length);
+                    ch = nx;
+                    continue;
+                }
+                if (mathml_is_decimal_dot_glyph(nx) && mathml_is_digit_glyph(nx->next)) {
+                    out->write_lit(".");
+                    out->write_escaped(nx->next->text.chars, nx->next->text.length);
+                    ch = nx->next;
+                    continue;
+                }
+                break;
+            }
+            out->write_lit("</mn>");
+            continue;
+        }
+        mathml_emit_box(ch, out);
+    }
+    if (emit_mrow) out->write_lit("</mrow>");
+}
+
+void mathml_emit_box(const Box* box, MathSvgOut* out) noexcept {
+    if (!box || box->kind == Space) return;
+    switch (box->kind) {
+        case Row:
+            mathml_emit_row_items(box, true, out);
+            return;
+        case Glyph:
+            mathml_emit_glyph(box, out);
+            return;
+        case Fraction:
+            if (box->flags & 2u) out->write_lit("<mfrac linethickness=\"0\">");
+            else out->write_lit("<mfrac>");
+            mathml_emit_box(box->a, out);
+            mathml_emit_box(box->b, out);
+            out->write_lit("</mfrac>");
+            return;
+        case Root:
+            if (box->b) {
+                out->write_lit("<mroot>");
+                mathml_emit_box(box->a, out);
+                mathml_emit_box(box->b, out);
+                out->write_lit("</mroot>");
+            } else {
+                out->write_lit("<msqrt>");
+                mathml_emit_box(box->a, out);
+                out->write_lit("</msqrt>");
+            }
+            return;
+        case Scripts:
+            if (box->b && box->c) {
+                out->write_lit("<msubsup>");
+                mathml_emit_box(box->a, out);
+                mathml_emit_box(box->c, out);
+                mathml_emit_box(box->b, out);
+                out->write_lit("</msubsup>");
+            } else if (box->b) {
+                out->write_lit("<msup>");
+                mathml_emit_box(box->a, out);
+                mathml_emit_box(box->b, out);
+                out->write_lit("</msup>");
+            } else if (box->c) {
+                out->write_lit("<msub>");
+                mathml_emit_box(box->a, out);
+                mathml_emit_box(box->c, out);
+                out->write_lit("</msub>");
+            } else {
+                mathml_emit_box(box->a, out);
+            }
+            return;
+        case Limits:
+            if (box->b && box->c) {
+                out->write_lit("<munderover>");
+                mathml_emit_box(box->a, out);
+                mathml_emit_box(box->c, out);
+                mathml_emit_box(box->b, out);
+                out->write_lit("</munderover>");
+            } else if (box->b) {
+                out->write_lit("<mover>");
+                mathml_emit_box(box->a, out);
+                mathml_emit_box(box->b, out);
+                out->write_lit("</mover>");
+            } else if (box->c) {
+                out->write_lit("<munder>");
+                mathml_emit_box(box->a, out);
+                mathml_emit_box(box->c, out);
+                out->write_lit("</munder>");
+            } else {
+                mathml_emit_box(box->a, out);
+            }
+            return;
+        case Accent: {
+            const auto ak = static_cast<AccentKind>(box->sub_kind);
+            if (ak == AccUnderline) {
+                out->write_lit("<munder accentunder=\"true\">");
+                mathml_emit_box(box->a, out);
+                out->write_lit("<mo>_</mo></munder>");
+            } else {
+                const char* acc_str = "‾";
+                switch (ak) {
+                    case AccHat:      acc_str = "^"; break;
+                    case AccVec:      acc_str = "→"; break;
+                    case AccTilde:    acc_str = "~"; break;
+                    case AccDot:      acc_str = "˙"; break;
+                    case AccDDot:     acc_str = "¨"; break;
+                    case AccBar:      acc_str = "¯"; break;
+                    case AccOverline:
+                    default:          acc_str = "‾"; break;
+                }
+                out->write_lit("<mover accent=\"true\">");
+                mathml_emit_box(box->a, out);
+                out->write_lit("<mo>");
+                out->write_lit(acc_str);
+                out->write_lit("</mo></mover>");
+            }
+            return;
+        }
+        case Delimited: {
+            const char* open_s = box->text.length >= 2u ? mathml_delim_str(box->text.chars[0]) : nullptr;
+            const char* close_s = box->text.length >= 2u ? mathml_delim_str(box->text.chars[1]) : nullptr;
+            out->write_lit("<mrow>");
+            if (open_s) { out->write_lit("<mo stretchy=\"true\">"); out->write_lit(open_s); out->write_lit("</mo>"); }
+            mathml_emit_box(box->a, out);
+            if (close_s) { out->write_lit("<mo stretchy=\"true\">"); out->write_lit(close_s); out->write_lit("</mo>"); }
+            out->write_lit("</mrow>");
+            return;
+        }
+        case Grid: {
+            const char* open_s = box->text.length >= 2u ? mathml_delim_str(box->text.chars[0]) : nullptr;
+            const char* close_s = box->text.length >= 2u ? mathml_delim_str(box->text.chars[1]) : nullptr;
+            const bool has_delim = open_s != nullptr || close_s != nullptr;
+            if (has_delim) {
+                out->write_lit("<mrow>");
+                if (open_s) { out->write_lit("<mo stretchy=\"true\">"); out->write_lit(open_s); out->write_lit("</mo>"); }
+            }
+            out->write_lit("<mtable>");
+            uint32_t cur_row = UINT32_MAX;
+            bool row_open = false;
+            for (const Box* cell = box->first; cell; cell = cell->next) {
+                const uint32_t ridx = static_cast<uint32_t>(cell->by);
+                if (!row_open || ridx != cur_row) {
+                    if (row_open) out->write_lit("</mtr>");
+                    out->write_lit("<mtr>");
+                    cur_row = ridx;
+                    row_open = true;
+                }
+                out->write_lit("<mtd>");
+                if (cell->kind == Row) mathml_emit_row_items(cell, false, out);
+                else mathml_emit_box(cell, out);
+                out->write_lit("</mtd>");
+            }
+            if (row_open) out->write_lit("</mtr>");
+            out->write_lit("</mtable>");
+            if (has_delim) {
+                if (close_s) { out->write_lit("<mo stretchy=\"true\">"); out->write_lit(close_s); out->write_lit("</mo>"); }
+                out->write_lit("</mrow>");
+            }
+            return;
+        }
+        case Space:
+            return;
+    }
+}
+} // namespace
+
+extern "C" {
+INLAY_API uint32_t inlay_math_export_mathml(EtchStr tex, char* out_buf, uint32_t cap) {
+    if ((!tex.chars && tex.length) || tex.length > 65536u) {
+        if (out_buf && cap > 0u) out_buf[0] = '\0';
+        return 0u;
+    }
+    MathHeapArena heap = {};
+    Parser parser = { tex, 0u, true, 0u, INLAY_MATH_ERROR_NONE, 0u, 20.0f, &heap, false };
+    const StyleState init_st = { StyleDisplay, false };
+    const Box* box = expression(&parser, init_st, false);
+    if (!box || !parser.valid) {
+        heap.destroy();
+        if (out_buf && cap > 0u) out_buf[0] = '\0';
+        return 0u;
+    }
+    MathSvgOut out = { out_buf, cap, 0u };
+    out.write_lit("<math xmlns=\"http://www.w3.org/1998/Math/MathML\">");
+    if (box->kind == Row) mathml_emit_row_items(box, false, &out);
+    else mathml_emit_box(box, &out);
+    out.write_lit("</math>");
     heap.destroy();
     if (out_buf && cap > 0u) {
         out_buf[out.len < cap - 1u ? out.len : (cap - 1u)] = '\0';

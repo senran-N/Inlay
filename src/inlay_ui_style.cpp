@@ -21,6 +21,7 @@ inline uint8_t responsive_width_bucket(float w) noexcept {
 }
 
 constexpr uint32_t kMaxColorTweens = 256u;
+constexpr uint16_t kNf2Container = uint16_t(1u << 13);
 
 inline bool is_ascii_space(char c) noexcept {
     return c == ' ' || c == '\t' || c == '\n' || c == '\r';
@@ -1556,6 +1557,8 @@ void inlay_ui_apply_cls_parse(InlaySurface* s, const char* cls, size_t cls_len,
         size_t len = pos - start;
 
         if (inlay_ui_str_eq(tok, len, "@container")) {
+            st.flags2 = static_cast<uint16_t>(st.flags2 | kNf2Container);
+            if (out_saw_responsive) *out_saw_responsive = true;
             continue;
         }
 

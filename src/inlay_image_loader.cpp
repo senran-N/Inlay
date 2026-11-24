@@ -13,8 +13,10 @@ struct ImageJob {
  char* path;
  uint8_t* raw_bytes;
  size_t raw_size;
+ EtchDecodedImage decoded;
  bool is_file;
  bool srgb;
+ bool generate_mipmaps;
  bool ok;
  ImageJob* next;
 };
@@ -36,6 +38,7 @@ void free_job(ImageJob* j) noexcept {
  if (!j) return;
  SDL_free(j->path);
  SDL_free(j->raw_bytes);
+ if (j->decoded.rgba) etch_free_decoded_image(&j->decoded);
  SDL_free(j);
 }
 
@@ -156,21 +159,54 @@ int SDLCALL image_loader_worker(void* user) noexcept {
   loader->pending_head = job->next;
   if (!loader->pending_head) loader->pending_tail = nullptr;
   job->next = nullptr;
+  bool active = false;
+  if (job->slot_index < loader->max_entries) {
+   const auto& e = loader->entries[job->slot_index];
+   active = e.occupied && e.key_hash == job->key_hash &&
+            e.generation == job->generation && e.status == INLAY_IMAGE_STATUS_LOADING;
+  }
   SDL_UnlockMutex(loader->mutex);
 
+  if (!active) {
+   free_job(job);
+   continue;
+  }
+
+  uint8_t* raw = job->raw_bytes;
+  size_t raw_size = job->raw_size;
+  job->raw_bytes = nullptr;
+  job->raw_size = 0u;
   if (job->is_file) {
    size_t fsize = 0u;
    void* fdata = job->path ? SDL_LoadFile(job->path, &fsize) : nullptr;
    if (fdata && fsize > 0u) {
-    job->raw_bytes = static_cast<uint8_t*>(fdata);
-    job->raw_size = fsize;
-    job->ok = true;
+    raw = static_cast<uint8_t*>(fdata);
+    raw_size = fsize;
    } else {
     SDL_free(fdata);
+   }
+  }
+  SDL_free(job->path);
+  job->path = nullptr;
+
+  job->ok = false;
+  job->decoded = {};
+  job->generate_mipmaps = true;
+  if (raw && raw_size > 0u) {
+   if (bytes_look_like_svg(raw, raw_size)) {
+    EtchSvgRasterDesc sdesc = etch_svg_raster_desc_default();
+    sdesc.srgb = job->srgb;
+    job->generate_mipmaps = sdesc.generate_mipmaps;
+    job->ok = etch_rasterize_svg_memory(raw, raw_size, &sdesc, &job->decoded);
+   } else {
+    job->ok = etch_decode_image_memory(raw, raw_size, &job->decoded);
+   }
+   SDL_free(raw);
+   raw = nullptr;
+   if (job->ok && (!job->decoded.rgba || job->decoded.width == 0u || job->decoded.height == 0u)) {
+    etch_free_decoded_image(&job->decoded);
     job->ok = false;
    }
-  } else {
-   job->ok = (job->raw_bytes != nullptr && job->raw_size > 0u);
   }
 
   SDL_LockMutex(loader->mutex);
@@ -391,15 +427,17 @@ INLAY_API uint32_t inlay_image_loader_poll(InlayImageLoader* loader, uint32_t ma
   }
 
   EtchLoadedTexture tex = {};
-  if (job->ok && job->raw_bytes && job->raw_size > 0u) {
-   if (bytes_look_like_svg(job->raw_bytes, job->raw_size)) {
-    EtchSvgRasterDesc sdesc = etch_svg_raster_desc_default();
-    sdesc.srgb = job->srgb;
-    tex = etch_load_svg_memory(loader->ctx, job->raw_bytes, job->raw_size, &sdesc);
-   } else {
-    tex = etch_load_texture_memory(loader->ctx, job->raw_bytes, job->raw_size, job->srgb);
-   }
+  if (job->ok && job->decoded.rgba && job->decoded.width > 0u && job->decoded.height > 0u) {
+   EtchTextureDesc tdesc = etch_texture_desc_default();
+   tdesc.rgba_pixels = job->decoded.rgba;
+   tdesc.width = job->decoded.width;
+   tdesc.height = job->decoded.height;
+   tdesc.row_pitch_bytes = job->decoded.width * 4u;
+   tdesc.srgb = job->srgb;
+   tdesc.generate_mipmaps = job->generate_mipmaps;
+   tex = etch_create_texture_rgba(loader->ctx, &tdesc);
   }
+  etch_free_decoded_image(&job->decoded);
   const uint32_t slot_index = job->slot_index;
   const uint64_t job_hash = job->key_hash;
   const uint64_t job_gen = job->generation;

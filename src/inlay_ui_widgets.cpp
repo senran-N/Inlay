@@ -8,6 +8,8 @@
 #include <cstring>
 
 bool inlay_ui_model_read(const InlayModel* model, uint32_t index, InlayModelRow* out_row) noexcept;
+bool inlay_ui_model_replay_scroll_delta(const InlayModel* model, uint64_t since_rev,
+                                        uint32_t first_visible, int64_t* out_row_delta) noexcept;
 
 namespace {
 
@@ -30,6 +32,8 @@ struct ModelSelectionEntry {
     uint32_t selected_index;
     bool has_selection;
     uint64_t last_used_frame;
+    const InlayModel* last_model;
+    uint64_t last_model_rev;
 };
 
 ModelSelectionEntry g_model_selections[kMaxModelSelections] = {};
@@ -2404,10 +2408,43 @@ void draw_virtual_list_widget(InlaySurface* s, const InlayUiNode& node, const No
     vd.scroll_fade_px = spec.scroll_fade_px;
     vd.stick_to_bottom = spec.stick_to_bottom;
 
+    const double stride = double(vd.item_height_px) +
+                          double(vd.row_gap_px > 0.f ? std::round(vd.row_gap_px) : 0.f);
+    ModelSelectionEntry* sel = model_mode ? find_or_add_model_selection(s, id) : nullptr;
+    bool has_post_scroll_target = false;
+    double post_scroll_target_y = 0.0;
+    if (model_mode && model && sel) {
+        const uint64_t cur_rev = inlay_model_revision(model);
+        if (sel->last_model == model && sel->last_model_rev != cur_rev) {
+            if (!(vd.stick_to_bottom && etch_virtual_list_is_at_bottom(id))) {
+                const double cur_y = etch_virtual_list_scroll_offset(id);
+                const double adj_y = cur_y > double(vd.padding.top) ? (cur_y - double(vd.padding.top)) : 0.0;
+                const uint32_t first_visible =
+                    stride > 0.0 ? static_cast<uint32_t>(std::floor(adj_y / stride)) : 0u;
+                int64_t row_delta = 0;
+                if (inlay_ui_model_replay_scroll_delta(model, sel->last_model_rev,
+                                                       first_visible, &row_delta)) {
+                    const double target_y = std::fmax(0.0, cur_y + double(row_delta) * stride);
+                    etch_set_virtual_list_scroll_offset(id, target_y, true);
+                    has_post_scroll_target = true;
+                    post_scroll_target_y = target_y;
+                }
+            }
+            sel->last_model_rev = cur_rev;
+        } else if (sel->last_model != model) {
+            sel->last_model = model;
+            sel->last_model_rev = cur_rev;
+        }
+    }
+
     const EtchVirtualListSlice slice = etch_begin_virtual_list(&vd);
+    if (has_post_scroll_target && post_scroll_target_y > slice.scroll_y + 0.5 &&
+        post_scroll_target_y <= slice.max_scroll_y + 0.5) {
+        etch_set_virtual_list_scroll_offset(id, post_scroll_target_y, true);
+        etch_request_redraw(s->etch);
+    }
 
     if (model_mode) {
-        ModelSelectionEntry* sel = find_or_add_model_selection(s, id);
         const bool controlled_sel = (st.flags2 & Nf2HasMin) != 0u;
         const bool dark = inlay_is_dark_theme(theme);
         const EtchColor hover_bg = (cold && cold->hover_bg.set)
@@ -2425,7 +2462,10 @@ void draw_virtual_list_widget(InlaySurface* s, const InlayUiNode& node, const No
                 : (sel && sel->has_selection &&
                    (has_row && mrow.row_id != 0u ? (sel->selected_row_id == mrow.row_id) : (sel->selected_index == i)));
 
-            const uint32_t row_id = etch_id_index(id, 0x710000u + i);
+            const uint32_t row_key = (has_row && mrow.row_id != 0u)
+                ? static_cast<uint32_t>(mrow.row_id ^ (mrow.row_id >> 32))
+                : (0x710000u + i);
+            const uint32_t row_id = etch_id_index(id, row_key);
             auto row = etch_box_desc_default();
             row.id = row_id;
             row.axis = ETCH_AXIS_ROW;

@@ -176,6 +176,438 @@ bool test_stream() {
     return ok;
 }
 
+bool test_stream_r01_atomic_upsert() {
+    bool ok = true;
+    InlayStream* s = inlay_stream_create();
+    if (!check(s != nullptr, "R01 stream create")) return false;
+
+    InlayStreamItem orig = {};
+    orig.id = 42u;
+    orig.message_id = 7u;
+    orig.role = INLAY_STREAM_ROLE_ASSISTANT;
+    orig.kind = INLAY_STREAM_ITEM_MARKDOWN;
+    orig.status = INLAY_STREAM_STATUS_RUNNING;
+    orig.progress = 0.5f;
+    orig.title = ETCH_STR_LIT("OrigTitle");
+    orig.body = ETCH_STR_LIT("OrigBody");
+    orig.metadata_json = ETCH_STR_LIT("{\"v\":1}");
+    ok &= check(inlay_stream_upsert(s, &orig), "R01 initial insert");
+
+    const uint64_t saved_cursor = inlay_stream_cursor(s);
+    constexpr uint32_t kOverLimit = (32u * 1024u * 1024u) + 1u;
+
+    auto verify_untouched = [&](const char* label, uint64_t expect_rev, uint64_t expect_cursor) {
+        InlayStreamItem cur = {};
+        const bool got = inlay_stream_get_by_id(s, 42u, &cur);
+        ok &= check(got &&
+                    cur.revision == expect_rev &&
+                    inlay_stream_cursor(s) == expect_cursor &&
+                    cur.status == INLAY_STREAM_STATUS_RUNNING &&
+                    near_f(cur.progress, 0.5f) &&
+                    str_eq(cur.title, "OrigTitle") &&
+                    str_eq(cur.body, "OrigBody") &&
+                    str_eq(cur.metadata_json, "{\"v\":1}"),
+                    label);
+    };
+
+    // Over-limit body after valid modified title & metadata must not mutate existing entry
+    {
+        InlayStreamItem bad = orig;
+        bad.status = INLAY_STREAM_STATUS_DONE;
+        bad.progress = 1.0f;
+        bad.title = ETCH_STR_LIT("CorruptedTitle");
+        bad.body = {"x", kOverLimit, false};
+        bad.metadata_json = ETCH_STR_LIT("{\"v\":2}");
+        ok &= check(!inlay_stream_upsert(s, &bad), "R01 rejects over-limit body");
+        verify_untouched("R01 over-limit body preserves existing entry", 1u, saved_cursor);
+    }
+
+    // Over-limit metadata_json after valid modified title & body must not mutate existing entry
+    {
+        InlayStreamItem bad = orig;
+        bad.title = ETCH_STR_LIT("CorruptedTitle2");
+        bad.body = ETCH_STR_LIT("CorruptedBody2");
+        bad.metadata_json = {"x", kOverLimit, false};
+        ok &= check(!inlay_stream_upsert(s, &bad), "R01 rejects over-limit metadata_json");
+        verify_untouched("R01 over-limit metadata preserves existing entry", 1u, saved_cursor);
+    }
+
+    // Over-limit title
+    {
+        InlayStreamItem bad = orig;
+        bad.title = {"x", kOverLimit, false};
+        ok &= check(!inlay_stream_upsert(s, &bad), "R01 rejects over-limit title");
+        verify_untouched("R01 over-limit title preserves existing entry", 1u, saved_cursor);
+    }
+
+    // Invalid UTF-8 in title / body / metadata_json
+    {
+        const char bad_ff[] = "a\xFF";
+        InlayStreamItem bad = orig;
+        bad.title = {bad_ff, 2u, false};
+        bad.body = ETCH_STR_LIT("MutatedBody");
+        bad.metadata_json = ETCH_STR_LIT("{\"mut\":true}");
+        ok &= check(!inlay_stream_upsert(s, &bad), "R01 rejects invalid UTF-8 title");
+        verify_untouched("R01 invalid UTF-8 title preserves existing entry", 1u, saved_cursor);
+    }
+    {
+        const char bad_surr[] = "\xED\xA0\x80";
+        InlayStreamItem bad = orig;
+        bad.title = ETCH_STR_LIT("MutatedTitle");
+        bad.body = {bad_surr, 3u, false};
+        bad.metadata_json = ETCH_STR_LIT("{\"mut\":true}");
+        ok &= check(!inlay_stream_upsert(s, &bad), "R01 rejects surrogate UTF-8 body");
+        verify_untouched("R01 surrogate UTF-8 body preserves existing entry", 1u, saved_cursor);
+    }
+    {
+        const char bad_trunc[] = "\xE4\xB8";
+        InlayStreamItem bad = orig;
+        bad.title = ETCH_STR_LIT("MutatedTitle");
+        bad.body = {bad_trunc, 2u, false};
+        ok &= check(!inlay_stream_upsert(s, &bad), "R01 rejects incomplete UTF-8 body");
+        verify_untouched("R01 incomplete UTF-8 body preserves existing entry", 1u, saved_cursor);
+    }
+    {
+        const char bad_meta[] = "\xE0\x80\x80";
+        InlayStreamItem bad = orig;
+        bad.title = ETCH_STR_LIT("MutatedTitle");
+        bad.body = ETCH_STR_LIT("MutatedBody");
+        bad.metadata_json = {bad_meta, 3u, false};
+        ok &= check(!inlay_stream_upsert(s, &bad), "R01 rejects overlong UTF-8 metadata_json");
+        verify_untouched("R01 invalid UTF-8 metadata preserves existing entry", 1u, saved_cursor);
+    }
+
+    // Invalid enum and null pointer with nonzero length
+    {
+        InlayStreamItem bad = orig;
+        bad.role = static_cast<InlayStreamRole>(99);
+        ok &= check(!inlay_stream_upsert(s, &bad), "R01 rejects out-of-range role");
+        verify_untouched("R01 invalid role preserves existing entry", 1u, saved_cursor);
+    }
+    {
+        InlayStreamItem bad = orig;
+        bad.title = ETCH_STR_LIT("MutatedTitle");
+        bad.metadata_json = {nullptr, 5u, false};
+        ok &= check(!inlay_stream_upsert(s, &bad), "R01 rejects null metadata with nonzero length");
+        verify_untouched("R01 null metadata preserves existing entry", 1u, saved_cursor);
+    }
+
+    // Pending utf8_carry preserved on failed upsert, cleared on committed replacement upsert
+    {
+        const char lead[] = "\xE4";
+        const char tail[] = "\xB8\xAD";
+        ok &= check(inlay_stream_append_body(s, 42u, {lead, 1u, false}), "R01 stage 1-byte utf8 carry");
+        const uint64_t cur_after_carry = inlay_stream_cursor(s);
+
+        const char bad_utf8[] = "\xFF";
+        InlayStreamItem bad = orig;
+        bad.metadata_json = {bad_utf8, 1u, false};
+        ok &= check(!inlay_stream_upsert(s, &bad), "R01 failed upsert while carry pending");
+        ok &= check(inlay_stream_cursor(s) == cur_after_carry, "R01 failed upsert keeps cursor");
+
+        ok &= check(inlay_stream_append_body(s, 42u, {tail, 2u, false}), "R01 pending carry completes after failed upsert");
+        InlayStreamItem after_cjk = {};
+        ok &= check(inlay_stream_get_by_id(s, 42u, &after_cjk) && str_eq(after_cjk.body, "OrigBody中"),
+                    "R01 carry reassembled CJK char intact");
+
+        const char emoji_lead[] = "\xF0";
+        ok &= check(inlay_stream_append_body(s, 42u, {emoji_lead, 1u, false}), "R01 stage emoji lead carry");
+        InlayStreamItem repl = orig;
+        repl.body = ETCH_STR_LIT("Reset");
+        ok &= check(inlay_stream_upsert(s, &repl), "R01 valid replacement upsert commits");
+        ok &= check(inlay_stream_append_body(s, 42u, ETCH_STR_LIT("!")),
+                    "R01 replacement upsert cleared stale utf8_carry");
+        InlayStreamItem after_reset = {};
+        ok &= check(inlay_stream_get_by_id(s, 42u, &after_reset) && str_eq(after_reset.body, "Reset!"),
+                    "R01 post-replacement append matches");
+    }
+
+    inlay_stream_destroy(s);
+    return ok;
+}
+
+bool test_stream_r02_utf8_carry() {
+    bool ok = true;
+    InlayStream* s = inlay_stream_create();
+    if (!check(s != nullptr, "R02 stream create")) return false;
+
+    InlayStreamItem item = {};
+    item.id = 7u;
+    item.role = INLAY_STREAM_ROLE_ASSISTANT;
+    item.kind = INLAY_STREAM_ITEM_MARKDOWN;
+    item.status = INLAY_STREAM_STATUS_RUNNING;
+    item.title = ETCH_STR_LIT("Stream");
+    item.body = ETCH_STR_LIT("Start:");
+    ok &= check(inlay_stream_upsert(s, &item), "R02 insert base item");
+
+    auto check_body_state = [&](const char* expected_body, uint64_t expected_rev,
+                                uint64_t expected_cursor, const char* label) {
+        InlayStreamItem cur = {};
+        ok &= check(inlay_stream_get_by_id(s, 7u, &cur) &&
+                    str_eq(cur.body, expected_body) &&
+                    cur.revision == expected_rev &&
+                    inlay_stream_cursor(s) == expected_cursor,
+                    label);
+    };
+
+    const uint64_t c0 = inlay_stream_cursor(s);
+
+    // Invalid UTF-8 sequences must be rejected atomically without modifying body/revision/cursor
+    const char inv_ff[] = "\xFF";
+    const char inv_cont[] = "\x80";
+    const char inv_c0[] = "\xC0\x80";
+    const char inv_c1[] = "\xC1\xBF";
+    const char inv_overlong_e0[] = "\xE0\x80";
+    const char inv_overlong_e0_full[] = "\xE0\x9F\xBF";
+    const char inv_surr_prefix[] = "\xED\xA0";
+    const char inv_surr_full[] = "\xED\xA0\x80";
+    const char inv_overlong_f0[] = "\xF0\x80";
+    const char inv_gt_max[] = "\xF4\x90";
+    const char inv_f5[] = "\xF5\x80\x80\x80";
+    const char inv_mixed[] = "ok\xFF";
+
+    ok &= check(!inlay_stream_append_body(s, 7u, {inv_ff, 1u, false}), "R02 reject 0xFF");
+    ok &= check(!inlay_stream_append_body(s, 7u, {inv_cont, 1u, false}), "R02 reject lone continuation 0x80");
+    ok &= check(!inlay_stream_append_body(s, 7u, {inv_c0, 2u, false}), "R02 reject overlong C0 80");
+    ok &= check(!inlay_stream_append_body(s, 7u, {inv_c1, 2u, false}), "R02 reject overlong C1 BF");
+    ok &= check(!inlay_stream_append_body(s, 7u, {inv_overlong_e0, 2u, false}), "R02 reject overlong prefix E0 80");
+    ok &= check(!inlay_stream_append_body(s, 7u, {inv_overlong_e0_full, 3u, false}), "R02 reject overlong E0 9F BF");
+    ok &= check(!inlay_stream_append_body(s, 7u, {inv_surr_prefix, 2u, false}), "R02 reject surrogate prefix ED A0");
+    ok &= check(!inlay_stream_append_body(s, 7u, {inv_surr_full, 3u, false}), "R02 reject surrogate ED A0 80");
+    ok &= check(!inlay_stream_append_body(s, 7u, {inv_overlong_f0, 2u, false}), "R02 reject overlong prefix F0 80");
+    ok &= check(!inlay_stream_append_body(s, 7u, {inv_gt_max, 2u, false}), "R02 reject >U+10FFFF F4 90");
+    ok &= check(!inlay_stream_append_body(s, 7u, {inv_f5, 4u, false}), "R02 reject F5..");
+    ok &= check(!inlay_stream_append_body(s, 7u, {inv_mixed, 3u, false}), "R02 reject mixed valid+0xFF atomically");
+    check_body_state("Start:", 1u, c0, "R02 all invalid appends left state untouched");
+
+    // 3-byte Chinese "中" (\xE4\xB8\xAD) split byte-by-byte with interleaved invalid rejection
+    const char zh[] = "\xE4\xB8\xAD";
+    ok &= check(inlay_stream_append_body(s, 7u, {&zh[0], 1u, false}), "R02 zh byte 1");
+    check_body_state("Start:", 2u, c0 + 1u, "R02 zh byte 1 buffered in carry");
+
+    ok &= check(!inlay_stream_append_body(s, 7u, ETCH_STR_LIT("A")), "R02 reject non-continuation after carry");
+    check_body_state("Start:", 2u, c0 + 1u, "R02 failed continuation left carry & cursor untouched");
+
+    ok &= check(inlay_stream_append_body(s, 7u, {&zh[1], 1u, false}), "R02 zh byte 2");
+    check_body_state("Start:", 3u, c0 + 2u, "R02 zh byte 2 buffered in carry");
+
+    ok &= check(!inlay_stream_append_body(s, 7u, {inv_ff, 1u, false}), "R02 reject 0xFF while 2-byte carry pending");
+    check_body_state("Start:", 3u, c0 + 2u, "R02 failed 0xFF left 2-byte carry untouched");
+
+    ok &= check(inlay_stream_append_body(s, 7u, {&zh[2], 1u, false}), "R02 zh byte 3 completes scalar");
+    check_body_state("Start:中", 4u, c0 + 3u, "R02 3-byte Chinese reassembled identically");
+
+    // 4-byte emoji "😀" (\xF0\x9F\x98\x80) split byte-by-byte with interleaved invalid rejection
+    const char emoji[] = "\xF0\x9F\x98\x80";
+    ok &= check(inlay_stream_append_body(s, 7u, {&emoji[0], 1u, false}), "R02 emoji byte 1");
+    ok &= check(inlay_stream_append_body(s, 7u, {&emoji[1], 1u, false}), "R02 emoji byte 2");
+    ok &= check(!inlay_stream_append_body(s, 7u, ETCH_STR_LIT("Z")), "R02 reject non-continuation mid-emoji");
+    check_body_state("Start:中", 6u, c0 + 5u, "R02 failed mid-emoji left state untouched");
+
+    ok &= check(inlay_stream_append_body(s, 7u, {&emoji[2], 1u, false}), "R02 emoji byte 3");
+    ok &= check(inlay_stream_append_body(s, 7u, {&emoji[3], 1u, false}), "R02 emoji byte 4 completes scalar");
+    check_body_state("Start:中😀", 8u, c0 + 7u, "R02 4-byte emoji reassembled identically");
+
+    // Split overlong E0 + 80 across two calls must reject byte 2 and still accept valid A0 80 afterwards
+    const char e0_lead[] = "\xE0";
+    const char e0_bad[] = "\x80";
+    const char e0_ok[] = "\xA0\x80";
+    ok &= check(inlay_stream_append_body(s, 7u, {e0_lead, 1u, false}), "R02 E0 lead accepted");
+    ok &= check(!inlay_stream_append_body(s, 7u, {e0_bad, 1u, false}), "R02 split overlong E0+80 rejected");
+    ok &= check(inlay_stream_append_body(s, 7u, {e0_ok, 2u, false}), "R02 valid continuation after rejected split");
+    ok &= check(inlay_stream_append_body(s, 7u, ETCH_STR_LIT("!")), "R02 trailing ASCII after carry recovery");
+    check_body_state("Start:中😀\xE0\xA0\x80!", 11u, c0 + 10u,
+                     "R02 final reassembled body exact");
+
+    inlay_stream_destroy(s);
+    return ok;
+}
+
+bool test_stream_c10_replay_and_budget() {
+    bool ok = true;
+
+    // Part A: Incremental replay via inlay_stream_export_since_json
+    {
+        char null_buf[8] = {'x'};
+        ok &= check(inlay_stream_export_since_json(nullptr, 0u, null_buf, sizeof(null_buf)) == 0u &&
+                    null_buf[0] == '\0',
+                    "C10 export_since null guard");
+
+        InlayStream* s = inlay_stream_create();
+        if (!check(s != nullptr, "C10 replay stream create")) return false;
+
+        for (uint64_t id = 101u; id <= 103u; ++id) {
+            InlayStreamItem it = {};
+            it.id = id;
+            it.role = INLAY_STREAM_ROLE_ASSISTANT;
+            it.kind = INLAY_STREAM_ITEM_MARKDOWN;
+            it.status = INLAY_STREAM_STATUS_RUNNING;
+            it.title = ETCH_STR_LIT("T");
+            it.body = ETCH_STR_LIT("B");
+            ok &= check(inlay_stream_upsert(s, &it), "C10 insert replay item");
+        }
+
+        char buf[1024] = {};
+        const uint32_t need0 = inlay_stream_export_since_json(s, 0u, nullptr, 0u);
+        const uint32_t got0 = inlay_stream_export_since_json(s, 0u, buf, sizeof(buf));
+        ok &= check(need0 == got0 && got0 < sizeof(buf) &&
+                    std::strstr(buf, "\"cursor\":3,\"since\":0,\"items\":[") != nullptr &&
+                    std::strstr(buf, "\"id\":101") != nullptr &&
+                    std::strstr(buf, "\"id\":102") != nullptr &&
+                    std::strstr(buf, "\"id\":103") != nullptr,
+                    "C10 since=0 exports all 3 items");
+
+        const uint32_t got2 = inlay_stream_export_since_json(s, 2u, buf, sizeof(buf));
+        ok &= check(got2 > 0u &&
+                    std::strstr(buf, "\"cursor\":3,\"since\":2,\"items\":[") != nullptr &&
+                    std::strstr(buf, "\"id\":101") == nullptr &&
+                    std::strstr(buf, "\"id\":102") == nullptr &&
+                    std::strstr(buf, "\"id\":103") != nullptr,
+                    "C10 since=2 exports only item 103");
+
+        const uint32_t got3 = inlay_stream_export_since_json(s, 3u, buf, sizeof(buf));
+        ok &= check(got3 > 0u && std::strcmp(buf, "{\"cursor\":3,\"since\":3,\"items\":[]}") == 0,
+                    "C10 since=3 exports empty delta");
+
+        // Append to item 101 -> cursor 4; upsert item 102 -> cursor 5
+        ok &= check(inlay_stream_append_body(s, 101u, ETCH_STR_LIT("+")), "C10 append item 101");
+        const uint32_t got3_after_append = inlay_stream_export_since_json(s, 3u, buf, sizeof(buf));
+        ok &= check(got3_after_append > 0u &&
+                    std::strstr(buf, "\"cursor\":4,\"since\":3,\"items\":[") != nullptr &&
+                    std::strstr(buf, "\"id\":101") != nullptr &&
+                    std::strstr(buf, "\"id\":102") == nullptr &&
+                    std::strstr(buf, "\"id\":103") == nullptr,
+                    "C10 since=3 after append exports only item 101");
+
+        InlayStreamItem upd102 = {};
+        ok &= check(inlay_stream_get_by_id(s, 102u, &upd102), "C10 fetch 102");
+        upd102.status = INLAY_STREAM_STATUS_DONE;
+        ok &= check(inlay_stream_upsert(s, &upd102), "C10 update item 102");
+
+        const uint32_t got3_after_upd = inlay_stream_export_since_json(s, 3u, buf, sizeof(buf));
+        ok &= check(got3_after_upd > 0u &&
+                    std::strstr(buf, "\"cursor\":5,\"since\":3,\"items\":[") != nullptr &&
+                    std::strstr(buf, "\"id\":101") != nullptr &&
+                    std::strstr(buf, "\"id\":102") != nullptr &&
+                    std::strstr(buf, "\"id\":103") == nullptr,
+                    "C10 since=3 exports items 101 and 102");
+
+        const uint32_t got4 = inlay_stream_export_since_json(s, 4u, buf, sizeof(buf));
+        ok &= check(got4 > 0u &&
+                    std::strstr(buf, "\"cursor\":5,\"since\":4,\"items\":[") != nullptr &&
+                    std::strstr(buf, "\"id\":101") == nullptr &&
+                    std::strstr(buf, "\"id\":102") != nullptr &&
+                    std::strstr(buf, "\"id\":103") == nullptr,
+                    "C10 since=4 exports only item 102");
+
+        // Roundtrip full JSON preserves lastCursor for incremental export
+        const uint32_t full_len = inlay_stream_export_json(s, buf, sizeof(buf));
+        InlayStream* s2 = inlay_stream_create();
+        ok &= check(s2 != nullptr && inlay_stream_import_json(s2, {buf, full_len, false}),
+                    "C10 full roundtrip import");
+        if (s2) {
+            char delta_buf[1024] = {};
+            inlay_stream_export_since_json(s2, 4u, delta_buf, sizeof(delta_buf));
+            ok &= check(std::strstr(delta_buf, "\"id\":102") != nullptr &&
+                        std::strstr(delta_buf, "\"id\":101") == nullptr &&
+                        std::strstr(delta_buf, "\"id\":103") == nullptr,
+                        "C10 imported stream preserves per-item last_cursor");
+            inlay_stream_destroy(s2);
+        }
+
+        inlay_stream_destroy(s);
+    }
+
+    // Part B: Bounded memory budget & oldest-item eviction via inlay_stream_set_max_bytes
+    {
+        inlay_stream_set_max_bytes(nullptr, 60u); // Null guard
+
+        InlayStream* s = inlay_stream_create();
+        if (!check(s != nullptr, "C10 budget stream create")) return false;
+        inlay_stream_set_max_bytes(s, 60u);
+
+        const char b25[26] = "1234567890123456789012345";
+        const char b20[21] = "12345678901234567890";
+        const char b61[62] = "1234567890123456789012345678901234567890123456789012345678901";
+
+        InlayStreamItem it = {};
+        it.role = INLAY_STREAM_ROLE_ASSISTANT;
+        it.kind = INLAY_STREAM_ITEM_MARKDOWN;
+        it.status = INLAY_STREAM_STATUS_RUNNING;
+        it.body = {b25, 25u, false};
+
+        it.id = 1u;
+        ok &= check(inlay_stream_upsert(s, &it) && inlay_stream_count(s) == 1u, "C10 insert item 1 (25B)");
+        it.id = 2u;
+        ok &= check(inlay_stream_upsert(s, &it) && inlay_stream_count(s) == 2u, "C10 insert item 2 (50B)");
+        it.id = 3u;
+        ok &= check(inlay_stream_upsert(s, &it) && inlay_stream_count(s) == 2u,
+                    "C10 insert item 3 (75B > 60B) evicts oldest");
+
+        InlayStreamItem at0 = {}, at1 = {};
+        ok &= check(!inlay_stream_get_by_id(s, 1u, &at0) &&
+                    inlay_stream_at(s, 0u, &at0) && inlay_stream_at(s, 1u, &at1) &&
+                    at0.id == 2u && at1.id == 3u,
+                    "C10 item 1 evicted, items 2 and 3 retained in order");
+
+        // Append 20B to item 2 (25->45B, total 70B > 60B): evicts item 3, keeps item 2 being updated
+        ok &= check(inlay_stream_append_body(s, 2u, {b20, 20u, false}),
+                    "C10 append_body evicts other item to fit budget");
+        ok &= check(inlay_stream_count(s) == 1u &&
+                    inlay_stream_get_by_id(s, 2u, &at0) && at0.body.length == 45u &&
+                    !inlay_stream_get_by_id(s, 3u, &at1),
+                    "C10 item 2 grew to 45B and item 3 evicted");
+
+        // Appending 20B more would make item 2 alone 65B > 60B -> must reject without corrupting item 2
+        const uint64_t saved_cursor = inlay_stream_cursor(s);
+        const uint64_t saved_rev = at0.revision;
+        ok &= check(!inlay_stream_append_body(s, 2u, {b20, 20u, false}),
+                    "C10 reject append exceeding single-item budget");
+        ok &= check(inlay_stream_count(s) == 1u &&
+                    inlay_stream_cursor(s) == saved_cursor &&
+                    inlay_stream_get_by_id(s, 2u, &at0) &&
+                    at0.body.length == 45u && at0.revision == saved_rev,
+                    "C10 rejected append left item 2 untouched");
+
+        // Single oversized upsert (new item or existing item) must reject without evicting or mutating
+        InlayStreamItem huge = it;
+        huge.id = 4u;
+        huge.body = {b61, 61u, false};
+        ok &= check(!inlay_stream_upsert(s, &huge), "C10 reject oversized new item");
+        ok &= check(inlay_stream_count(s) == 1u && inlay_stream_cursor(s) == saved_cursor,
+                    "C10 oversized new item did not evict existing item");
+
+        huge.id = 2u;
+        ok &= check(!inlay_stream_upsert(s, &huge), "C10 reject oversized update on existing item");
+        ok &= check(inlay_stream_get_by_id(s, 2u, &at0) &&
+                    at0.body.length == 45u && at0.revision == saved_rev &&
+                    inlay_stream_cursor(s) == saved_cursor,
+                    "C10 oversized update preserved existing item");
+
+        // Shrinking max_bytes immediately evicts oldest items; setting 0 restores unbounded mode
+        it.body = {b20, 20u, false};
+        it.id = 2u; ok &= check(inlay_stream_upsert(s, &it), "C10 shrink item 2 to 20B");
+        it.id = 5u; ok &= check(inlay_stream_upsert(s, &it), "C10 insert item 5 (20B)");
+        it.id = 6u; ok &= check(inlay_stream_upsert(s, &it), "C10 insert item 6 (20B)");
+        ok &= check(inlay_stream_count(s) == 3u, "C10 3 items fit exactly in 60B");
+
+        inlay_stream_set_max_bytes(s, 40u);
+        ok &= check(inlay_stream_count(s) == 2u &&
+                    inlay_stream_at(s, 0u, &at0) && inlay_stream_at(s, 1u, &at1) &&
+                    at0.id == 5u && at1.id == 6u,
+                    "C10 lowering max_bytes evicts oldest item");
+
+        inlay_stream_set_max_bytes(s, 0u);
+        huge.id = 7u;
+        ok &= check(inlay_stream_upsert(s, &huge) && inlay_stream_count(s) == 3u,
+                    "C10 max_bytes=0 restores unbounded budget");
+
+        inlay_stream_destroy(s);
+    }
+
+    return ok;
+}
+
 // ============================================================================
 // 2. GenUI Schema Validator & Safe Surface Renderer Tests (#13)
 // ============================================================================
@@ -575,6 +1007,9 @@ int main() {
 
     bool ok = true;
     ok &= test_stream();
+    ok &= test_stream_r01_atomic_upsert();
+    ok &= test_stream_r02_utf8_carry();
+    ok &= test_stream_c10_replay_and_budget();
     ok &= test_genui(ctx);
     ok &= test_tokens();
     ok &= test_inbox_drain_to_surface(ctx);

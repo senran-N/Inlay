@@ -2,6 +2,35 @@
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-11-24
+
+- Require Etch 0.29 (`SameMinorVersion` compatibility), deploy runtime DLLs for
+  optional `inlay_webview2_tests`, and install `LICENSE` +
+  `THIRD_PARTY_NOTICES.md`.
+- Fix atomic `inlay_stream_upsert` rollback on field/allocation failure, enforce
+  strict UTF-8 validation with 4-byte chunked carry in `InlayStream`, add
+  incremental cursor replay (`inlay_stream_export_since_json`) and bounded
+  memory eviction (`inlay_stream_set_max_bytes`).
+- Make HMR candidate reload truly transactional: validate compilation,
+  initialization, and initial `render()` in a staging runtime before retiring
+  live views, timers, or async actions.
+- Move image/SVG decoding off the UI thread in `InlayImageLoader` using Etch's
+  thread-safe CPU decoders; upgrade `InlayModel` with range-aware
+  insert/remove/move notifications, scroll anchor preservation, `row_id`-keyed
+  items, and sleeping-window wake-up; expand `memo()` native subtree caching
+  budget; drive `@container` breakpoints from actual completed layout widths;
+  add form error auto-focus + assertive A11y announcements and boundary-local
+  event error isolation.
+- Wire real WebView2 `NavigationStarting`, `NewWindowRequested`,
+  `WebMessageReceived`, and `PermissionRequested` handlers onto
+  `InlayPortalPolicy` and make short-buffer `inlay_portal_poll_message`
+  non-destructive (`inlay_portal_peek_message_size`).
+- Add O(delta) streaming open-fence updates in `InlayDoc`, document heading
+  outlines (`inlay_doc_outline_*`), multi-match search
+  (`inlay_doc_view_find_all`), rich HTML selection copy
+  (`inlay_doc_view_copy_html`), MathML export (`inlay_math_export_mathml`), and
+  generic `ETCH_A11Y_ACT_SCROLL_UP`/`DOWN` document actions.
+
 - Add structured AI conversation & tool-result streams (`InlayStream`: stable
   64-bit IDs, in-place upsert, streaming delta append, resumable cursor, and
   JSON session import/export) plus budgeted `inlay_inbox_drain_to_surface`.

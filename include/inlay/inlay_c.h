@@ -5,7 +5,7 @@
 #include <stdint.h>
 #include <etch/etch_c.h>
 #define INLAY_VERSION_MAJOR 0
-#define INLAY_VERSION_MINOR 13
+#define INLAY_VERSION_MINOR 14
 #define INLAY_VERSION_PATCH 0
 #define INLAY_STRING_DETAIL(x) #x
 #define INLAY_STRING(x) INLAY_STRING_DETAIL(x)
@@ -199,6 +199,7 @@ INLAY_API InlayMathDesc inlay_math_desc_default(void);
 INLAY_API InlayMathResult inlay_draw_math(EtchStr tex,const InlayMathDesc* desc);
 INLAY_API InlayMathResult inlay_measure_math(EtchStr tex,float font_size_px);
 INLAY_API uint32_t inlay_math_export_svg(EtchStr tex,const InlayMathDesc* desc,char* out_buf,uint32_t cap);
+INLAY_API uint32_t inlay_math_export_mathml(EtchStr tex,char* out_buf,uint32_t cap);
 typedef enum InlayDiagramDiagnosticKind {
  INLAY_DIAGRAM_UNSUPPORTED_DIRECTIVE, INLAY_DIAGRAM_UNSUPPORTED_KIND,
  INLAY_DIAGRAM_INVALID_DIRECTION, INLAY_DIAGRAM_INVALID_SYNTAX
@@ -294,6 +295,17 @@ INLAY_API uint32_t inlay_doc_view_copy_plain_text(const InlayDoc* doc,uint32_t v
 INLAY_API uint32_t inlay_doc_view_copy_markdown(const InlayDoc* doc,uint32_t view_id,char* out_buf,uint32_t cap);
 /* Exports semantic HTML5 for the full document into out_buf (NUL-terminated if cap > 0). Returns required length excluding NUL. */
 INLAY_API uint32_t inlay_doc_export_html(const InlayDoc* doc,char* out_buf,uint32_t cap);
+/* Copies selected range as semantic HTML5 into out_buf (NUL-terminated if cap > 0). Returns required length excluding NUL. */
+INLAY_API uint32_t inlay_doc_view_copy_html(const InlayDoc* doc,uint32_t view_id,char* out_buf,uint32_t cap);
+/* Document heading outline enumeration and multi-match search index. */
+typedef struct InlayDocOutlineEntry {
+ uint32_t block_index,source_offset;
+ uint8_t level;
+ EtchStr text;
+} InlayDocOutlineEntry;
+INLAY_API uint32_t inlay_doc_outline_count(const InlayDoc* doc);
+INLAY_API bool inlay_doc_outline_at(const InlayDoc* doc,uint32_t index,InlayDocOutlineEntry* out);
+INLAY_API uint32_t inlay_doc_view_find_all(const InlayDoc* doc,uint32_t view_id,EtchStr query,InlayDocSelection* out_matches,uint32_t max_matches);
 /* Reports Mermaid cross-frame layout cache statistics for a document. */
 INLAY_API void inlay_doc_diagram_cache_stats(const InlayDoc* doc,uint32_t* out_entries,uint64_t* out_hits,uint64_t* out_misses);
 
@@ -375,10 +387,28 @@ typedef struct InlayModelRow {
  EtchStr badge;
 } InlayModelRow;
 typedef bool (*InlayModelReadFn)(uint32_t index,InlayModelRow* out_row,void* user_data);
+typedef enum InlayModelChangeKind {
+ INLAY_MODEL_CHANGE_NONE = 0,
+ INLAY_MODEL_CHANGE_UPDATE = 1,
+ INLAY_MODEL_CHANGE_INSERT = 2,
+ INLAY_MODEL_CHANGE_REMOVE = 3,
+ INLAY_MODEL_CHANGE_MOVE = 4,
+ INLAY_MODEL_CHANGE_RESET = 5
+} InlayModelChangeKind;
+typedef struct InlayModelChange {
+ InlayModelChangeKind kind;
+ uint32_t first_row,count,dst_row;
+ uint64_t revision;
+} InlayModelChange;
 INLAY_API InlayModel* inlay_model_create(InlayModelReadFn read_fn,void* user_data);
 INLAY_API void inlay_model_destroy(InlayModel*);
+INLAY_API void inlay_model_bind_context(InlayModel*,EtchContext*);
 INLAY_API void inlay_model_set_count(InlayModel*,uint32_t count);
 INLAY_API void inlay_model_notify_change(InlayModel*,uint32_t first_row,uint32_t count);
+INLAY_API void inlay_model_notify_insert(InlayModel*,uint32_t index,uint32_t count);
+INLAY_API void inlay_model_notify_remove(InlayModel*,uint32_t index,uint32_t count);
+INLAY_API void inlay_model_notify_move(InlayModel*,uint32_t from_index,uint32_t to_index,uint32_t count);
+INLAY_API bool inlay_model_last_change(const InlayModel*,InlayModelChange* out);
 INLAY_API uint32_t inlay_model_count(const InlayModel*);
 INLAY_API uint64_t inlay_model_revision(const InlayModel*);
 INLAY_API InlaySurfaceDesc inlay_surface_desc_default(void);
@@ -504,7 +534,9 @@ INLAY_API bool inlay_stream_get_by_id(const InlayStream*,uint64_t id,InlayStream
 INLAY_API bool inlay_stream_at(const InlayStream*,uint32_t index,InlayStreamItem* out_item);
 INLAY_API uint64_t inlay_stream_cursor(const InlayStream*);
 INLAY_API uint32_t inlay_stream_export_json(const InlayStream*,char* out_buf,uint32_t cap);
+INLAY_API uint32_t inlay_stream_export_since_json(const InlayStream*,uint64_t since_cursor,char* out_buf,uint32_t cap);
 INLAY_API bool inlay_stream_import_json(InlayStream*,EtchStr json);
+INLAY_API void inlay_stream_set_max_bytes(InlayStream*,size_t max_bytes);
 
 /* Verifiable Generative UI declarative JSON schema validator & safe surface renderer. */
 typedef struct InlayGenUiValidation {
@@ -637,6 +669,11 @@ typedef struct InlayPortalPolicy {
 INLAY_API InlayPortalPolicy inlay_portal_policy_default(void);
 INLAY_API void inlay_portal_set_policy(InlayPortal*,const InlayPortalPolicy* policy);
 INLAY_API bool inlay_portal_post_message(InlayPortal*,EtchStr message_json);
+/* Returns front queued message byte length without consuming it (0 if empty). */
+INLAY_API uint32_t inlay_portal_peek_message_size(const InlayPortal*);
+/* Pops front message when cap > message_len; when out_buf==NULL or cap <= message_len,
+   writes truncated NUL-terminated preview (if cap > 0), returns full required length, and
+   keeps the message queued so callers never lose data on short buffers. */
 INLAY_API uint32_t inlay_portal_poll_message(InlayPortal*,char* out_buf,uint32_t cap);
 INLAY_API bool inlay_portal_go_back(InlayPortal*);
 INLAY_API bool inlay_portal_go_forward(InlayPortal*);

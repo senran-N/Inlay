@@ -2208,12 +2208,204 @@ int main(int argc,char** argv) {
    i3_loader &= inlay_image_loader_resolve(ETCH_STR_LIT("dot.bmp"),&res_bmp,loader) &&
                 res_bmp.texture!=nullptr && res_bmp.width_px==1.f && res_bmp.height_px==1.f;
    i3_loader &= !inlay_image_loader_resolve(ETCH_STR_LIT("cancel.bmp"),&res_cancel,loader);
+
+   // Off-thread invalid payload reports ERROR cleanly, and destroying with in-flight jobs leaks nothing.
+   static const uint8_t kBadBytes[8]={0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07};
+   i3_loader &= inlay_image_loader_request_memory(loader,ETCH_STR_LIT("bad.bin"),kBadBytes,sizeof(kBadBytes),true);
+   for(int iter=0;iter<200;++iter) {
+    (void)inlay_image_loader_poll(loader,1u);
+    if(inlay_image_loader_status(loader,ETCH_STR_LIT("bad.bin"))==INLAY_IMAGE_STATUS_ERROR) break;
+    SDL_Delay(5);
+   }
+   i3_loader &= inlay_image_loader_status(loader,ETCH_STR_LIT("bad.bin"))==INLAY_IMAGE_STATUS_ERROR;
+   i3_loader &= inlay_image_loader_request_memory(loader,ETCH_STR_LIT("unpolled.svg"),kSvgBytes,sizeof(kSvgBytes)-1u,true);
+   SDL_Delay(15);
    inlay_image_loader_destroy(loader);
   } else i3_loader=false;
 
-  i3 &= i3_cache && i3_a11y && i3_html && i3_dsvg && i3_msvg && i3_loader;
-  if(!i3)std::fprintf(stderr,"Track I3 failed: cache=%d a11y=%d html=%d dsvg=%d msvg=%d loader=%d\n",
-                      i3_cache,i3_a11y,i3_html,i3_dsvg,i3_msvg,i3_loader);
+  // 5. Wave-2 Track I3 checks: C01 O(delta) open code fence streaming, C02 outline & find_all,
+  //    C03 scroll A11y actions, C04 copy_html, C05 MathML export.
+  bool i3_fence=true,i3_outline_find_html=true,i3_mathml=true,i3_scroll_a11y=true;
+
+  // C01: 64 KiB fenced code appended in 256-byte chunks with per-chunk parse checks -> exact equivalence with set_utf8!
+  {
+   auto* ref_f=inlay_doc_create(ctx,nullptr);
+   auto* str_f=inlay_doc_create(ctx,nullptr);
+   const size_t fence_cap=72u*1024u;
+   char* fence_buf=static_cast<char*>(SDL_malloc(fence_cap));
+   if(ref_f && str_f && fence_buf) {
+    size_t flen=0u;
+    const auto push_lit=[&](const char* s) noexcept {
+     const size_t n=std::strlen(s);
+     if(flen+n<=fence_cap){std::memcpy(fence_buf+flen,s,n);flen+=n;}
+    };
+    push_lit("# Fence Stream\n\nIntro paragraph.\n\n```cpp\n");
+    const char* code_line="const int value = compute_delta(alpha, beta) + 42; // `inline` tick ok\n";
+    while(flen < 65536u) push_lit(code_line);
+    push_lit("    ```not-closing-4-spaces\n");
+    push_lit("```\n\nTrailing paragraph.\n");
+
+    i3_fence &= inlay_doc_set_utf8(ref_f,{fence_buf,static_cast<uint32_t>(flen),false});
+    bool saw_open_fence=false;
+    for(size_t pos=0u;pos<flen;) {
+     const size_t n=(flen-pos<256u) ? (flen-pos) : 256u;
+     i3_fence &= inlay_doc_append_utf8(str_f,{fence_buf+pos,static_cast<uint32_t>(n),false});
+     const uint32_t bc=inlay_doc_block_count(str_f);
+     if(pos>1024u && pos+512u<flen) {
+      i3_fence &= bc==3u && inlay_doc_stream_status(str_f)==INLAY_DOC_STREAM_OPEN_FENCE;
+      saw_open_fence=true;
+     }
+     pos+=n;
+    }
+    i3_fence &= saw_open_fence && inlay_doc_stream_status(str_f)==INLAY_DOC_STREAM_READY;
+    const uint32_t rcnt=inlay_doc_block_count(ref_f);
+    i3_fence &= rcnt==4u && inlay_doc_block_count(str_f)==rcnt;
+    for(uint32_t bi=0u;bi<rcnt && bi<inlay_doc_block_count(str_f);++bi) {
+     const auto a=*inlay_doc_block(ref_f,bi),b=*inlay_doc_block(str_f,bi);
+     i3_fence &= a.kind==b.kind && a.offset==b.offset && a.length==b.length &&
+                 a.content_offset==b.content_offset && a.content_length==b.content_length &&
+                 a.level==b.level && a.language_offset==b.language_offset &&
+                 a.language_length==b.language_length && a.complete==b.complete &&
+                 a.flags==b.flags && a.quote_depth==b.quote_depth && a.list_depth==b.list_depth;
+    }
+    // Split closing fence across chunk boundaries ("  " -> "``" -> "`\n") + tilde fence equivalence.
+    const EtchStr split_fence=ETCH_STR_LIT("~~~py\nx = 1\n  ~~~\n\nDone.\n");
+    i3_fence &= inlay_doc_set_utf8(ref_f,split_fence);
+    inlay_doc_clear(str_f);
+    const uint32_t cuts[]={6u,6u,2u,2u,2u,split_fence.length-18u};
+    uint32_t sp=0u;
+    for(uint32_t cn:cuts) {
+     i3_fence &= inlay_doc_append_utf8(str_f,{split_fence.chars+sp,cn,false});
+     (void)inlay_doc_block_count(str_f);
+     sp+=cn;
+    }
+    i3_fence &= inlay_doc_block_count(str_f)==inlay_doc_block_count(ref_f) && inlay_doc_block_count(ref_f)==2u;
+    for(uint32_t bi=0u;bi<inlay_doc_block_count(ref_f) && bi<inlay_doc_block_count(str_f);++bi) {
+     const auto a=*inlay_doc_block(ref_f,bi),b=*inlay_doc_block(str_f,bi);
+     i3_fence &= a.kind==b.kind && a.offset==b.offset && a.length==b.length &&
+                 a.content_offset==b.content_offset && a.content_length==b.content_length &&
+                 a.complete==b.complete;
+    }
+   } else i3_fence=false;
+   SDL_free(fence_buf);
+   inlay_doc_destroy(ref_f);
+   inlay_doc_destroy(str_f);
+  }
+
+  // C02 (outline + find_all), C03 (SCROLL_UP/SCROLL_DOWN on ETCH_A11Y_DOCUMENT), C04 (copy_html)
+  if(auto* d2=inlay_doc_create(ctx,nullptr)) {
+   const EtchStr md2=ETCH_STR_LIT(
+    "# Intro Alpha\n\n"
+    "Paragraph with **bold ALPHA**, *italic*, `code<1>`, and [Etch](https://etch.dev).\n\n"
+    "## Architecture\n\n"
+    "```cpp\nint alpha = a < b;\n```\n\n"
+    "### Details\n\n"
+    "Final Alpha note.\n");
+   i3_outline_find_html &= inlay_doc_set_utf8(d2,md2);
+
+   // Outline enumeration
+   i3_outline_find_html &= inlay_doc_outline_count(d2)==3u;
+   InlayDocOutlineEntry e0={},e1={},e2={},ebad={};
+   i3_outline_find_html &= inlay_doc_outline_at(d2,0u,&e0) && e0.level==1u && e0.block_index==0u && e0.source_offset==0u &&
+                           str_equal(e0.text,ETCH_STR_LIT("Intro Alpha"));
+   i3_outline_find_html &= inlay_doc_outline_at(d2,1u,&e1) && e1.level==2u && e1.block_index==2u && e1.source_offset>0u &&
+                           str_equal(e1.text,ETCH_STR_LIT("Architecture"));
+   i3_outline_find_html &= inlay_doc_outline_at(d2,2u,&e2) && e2.level==3u && e2.block_index==4u && e2.source_offset>e1.source_offset &&
+                           str_equal(e2.text,ETCH_STR_LIT("Details"));
+   i3_outline_find_html &= !inlay_doc_outline_at(d2,3u,&ebad);
+
+   // Render fixed-height view for C03 A11y scroll actions + C02 find_all + C04 copy_html
+   auto v2=inlay_doc_view_desc_default();
+   v2.id=etch_id("i3-w2-scroll-view");v2.width_px=480.f;v2.height_px=240.f;
+   etch_begin_frame(ctx,&fr);inlay_doc_view(d2,&v2);etch_end_frame(ctx);
+
+   // C03: Verify ETCH_A11Y_ACT_SCROLL_UP & ETCH_A11Y_ACT_SCROLL_DOWN on ETCH_A11Y_DOCUMENT
+   bool saw_scroll_doc=false;
+   const uint32_t expected_scroll_bits = etch_a11y_action_bit(ETCH_A11Y_ACT_SCROLL_UP) |
+                                         etch_a11y_action_bit(ETCH_A11Y_ACT_SCROLL_DOWN);
+   for(uint32_t ai=0u;ai<etch_a11y_node_count(ctx,nullptr);++ai) {
+    EtchA11yNode an={};
+    if(etch_get_a11y_node(ai,&an,ctx,nullptr) && an.role==ETCH_A11Y_DOCUMENT && an.id==v2.id) {
+     saw_scroll_doc = (an.actions_mask & expected_scroll_bits) == expected_scroll_bits;
+     break;
+    }
+   }
+   i3_scroll_a11y &= saw_scroll_doc;
+
+   // C02: find_all (case-insensitive across heading, paragraph, code, final paragraph -> 4 matches)
+   const uint32_t total_matches=inlay_doc_view_find_all(d2,v2.id,ETCH_STR_LIT("alpha"),nullptr,0u);
+   InlayDocSelection two_matches[2]={};
+   const uint32_t total_cap2=inlay_doc_view_find_all(d2,v2.id,ETCH_STR_LIT("ALPHA"),two_matches,2u);
+   InlayDocSelection all_matches[8]={};
+   const uint32_t total_all=inlay_doc_view_find_all(d2,v2.id,ETCH_STR_LIT("Alpha"),all_matches,8u);
+   i3_outline_find_html &= total_matches==4u && total_cap2==4u && total_all==4u;
+   i3_outline_find_html &= two_matches[0].active && two_matches[1].active && two_matches[0].focus<=two_matches[1].anchor;
+   for(uint32_t mi=0u;mi<4u;++mi) {
+    i3_outline_find_html &= all_matches[mi].active && (all_matches[mi].focus - all_matches[mi].anchor)==5u;
+    if(mi>0u) i3_outline_find_html &= all_matches[mi].anchor >= all_matches[mi-1u].focus;
+   }
+   i3_outline_find_html &= inlay_doc_view_find_all(d2,v2.id,ETCH_STR_LIT("\xe7"),all_matches,8u)==0u;
+
+   // C04: copy_html on full selection + truncation check
+   inlay_doc_view_select_all(d2,v2.id);
+   const uint32_t ch_need=inlay_doc_view_copy_html(d2,v2.id,nullptr,0u);
+   i3_outline_find_html &= ch_need>80u;
+   char trunc_buf[8]={};
+   i3_outline_find_html &= inlay_doc_view_copy_html(d2,v2.id,trunc_buf,static_cast<uint32_t>(sizeof(trunc_buf)))==ch_need && trunc_buf[7]=='\0';
+   char* ch_buf=static_cast<char*>(SDL_malloc(size_t(ch_need)+1u));
+   if(ch_buf) {
+    const uint32_t ch_got=inlay_doc_view_copy_html(d2,v2.id,ch_buf,ch_need+1u);
+    i3_outline_find_html &= ch_got==ch_need && ch_buf[ch_need]=='\0';
+    i3_outline_find_html &= std::strstr(ch_buf,"<h1>Intro Alpha</h1>")!=nullptr;
+    i3_outline_find_html &= std::strstr(ch_buf,"<strong>bold ALPHA</strong>")!=nullptr;
+    i3_outline_find_html &= std::strstr(ch_buf,"<em>italic</em>")!=nullptr;
+    i3_outline_find_html &= std::strstr(ch_buf,"<code>code&lt;1&gt;</code>")!=nullptr;
+    i3_outline_find_html &= std::strstr(ch_buf,"<a href=\"https://etch.dev\">Etch</a>")!=nullptr;
+    i3_outline_find_html &= std::strstr(ch_buf,"<h2>Architecture</h2>")!=nullptr;
+    i3_outline_find_html &= std::strstr(ch_buf,"<pre><code class=\"language-cpp\">int alpha = a &lt; b;</code></pre>")!=nullptr;
+    SDL_free(ch_buf);
+   } else i3_outline_find_html=false;
+
+   inlay_doc_destroy(d2);
+  } else { i3_outline_find_html=false; i3_scroll_a11y=false; }
+
+  // C05: Standard MathML export (outside and inside active frame)
+  {
+   const auto check_mathml=[](EtchStr tex,const char* must1,const char* must2,const char* must3) -> bool {
+    const uint32_t need=inlay_math_export_mathml(tex,nullptr,0u);
+    if(need<32u) return false;
+    char short_b[8]={};
+    if(inlay_math_export_mathml(tex,short_b,static_cast<uint32_t>(sizeof(short_b)))!=need || short_b[7]!='\0') return false;
+    char* buf=static_cast<char*>(SDL_malloc(size_t(need)+1u));
+    if(!buf) return false;
+    const uint32_t got=inlay_math_export_mathml(tex,buf,need+1u);
+    bool ok_ml = got==need && buf[need]=='\0' &&
+                 std::strstr(buf,"<math xmlns=\"http://www.w3.org/1998/Math/MathML\"")!=nullptr &&
+                 std::strstr(buf,"</math>")!=nullptr;
+    if(must1) ok_ml &= std::strstr(buf,must1)!=nullptr;
+    if(must2) ok_ml &= std::strstr(buf,must2)!=nullptr;
+    if(must3) ok_ml &= std::strstr(buf,must3)!=nullptr;
+    SDL_free(buf);
+    return ok_ml;
+   };
+   // Outside active frame:
+   i3_mathml &= check_mathml(ETCH_STR_LIT("\\frac{a+b}{\\sqrt{x^2+1}}"),"<mfrac>","<msqrt>","<msup>");
+   i3_mathml &= check_mathml(ETCH_STR_LIT("\\sqrt[3]{y_i^2}"),"<mroot>","<msubsup>","<mn>3</mn>");
+   i3_mathml &= check_mathml(ETCH_STR_LIT("\\begin{bmatrix}a&b\\\\c&d\\end{bmatrix}"),"<mtable>","<mtr>","<mtd>");
+   i3_mathml &= check_mathml(ETCH_STR_LIT("a < b"),"<mo>&lt;</mo>","<mi>a</mi>","<mi>b</mi>");
+   char bad_ml[8]={'X','X','X','X','X','X','X','X'};
+   i3_mathml &= inlay_math_export_mathml(ETCH_STR_LIT("\\frac{x}"),bad_ml,static_cast<uint32_t>(sizeof(bad_ml)))==0u && bad_ml[0]=='\0';
+   // Inside active frame:
+   etch_begin_frame(ctx,&fr);
+   i3_mathml &= check_mathml(ETCH_STR_LIT("\\frac{a+b}{\\sqrt{x^2+1}}"),"<mfrac>","<msqrt>","<msup>");
+   etch_end_frame(ctx);
+  }
+
+  i3 &= i3_cache && i3_a11y && i3_html && i3_dsvg && i3_msvg && i3_loader &&
+        i3_fence && i3_outline_find_html && i3_mathml && i3_scroll_a11y;
+  if(!i3)std::fprintf(stderr,"Track I3 failed: cache=%d a11y=%d html=%d dsvg=%d msvg=%d loader=%d fence=%d outline_find_html=%d mathml=%d scroll_a11y=%d\n",
+                      i3_cache,i3_a11y,i3_html,i3_dsvg,i3_msvg,i3_loader,
+                      i3_fence,i3_outline_find_html,i3_mathml,i3_scroll_a11y);
   ok &= i3;
  }
 

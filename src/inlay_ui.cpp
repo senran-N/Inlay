@@ -5,17 +5,83 @@
 // Reusable Host Row/Tree Model (Available Both With & Without Script Engine)
 // ============================================================================
 
+constexpr uint32_t kModelChangeHistoryCap = 16u;
+
 struct InlayModel {
     InlayModelReadFn read_fn;
     void* user_data;
+    EtchContext* bound_ctx;
     uint32_t count;
     uint64_t revision;
+    InlayModelChange last_change;
+    int64_t pending_scroll_row_delta;
+    uint32_t last_structural_index;
+    InlayModelChange history[kModelChangeHistoryCap];
+    uint32_t history_head;
+    uint32_t history_count;
 };
+
+static void model_wake_context(const InlayModel* model) noexcept {
+    EtchContext* ctx = model->bound_ctx ? model->bound_ctx : etch_current_context();
+    if (ctx) {
+        etch_request_redraw(ctx);
+        etch_wake_up(ctx);
+    }
+}
+
+static void model_record_change(InlayModel* model, InlayModelChangeKind kind,
+                                uint32_t first_row, uint32_t count, uint32_t dst_row) noexcept {
+    ++model->revision;
+    const InlayModelChange ch = {kind, first_row, count, dst_row, model->revision};
+    model->last_change = ch;
+    model->history[model->history_head] = ch;
+    model->history_head = (model->history_head + 1u) % kModelChangeHistoryCap;
+    if (model->history_count < kModelChangeHistoryCap) ++model->history_count;
+    model_wake_context(model);
+}
 
 bool inlay_ui_model_read(const InlayModel* model, uint32_t index, InlayModelRow* out_row) noexcept {
     if (!model || !model->read_fn || !out_row || index >= model->count) return false;
     *out_row = {};
     return model->read_fn(index, out_row, model->user_data);
+}
+
+bool inlay_ui_model_replay_scroll_delta(const InlayModel* model, uint64_t since_rev,
+                                        uint32_t first_visible, int64_t* out_row_delta) noexcept {
+    if (!model || !out_row_delta || model->revision <= since_rev || model->history_count == 0u) {
+        if (out_row_delta) *out_row_delta = 0;
+        return false;
+    }
+    const uint32_t oldest =
+        (model->history_head + kModelChangeHistoryCap - model->history_count) % kModelChangeHistoryCap;
+    int64_t cur_vis = static_cast<int64_t>(first_visible);
+    int64_t delta = 0;
+    for (uint32_t i = 0u; i < model->history_count; ++i) {
+        const InlayModelChange& ch = model->history[(oldest + i) % kModelChangeHistoryCap];
+        if (ch.revision <= since_rev) continue;
+        if (ch.kind == INLAY_MODEL_CHANGE_RESET) {
+            *out_row_delta = 0;
+            return false;
+        }
+        if (ch.kind == INLAY_MODEL_CHANGE_INSERT) {
+            if (static_cast<int64_t>(ch.first_row) < cur_vis) {
+                const int64_t add = static_cast<int64_t>(ch.count);
+                delta += add;
+                cur_vis += add;
+            }
+        } else if (ch.kind == INLAY_MODEL_CHANGE_REMOVE) {
+            if (static_cast<int64_t>(ch.first_row) < cur_vis) {
+                const int64_t avail_above = cur_vis - static_cast<int64_t>(ch.first_row);
+                const int64_t sub = static_cast<int64_t>(ch.count) < avail_above
+                    ? static_cast<int64_t>(ch.count)
+                    : avail_above;
+                delta -= sub;
+                cur_vis -= sub;
+            }
+        }
+    }
+    *out_row_delta = delta;
+    return delta != 0;
 }
 
 extern "C" {
@@ -34,23 +100,62 @@ INLAY_API void inlay_model_destroy(InlayModel* model) {
     SDL_free(model);
 }
 
+INLAY_API void inlay_model_bind_context(InlayModel* model, EtchContext* ctx) {
+    if (!model) return;
+    model->bound_ctx = ctx;
+}
+
 INLAY_API void inlay_model_set_count(InlayModel* model, uint32_t count) {
     if (!model) return;
     if (model->count != count) {
         model->count = count;
-        ++model->revision;
-        if (EtchContext* ctx = etch_current_context()) {
-            etch_request_redraw(ctx);
-        }
+        model->pending_scroll_row_delta = 0;
+        model->last_structural_index = 0u;
+        model_record_change(model, INLAY_MODEL_CHANGE_RESET, 0u, count, 0u);
     }
 }
 
-INLAY_API void inlay_model_notify_change(InlayModel* model, uint32_t, uint32_t) {
+INLAY_API void inlay_model_notify_change(InlayModel* model, uint32_t first_row, uint32_t count) {
     if (!model) return;
-    ++model->revision;
-    if (EtchContext* ctx = etch_current_context()) {
-        etch_request_redraw(ctx);
+    model_record_change(model, INLAY_MODEL_CHANGE_UPDATE, first_row, count, 0u);
+}
+
+INLAY_API void inlay_model_notify_insert(InlayModel* model, uint32_t index, uint32_t count) {
+    if (!model || count == 0u) return;
+    const uint32_t clamped_idx = index <= model->count ? index : model->count;
+    const uint32_t max_add = UINT32_MAX - model->count;
+    const uint32_t added = count <= max_add ? count : max_add;
+    if (added == 0u) return;
+    model->count += added;
+    model->pending_scroll_row_delta += static_cast<int64_t>(added);
+    model->last_structural_index = clamped_idx;
+    model_record_change(model, INLAY_MODEL_CHANGE_INSERT, clamped_idx, added, 0u);
+}
+
+INLAY_API void inlay_model_notify_remove(InlayModel* model, uint32_t index, uint32_t count) {
+    if (!model || count == 0u) return;
+    const uint32_t avail = index < model->count ? (model->count - index) : 0u;
+    const uint32_t removed = count <= avail ? count : avail;
+    if (removed == 0u) return;
+    model->count -= removed;
+    model->pending_scroll_row_delta -= static_cast<int64_t>(removed);
+    model->last_structural_index = index;
+    model_record_change(model, INLAY_MODEL_CHANGE_REMOVE, index, removed, 0u);
+}
+
+INLAY_API void inlay_model_notify_move(InlayModel* model, uint32_t from_index, uint32_t to_index, uint32_t count) {
+    if (!model || count == 0u) return;
+    model_record_change(model, INLAY_MODEL_CHANGE_MOVE, from_index, count, to_index);
+}
+
+INLAY_API bool inlay_model_last_change(const InlayModel* model, InlayModelChange* out) {
+    if (!model || !out) return false;
+    if (model->last_change.kind == INLAY_MODEL_CHANGE_NONE) {
+        *out = {};
+        return false;
     }
+    *out = model->last_change;
+    return true;
 }
 
 INLAY_API uint32_t inlay_model_count(const InlayModel* model) {
@@ -84,9 +189,14 @@ constexpr double kHmrViewPollIntervalMs = 80.0;
 constexpr uint32_t kAsyncActionCapacity = 32u;
 constexpr size_t kAsyncPayloadLimit = 65536u;
 constexpr uint32_t kMemoCacheCap = 128u;
-constexpr uint32_t kMaxMemoSubtreeNodes = 256u;
-constexpr uint32_t kMaxMemoSubtreeText = 8192u;
+constexpr uint32_t kMaxMemoSubtreeNodes = 4096u;
+constexpr uint32_t kMaxMemoSubtreeText = 65536u;
+constexpr size_t kMaxMemoCacheTotalBytes = 2u * 1024u * 1024u;
 constexpr uint32_t kMaxFormStates = 16u;
+constexpr uint16_t kNf2Container = uint16_t(1u << 13);
+constexpr uint32_t kContainerWidthCacheCap = 64u;
+constexpr uint32_t kMaxBoundaryRoots = 64u;
+constexpr uint32_t kMaxEventBoundaryTags = 32u;
 
 enum BadgeVariant : uint8_t {
     BadgeDefault   = 0,
@@ -189,6 +299,30 @@ struct MemoNativeEntry {
     bool has_responsive;
     uint8_t pad_;
     uint8_t* blob;
+    size_t blob_bytes;
+};
+
+struct ContainerWidthEntry {
+    uint32_t node_id;
+    float width_px;
+    float last_rebuild_view_w;
+    uint8_t bucket;
+    uint8_t built_bucket;
+    uint8_t prev_bucket;
+    bool measured;
+    bool requested_measure;
+    uint64_t last_rebuild_frame;
+    uint64_t last_used_frame;
+};
+
+struct BoundaryRootEntry {
+    uint32_t node_idx;
+    TextSlice eb_key;
+};
+
+struct EventBoundaryTag {
+    const WidgetEvent* ev;
+    TextSlice eb_key;
 };
 
 struct FormStateEntry {
@@ -202,6 +336,7 @@ struct ActiveFormField {
     uint32_t element_id;
     EtchStr name;
     EtchStr value;
+    EtchStr error;
     bool valid;
 };
 
@@ -267,18 +402,36 @@ struct SurfaceStorage {
     // #50 Native subtree cache for memo()
     MemoNativeEntry memo_cache[kMemoCacheCap];
     uint32_t memo_cache_clock;
+    size_t memo_cache_bytes;
     JSAtom atom_memo_key;
     JSAtom atom_memo_rev;
+    JSAtom atom_eb_key;
+    // I07 Boundary-local event error isolation
+    TextSlice* handler_eb_keys; // Parallel to pub.handlers (capacity = pub.handler_capacity).
+    TextSlice cur_eb_key;
+    TextSlice draw_eb_key;
+    BoundaryRootEntry boundary_roots[kMaxBoundaryRoots];
+    uint32_t boundary_root_count;
+    EventBoundaryTag event_eb_tags[kMaxEventBoundaryTags];
+    uint32_t event_eb_tag_count;
     // #54 Form validation state
     FormStateEntry form_states[kMaxFormStates];
     uint32_t form_state_count;
     ActiveFormCtx* active_form;
-    // #52 Responsive breakpoint tracking
+    // #52 / I03 Responsive & layout-width @container breakpoint tracking
     uint32_t responsive_cls_hits;
     bool uses_responsive_cls;
     bool has_view_width;
+    ContainerWidthEntry container_widths[kContainerWidthCacheCap];
+    uint32_t container_width_count;
+    uint32_t draw_path_id;
+    bool needs_container_rebuild;
     // #59 Subtree-scoped event consumption
     uint8_t child_consumed_mask;
+    // R03 Transactional HMR bootstrap bytecode cache & staging host redirect
+    uint8_t* bootstrap_bc;
+    size_t bootstrap_bc_len;
+    InlaySurface* host_surface;
 };
 static_assert(std::is_standard_layout_v<SurfaceStorage>);
 static_assert(offsetof(SurfaceStorage, pub) == 0);
@@ -2720,6 +2873,7 @@ void clear_memo_cache(InlaySurface* s) noexcept {
         e->memo_cache[i] = {};
     }
     e->memo_cache_clock = 0u;
+    e->memo_cache_bytes = 0u;
 }
 
 struct MemoBlobOffsets {
@@ -2919,6 +3073,7 @@ void store_memo_native(InlaySurface* s, uint32_t memo_key, uint32_t memo_rev,
     }
 
     const MemoBlobOffsets o = compute_memo_blob_offsets(node_count, cold_count, extra_count, text_len);
+    if (o.total > kMaxMemoCacheTotalBytes) return;
     auto* blob = static_cast<uint8_t*>(SDL_malloc(o.total));
     if (!blob) return;
 
@@ -2972,23 +3127,46 @@ void store_memo_native(InlaySurface* s, uint32_t memo_key, uint32_t memo_rev,
         dst_xidx[i] = (xi != INLAY_UI_NONE) ? (xi - extra_start) : INLAY_UI_NONE;
     }
 
-    // Reuse slot with matching memo_key, or empty slot, or LRU victim.
+    // Reuse slot with matching memo_key, or empty slot, enforcing 2 MiB total byte budget via LRU eviction.
     MemoNativeEntry* slot = nullptr;
-    uint32_t victim = 0u;
     for (uint32_t i = 0u; i < kMemoCacheCap; ++i) {
         if (e->memo_cache[i].blob && e->memo_cache[i].memo_key == memo_key) {
             slot = &e->memo_cache[i];
+            e->memo_cache_bytes -= slot->blob_bytes;
+            SDL_free(slot->blob);
+            *slot = {};
             break;
         }
         if (!e->memo_cache[i].blob && !slot) {
             slot = &e->memo_cache[i];
         }
-        if (e->memo_cache[i].last_used < e->memo_cache[victim].last_used) {
-            victim = i;
-        }
     }
-    if (!slot) slot = &e->memo_cache[victim];
-    SDL_free(slot->blob);
+    while (e->memo_cache_bytes + o.total > kMaxMemoCacheTotalBytes) {
+        uint32_t lru = kMemoCacheCap;
+        for (uint32_t i = 0u; i < kMemoCacheCap; ++i) {
+            if (!e->memo_cache[i].blob) continue;
+            if (lru == kMemoCacheCap || e->memo_cache[i].last_used < e->memo_cache[lru].last_used) {
+                lru = i;
+            }
+        }
+        if (lru == kMemoCacheCap) break;
+        e->memo_cache_bytes -= e->memo_cache[lru].blob_bytes;
+        SDL_free(e->memo_cache[lru].blob);
+        e->memo_cache[lru] = {};
+        if (!slot) slot = &e->memo_cache[lru];
+    }
+    if (!slot) {
+        uint32_t victim = 0u;
+        for (uint32_t i = 1u; i < kMemoCacheCap; ++i) {
+            if (e->memo_cache[i].last_used < e->memo_cache[victim].last_used) {
+                victim = i;
+            }
+        }
+        slot = &e->memo_cache[victim];
+        e->memo_cache_bytes -= slot->blob_bytes;
+        SDL_free(slot->blob);
+        *slot = {};
+    }
     *slot = {
         memo_key,
         memo_rev,
@@ -3001,8 +3179,84 @@ void store_memo_native(InlaySurface* s, uint32_t memo_key, uint32_t memo_rev,
         root_explicit_id,
         e->responsive_cls_hits > resp_hits_start,
         0u,
-        blob
+        blob,
+        o.total
     };
+    e->memo_cache_bytes += o.total;
+}
+
+inline uint8_t container_width_bucket(float w) noexcept {
+    if (w >= 840.0f) return 3u;
+    if (w >= 560.0f) return 2u;
+    if (w >= 360.0f) return 1u;
+    return 0u;
+}
+
+ContainerWidthEntry* find_container_width(InlaySurface* s, uint32_t node_id) noexcept {
+    auto* e = ext(s);
+    for (uint32_t i = 0u; i < e->container_width_count; ++i) {
+        if (e->container_widths[i].node_id == node_id) {
+            return &e->container_widths[i];
+        }
+    }
+    return nullptr;
+}
+
+ContainerWidthEntry* find_or_add_container_width(InlaySurface* s, uint32_t node_id) noexcept {
+    if (auto* existing = find_container_width(s, node_id)) return existing;
+    auto* e = ext(s);
+    ContainerWidthEntry* slot = nullptr;
+    if (e->container_width_count < kContainerWidthCacheCap) {
+        slot = &e->container_widths[e->container_width_count++];
+    } else {
+        uint32_t victim = 0u;
+        for (uint32_t i = 1u; i < e->container_width_count; ++i) {
+            if (e->container_widths[i].last_used_frame < e->container_widths[victim].last_used_frame) {
+                victim = i;
+            }
+        }
+        slot = &e->container_widths[victim];
+    }
+    *slot = {};
+    slot->node_id = node_id;
+    slot->last_used_frame = s->frame_counter;
+    return slot;
+}
+
+void observe_container_width(InlaySurface* s, uint32_t path_id, float width_px) noexcept {
+    ContainerWidthEntry* ent = find_or_add_container_width(s, path_id);
+    if (!ent) return;
+    ent->last_used_frame = s->frame_counter;
+    if (width_px <= 1.0f) {
+        if (!ent->measured && !ent->requested_measure) {
+            ent->requested_measure = true;
+            etch_request_redraw(s->etch);
+        }
+        return;
+    }
+    const uint8_t new_b = container_width_bucket(width_px);
+    if (new_b == ent->built_bucket) {
+        ent->width_px = width_px;
+        ent->bucket = new_b;
+        ent->measured = true;
+        return;
+    }
+    if (ent->measured && ent->last_rebuild_frame > 0u &&
+        s->frame_counter >= ent->last_rebuild_frame &&
+        (s->frame_counter - ent->last_rebuild_frame) <= 2u &&
+        std::fabs(s->last_view_width_px - ent->last_rebuild_view_w) <= 0.5f &&
+        new_b == ent->prev_bucket) {
+        ent->width_px = width_px;
+        ent->bucket = new_b;
+        return;
+    }
+    ent->prev_bucket = ent->built_bucket;
+    ent->width_px = width_px;
+    ent->last_rebuild_view_w = s->last_view_width_px;
+    ent->bucket = new_b;
+    ent->measured = true;
+    ent->last_rebuild_frame = s->frame_counter;
+    ext(s)->needs_container_rebuild = true;
 }
 
 uint32_t build_node(InlaySurface* s, JSValueConst value, uint32_t depth, uint32_t sibling_slot, uint32_t parent_path) {
@@ -3107,14 +3361,53 @@ uint32_t build_node(InlaySurface* s, JSValueConst value, uint32_t depth, uint32_
     }
     const uint32_t path_id = etch_id_index(parent_path, s->nodes[index].id);
 
+    // I07 Track enclosing ErrorBoundary key on handlers & subtree roots.
+    const TextSlice prev_eb_key = ext(s)->cur_eb_key;
+    if (ext(s)->atom_eb_key != JS_ATOM_NULL) {
+        const JSValue eb_val = JS_GetProperty(s->js, value, ext(s)->atom_eb_key);
+        if (JS_IsString(eb_val)) {
+            size_t eb_len = 0u;
+            const char* eb_chars = JS_ToCStringLen(s->js, &eb_len, eb_val);
+            if (eb_chars && eb_len > 0u) {
+                const bool same_eb = prev_eb_key.len == eb_len && s->text &&
+                                     prev_eb_key.off <= s->text_used &&
+                                     prev_eb_key.len <= s->text_used - prev_eb_key.off &&
+                                     std::memcmp(s->text + prev_eb_key.off, eb_chars, eb_len) == 0;
+                if (!same_eb) {
+                    const TextSlice eb_sl = append_text_raw(s, eb_chars, eb_len);
+                    if (eb_sl.len > 0u) {
+                        ext(s)->cur_eb_key = eb_sl;
+                        if (ext(s)->boundary_root_count < kMaxBoundaryRoots) {
+                            ext(s)->boundary_roots[ext(s)->boundary_root_count++] = {index, eb_sl};
+                        }
+                    }
+                }
+            }
+            if (eb_chars) JS_FreeCString(s->js, eb_chars);
+        }
+        JS_FreeValue(s->js, eb_val);
+    }
+
+    // I03 Look up measured layout width for @container nodes before parsing styles.
+    const float prev_container_w = s->current_container_width_px;
+    ContainerWidthEntry* cw_entry = find_container_width(s, path_id);
+    if (cw_entry && cw_entry->measured && cw_entry->width_px > 1.0f) {
+        s->current_container_width_px = cw_entry->width_px;
+    }
+
     parse_style(s, props, kind, s->styles[index], index, default_col_hint);
     if (JS_HasException(s->js)) {
+        s->current_container_width_px = prev_container_w;
+        ext(s)->cur_eb_key = prev_eb_key;
         JS_FreeValue(s->js, props);
         return INLAY_UI_NONE;
     }
 
-    // #52 Container query width scoping for descendants when this container has explicit width.
-    const float prev_container_w = s->current_container_width_px;
+    // #52 / I03 Container query width scoping for descendants.
+    const bool is_at_container = (s->styles[index].flags2 & kNf2Container) != 0u;
+    if (!is_at_container) {
+        s->current_container_width_px = prev_container_w;
+    }
     if (is_container_kind(kind) && (s->styles[index].flags2 & Nf2WExplicit) != 0u) {
         if (s->styles[index].w_kind == uint8_t(ETCH_SIZING_FIXED) && s->styles[index].w_val > 0.f) {
             s->current_container_width_px = s->styles[index].w_val;
@@ -3123,10 +3416,21 @@ uint32_t build_node(InlaySurface* s, JSValueConst value, uint32_t depth, uint32_
             s->current_container_width_px = prev_container_w * s->styles[index].w_val;
         }
     }
+    if (is_at_container) {
+        const float eff_ct = s->current_container_width_px > 0.f
+            ? s->current_container_width_px
+            : s->last_view_width_px;
+        cw_entry = find_or_add_container_width(s, path_id);
+        if (cw_entry) {
+            cw_entry->built_bucket = container_width_bucket(eff_ct);
+            cw_entry->last_used_frame = s->frame_counter;
+        }
+    }
 
     if (inlay_ui_is_ext_widget(kind)) {
         if (!inlay_ui_parse_ext_widget(s, props, kind, s->nodes[index], s->styles[index], path_id)) {
             s->current_container_width_px = prev_container_w;
+            ext(s)->cur_eb_key = prev_eb_key;
             JS_FreeValue(s->js, props);
             return INLAY_UI_NONE;
         }
@@ -3257,6 +3561,7 @@ uint32_t build_node(InlaySurface* s, JSValueConst value, uint32_t depth, uint32_
     JS_FreeValue(s->js, props);
     if (JS_HasException(s->js)) {
         s->current_container_width_px = prev_container_w;
+        ext(s)->cur_eb_key = prev_eb_key;
         return INLAY_UI_NONE;
     }
 
@@ -3289,6 +3594,7 @@ uint32_t build_node(InlaySurface* s, JSValueConst value, uint32_t depth, uint32_
         JS_FreeValue(s->js, children);
     }
     s->current_container_width_px = prev_container_w;
+    ext(s)->cur_eb_key = prev_eb_key;
     if (kind == INLAY_UI_DOC && s->styles[index].ext_idx != INLAY_UI_NONE) {
         const EtchStr text = s->nodes[index].text;
         auto& spec = s->doc_specs[s->styles[index].ext_idx];
@@ -3414,7 +3720,8 @@ bool check_action_authorized(InlaySurface* s, EtchStr name, EtchStr payload) {
     }
     auto* storage = ext(s);
     if (storage->audit_fn) {
-        return storage->audit_fn(s, name, perm, req_approval, payload, storage->audit_user);
+        InlaySurface* target = storage->host_surface ? storage->host_surface : s;
+        return storage->audit_fn(target, name, perm, req_approval, payload, storage->audit_user);
     }
     if (req_approval) return false;
     return true;
@@ -3446,7 +3753,8 @@ JSValue js_action(JSContext* js, JSValueConst, int argc, JSValueConst* argv) {
         const EtchStr payload_str = {payload, static_cast<uint32_t>(length), false};
         if (check_action_authorized(s, name_str, payload_str)) {
             allowed = true;
-            binding->callback(s, payload_str, binding->user);
+            InlaySurface* target = ext(s)->host_surface ? ext(s)->host_surface : s;
+            binding->callback(target, payload_str, binding->user);
         }
     } else if (payload) {
         JS_ThrowTypeError(js, "Action payload exceeds 64KiB");
@@ -3713,6 +4021,8 @@ bool rebuild(InlaySurface* s, bool eager_state) {
         s->gradient_pool_count = 0u;
         s->item_pool_count = 0u;
         ext(s)->core_extra_count = 0u;
+        ext(s)->boundary_root_count = 0u;
+        ext(s)->cur_eb_key = {};
         ext(s)->uses_responsive_cls = false;
         ext(s)->responsive_cls_hits = 0u;
         s->current_container_width_px = s->last_view_width_px;
@@ -3760,6 +4070,52 @@ bool rebuild(InlaySurface* s, bool eager_state) {
     return !JS_HasException(s->js);
 }
 
+TextSlice find_event_eb_key(const InlaySurface* s, const WidgetEvent* ev) noexcept {
+    const auto* e = ext(s);
+    for (uint32_t i = 0u; i < e->event_eb_tag_count; ++i) {
+        if (e->event_eb_tags[i].ev == ev) return e->event_eb_tags[i].eb_key;
+    }
+    return {};
+}
+
+bool try_trip_error_boundary(InlaySurface* s, JSValueConst global, TextSlice eb_key) {
+    if (s->timed_out || eb_key.len == 0u || !s->text ||
+        eb_key.off > s->text_used || eb_key.len > s->text_used - eb_key.off) {
+        return false;
+    }
+    const JSValue exc = JS_GetException(s->js);
+    if (JS_IsUncatchableError(exc)) {
+        JS_Throw(s->js, exc);
+        return false;
+    }
+    const JSValue trip_fn = JS_GetPropertyStr(s->js, global, "__inlay_trip_eb");
+    bool tripped = false;
+    if (JS_IsFunction(s->js, trip_fn)) {
+        JSValue args[2] = {
+            JS_NewStringLen(s->js, s->text + eb_key.off, eb_key.len),
+            JS_DupValue(s->js, exc)
+        };
+        const JSValue res = JS_Call(s->js, trip_fn, global, 2, args);
+        if (!JS_IsException(res)) {
+            tripped = JS_ToBool(s->js, res) > 0;
+        }
+        JS_FreeValue(s->js, res);
+        JS_FreeValue(s->js, args[0]);
+        JS_FreeValue(s->js, args[1]);
+    }
+    JS_FreeValue(s->js, trip_fn);
+    if (tripped && !JS_HasException(s->js)) {
+        JS_FreeValue(s->js, exc);
+        return true;
+    }
+    if (!JS_HasException(s->js)) {
+        JS_Throw(s->js, exc);
+    } else {
+        JS_FreeValue(s->js, exc);
+    }
+    return false;
+}
+
 bool dispatch_one_event(InlaySurface* s, JSValueConst global, const WidgetEvent& ev) {
     if (ev.handler != INLAY_UI_NONE) {
         if (ev.handler >= s->handler_count) return true;
@@ -3782,7 +4138,15 @@ bool dispatch_one_event(InlaySurface* s, JSValueConst global, const WidgetEvent&
         JS_FreeValue(s->js, result);
         JS_FreeValue(s->js, state);
         JS_FreeValue(s->js, fn);
-        return !JS_HasException(s->js);
+        if (JS_HasException(s->js)) {
+            TextSlice eb_key = ext(s)->handler_eb_keys ? ext(s)->handler_eb_keys[ev.handler] : TextSlice{};
+            if (eb_key.len == 0u) eb_key = find_event_eb_key(s, &ev);
+            if (eb_key.len > 0u && try_trip_error_boundary(s, global, eb_key)) {
+                return true;
+            }
+            return false;
+        }
+        return true;
     }
     if (!ev.name.length) return true;
     const JSValue parsed = parse_json(s, ev.payload);
@@ -3812,7 +4176,14 @@ bool dispatch_one_event(InlaySurface* s, JSValueConst global, const WidgetEvent&
         JS_FreeValue(s->js, handler);
     }
     JS_FreeValue(s->js, parsed);
-    return !JS_HasException(s->js);
+    if (JS_HasException(s->js)) {
+        const TextSlice eb_key = find_event_eb_key(s, &ev);
+        if (eb_key.len > 0u && try_trip_error_boundary(s, global, eb_key)) {
+            return true;
+        }
+        return false;
+    }
+    return true;
 }
 
 bool run_batch(InlaySurface* s, const WidgetEvent* first) {
@@ -3865,9 +4236,647 @@ void clear_context(InlaySurface* s) {
             JS_FreeAtom(s->js, storage->atom_memo_rev);
             storage->atom_memo_rev = JS_ATOM_NULL;
         }
+        if (storage->atom_eb_key != JS_ATOM_NULL) {
+            JS_FreeAtom(s->js, storage->atom_eb_key);
+            storage->atom_eb_key = JS_ATOM_NULL;
+        }
         JS_FreeContext(s->js);
         s->js = nullptr;
     }
+}
+
+void free_spec_pools(InlaySurface* s) noexcept {
+    SDL_free(s->doc_specs);      s->doc_specs = nullptr;      s->doc_spec_count = 0u;      s->doc_spec_cap = 0u;
+    SDL_free(s->term_specs);     s->term_specs = nullptr;     s->term_spec_count = 0u;     s->term_spec_cap = 0u;
+    SDL_free(s->vlist_specs);    s->vlist_specs = nullptr;    s->vlist_spec_count = 0u;    s->vlist_spec_cap = 0u;
+    SDL_free(s->table_specs);    s->table_specs = nullptr;    s->table_spec_count = 0u;    s->table_spec_cap = 0u;
+    SDL_free(s->table_cols);     s->table_cols = nullptr;     s->table_col_count = 0u;     s->table_col_cap = 0u;
+    SDL_free(s->table_cells);    s->table_cells = nullptr;    s->table_cell_count = 0u;    s->table_cell_cap = 0u;
+    SDL_free(s->menu_specs);     s->menu_specs = nullptr;     s->menu_spec_count = 0u;     s->menu_spec_cap = 0u;
+    SDL_free(s->menu_items);     s->menu_items = nullptr;     s->menu_item_count = 0u;     s->menu_item_cap = 0u;
+    SDL_free(s->avatar_specs);   s->avatar_specs = nullptr;   s->avatar_spec_count = 0u;   s->avatar_spec_cap = 0u;
+    SDL_free(s->toast_specs);    s->toast_specs = nullptr;    s->toast_spec_count = 0u;    s->toast_spec_cap = 0u;
+    SDL_free(s->skeleton_specs); s->skeleton_specs = nullptr; s->skeleton_spec_count = 0u; s->skeleton_spec_cap = 0u;
+}
+
+void move_spec_pools(InlaySurface* dst, InlaySurface* src) noexcept {
+    free_spec_pools(dst);
+    dst->doc_specs = src->doc_specs;           dst->doc_spec_count = src->doc_spec_count;           dst->doc_spec_cap = src->doc_spec_cap;
+    dst->term_specs = src->term_specs;         dst->term_spec_count = src->term_spec_count;         dst->term_spec_cap = src->term_spec_cap;
+    dst->vlist_specs = src->vlist_specs;       dst->vlist_spec_count = src->vlist_spec_count;       dst->vlist_spec_cap = src->vlist_spec_cap;
+    dst->table_specs = src->table_specs;       dst->table_spec_count = src->table_spec_count;       dst->table_spec_cap = src->table_spec_cap;
+    dst->table_cols = src->table_cols;         dst->table_col_count = src->table_col_count;         dst->table_col_cap = src->table_col_cap;
+    dst->table_cells = src->table_cells;       dst->table_cell_count = src->table_cell_count;       dst->table_cell_cap = src->table_cell_cap;
+    dst->menu_specs = src->menu_specs;         dst->menu_spec_count = src->menu_spec_count;         dst->menu_spec_cap = src->menu_spec_cap;
+    dst->menu_items = src->menu_items;         dst->menu_item_count = src->menu_item_count;         dst->menu_item_cap = src->menu_item_cap;
+    dst->avatar_specs = src->avatar_specs;     dst->avatar_spec_count = src->avatar_spec_count;     dst->avatar_spec_cap = src->avatar_spec_cap;
+    dst->toast_specs = src->toast_specs;       dst->toast_spec_count = src->toast_spec_count;       dst->toast_spec_cap = src->toast_spec_cap;
+    dst->skeleton_specs = src->skeleton_specs; dst->skeleton_spec_count = src->skeleton_spec_count; dst->skeleton_spec_cap = src->skeleton_spec_cap;
+
+    src->doc_specs = nullptr;      src->doc_spec_count = 0u;      src->doc_spec_cap = 0u;
+    src->term_specs = nullptr;     src->term_spec_count = 0u;     src->term_spec_cap = 0u;
+    src->vlist_specs = nullptr;    src->vlist_spec_count = 0u;    src->vlist_spec_cap = 0u;
+    src->table_specs = nullptr;    src->table_spec_count = 0u;    src->table_spec_cap = 0u;
+    src->table_cols = nullptr;     src->table_col_count = 0u;     src->table_col_cap = 0u;
+    src->table_cells = nullptr;    src->table_cell_count = 0u;    src->table_cell_cap = 0u;
+    src->menu_specs = nullptr;     src->menu_spec_count = 0u;     src->menu_spec_cap = 0u;
+    src->menu_items = nullptr;     src->menu_item_count = 0u;     src->menu_item_cap = 0u;
+    src->avatar_specs = nullptr;   src->avatar_spec_count = 0u;   src->avatar_spec_cap = 0u;
+    src->toast_specs = nullptr;    src->toast_spec_count = 0u;    src->toast_spec_cap = 0u;
+    src->skeleton_specs = nullptr; src->skeleton_spec_count = 0u; src->skeleton_spec_cap = 0u;
+}
+
+bool init_vm_context(InlaySurface* s, const char** out_err) {
+    clear_context(s);
+    if (s->runtime) {
+        JS_FreeRuntime(s->runtime);
+        s->runtime = nullptr;
+    }
+    s->runtime = JS_NewRuntime();
+    if (!s->runtime) {
+        if (out_err) *out_err = "Unable to allocate script runtime";
+        return false;
+    }
+    JS_SetMemoryLimit(s->runtime, s->desc.memory_limit_bytes);
+    JS_SetMaxStackSize(s->runtime, s->desc.max_stack_bytes);
+    JS_SetInterruptHandler(s->runtime, interrupt, s);
+    JS_SetHostPromiseRejectionTracker(s->runtime, rejection_tracker, s);
+    s->js = JS_NewContext(s->runtime);
+    if (!s->js) {
+        if (out_err) *out_err = "Unable to allocate script context";
+        return false;
+    }
+    JS_SetContextOpaque(s->js, s);
+    auto* stg = ext(s);
+    stg->atom_memo_key = JS_NewAtom(s->js, "__memoKey");
+    stg->atom_memo_rev = JS_NewAtom(s->js, "__memoRev");
+    stg->atom_eb_key = JS_NewAtom(s->js, "__ebKey");
+
+    const JSValue global = JS_GetGlobalObject(s->js);
+    JS_SetPropertyStr(s->js, global, "action", JS_NewCFunction(s->js, js_action, "action", 2));
+    JS_SetPropertyStr(s->js, global, "request", JS_NewCFunction(s->js, js_request_async_action, "request", 2));
+    JS_SetPropertyStr(s->js, global, "setTimeout",
+                      JS_NewCFunction(s->js, js_set_timeout, "setTimeout", 2));
+    JS_SetPropertyStr(s->js, global, "clearTimeout",
+                      JS_NewCFunction(s->js, js_clear_timeout, "clearTimeout", 1));
+    JS_SetPropertyStr(s->js, global, "Atomics", JS_UNDEFINED);
+    JS_SetPropertyStr(s->js, global, "SharedArrayBuffer", JS_UNDEFINED);
+    JS_FreeValue(s->js, global);
+
+    static constexpr char bootstrap[] =
+        "globalThis.__frag=Symbol('frag');"
+        "globalThis.__inlay_hm=Object.create(null);globalThis.__inlay_eb_map=Object.create(null);"
+        "globalThis.__inlay_stk=[];globalThis.__inlay_has_hm=false;"
+        "globalThis.__inlay_seen=Object.create(null);globalThis.__inlay_fx=[];globalThis.__inlay_dirty=false;"
+        "globalThis.__inlay_begin=()=>{globalThis.__inlay_dirty=false;globalThis.__inlay_seen=Object.create(null);"
+        "globalThis.__inlay_fx.length=0;globalThis.__inlay_stk=[{k:'__root',i:0,c:0,eb:''}];"
+        "globalThis.__inlay_seen.__root=globalThis.__inlay_visit=1;};"
+        "globalThis.__inlay_commit=()=>{if(globalThis.__inlay_has_hm){const hm=globalThis.__inlay_hm,seen=globalThis.__inlay_seen;"
+        "let any=false;for(const k in hm){if(!seen[k]){const a=hm[k];for(let j=0;j<a.length;++j){"
+        "const sl=a[j];if(sl&&sl.__fx&&typeof sl.cl==='function'){try{sl.cl();}catch(_){}}}delete hm[k];delete globalThis.__inlay_eb_map[k];}else any=true;}"
+        "globalThis.__inlay_has_hm=any;}const fx=globalThis.__inlay_fx;if(!fx.length)return;"
+        "globalThis.__inlay_fx=[];for(let j=0;j<fx.length;++j){const r=fx[j];if(typeof r.cl==='function')r.cl();"
+        "const cl=r.fn();r.cl=typeof cl==='function'?cl:undefined;}};"
+        "globalThis.h=(tag,props,...children)=>{"
+        "if(tag===globalThis.__frag)return children;"
+        "if(tag===Math)tag='math';"
+        "if(typeof tag==='function'){"
+        "if(tag.__ui)return tag(props||{},...children);"
+        "const stk=globalThis.__inlay_stk,pf=stk.length?stk[stk.length-1]:{k:'__root',i:0,c:0,eb:''};"
+        "const nm=tag.name||'C',hk=props&&props.key!==undefined&&props.key!==null;"
+        "const sk=pf.k+'/'+(hk?(nm+'#'+String(props.key)):(nm+'@'+(pf.c++)));"
+        "globalThis.__inlay_seen[sk]=++globalThis.__inlay_visit;stk.push({k:sk,i:0,c:0,memo:pf.memo,eb:pf.eb||''});"
+        "const mp=children.length||!(props&&'children'in props)?Object.assign({},props,{children}):Object.assign({},props);"
+        "try{return tag(mp);}finally{stk.pop();}}"
+        "const stk=globalThis.__inlay_stk,pf=stk.length?stk[stk.length-1]:null;"
+        "const v={tag:tag==='switch'?'toggle':tag,props:props||{},children};"
+        "if(pf&&pf.eb)Object.defineProperty(v,'__ebKey',{value:pf.eb,configurable:true});"
+        "return v;};"
+        "globalThis.__jsx=globalThis.h;"
+        "(()=>{"
+        "const isP=p=>!!(p&&typeof p==='object'&&!Array.isArray(p)&&typeof p.tag!=='string'),"
+        "mk=f=>{f.__ui=true;return f;},"
+        "m=t=>mk((p,...c)=>isP(p)?h(t,p,...c):((p===undefined||p===null)&&!c.length?h(t,{}):h(t,{},p,...c))),"
+        "x=(t,k='text')=>mk((p,...c)=>typeof p==='string'?h(t,{[k]:p},...c):m(t)(p,...c));"
+        "globalThis.ui={"
+        "box:m('box'),row:m('row'),col:m('col'),card:m('card'),form:m('form'),spacer:m('spacer'),"
+        "text:x('text'),button:x('button'),input:m('input'),toggle:m('toggle'),switch:m('toggle'),"
+        "checkbox:m('checkbox'),tabs:m('tabs'),combobox:m('combobox'),scroll:m('scroll'),"
+        "progress:m('progress'),slider:m('slider'),badge:x('badge'),divider:m('divider'),"
+        "image:m('image'),modal:m('modal'),popover:m('popover'),tooltip:m('tooltip'),"
+        "split:m('split'),math:x('math'),diagram:x('diagram'),slot:x('slot','name'),"
+        "doc:x('doc','markdown'),codeEditor:x('codeEditor','buffer'),terminal:x('terminal','ansi'),virtualList:m('virtualList'),"
+        "table:m('table'),tree:m('tree'),treeItem:x('treeItem','label'),"
+        "menu:m('menu'),contextMenu:m('contextMenu'),avatar:x('avatar','name'),"
+        "toast:x('toast','description'),accordion:x('accordion','title'),skeleton:m('skeleton'),"
+        "h:globalThis.h,fragment:(...c)=>c};"
+        "const G=globalThis;"
+        "G.Box='box';G.Row='row';G.Col='col';G.Card='card';G.Form='form';G.Text='text';"
+        "G.Button='button';G.Input='input';G.Toggle='toggle';G.Switch='switch';"
+        "G.Checkbox='checkbox';G.Tabs='tabs';G.Combobox='combobox';G.Scroll='scroll';"
+        "G.Progress='progress';G.Slider='slider';G.Badge='badge';G.Divider='divider';"
+        "G.Image='image';G.Modal='modal';G.Popover='popover';G.Tooltip='tooltip';"
+        "G.Split='split';G.Spacer='spacer';G.Diagram='diagram';G.Slot='slot';"
+        "G.Doc='doc';G.CodeEditor='codeEditor';G.Terminal='terminal';G.VirtualList='virtualList';G.Table='table';"
+        "G.Tree='tree';G.TreeItem='treeItem';G.Menu='menu';G.ContextMenu='contextMenu';"
+        "G.Avatar='avatar';G.Toast='toast';G.Accordion='accordion';G.Skeleton='skeleton';"
+        "G.Fragment=G.__frag;"
+        "const slot=()=>{const stk=G.__inlay_stk,f=stk.length?stk[stk.length-1]:{k:'__root',i:0,c:0,eb:''};"
+        "if(f.i===0&&G.__inlay_collect)G.__inlay_collect.push(f.k);"
+        "const hm=G.__inlay_hm;let a=hm[f.k];if(!a){a=hm[f.k]=[];G.__inlay_has_hm=true;}return[a,f.i++];};"
+        "const same=(a,b)=>{if(!a||!b||a.length!==b.length)return false;"
+        "for(let j=0;j<a.length;++j)if(!Object.is(a[j],b[j]))return false;return true;};"
+        "G.useState=init=>{const[a,i]=slot();if(i>=a.length)a[i]=typeof init==='function'?init():init;"
+        "const frame=G.__inlay_stk[G.__inlay_stk.length-1],owner=frame&&frame.memo;"
+        "return[a[i],v=>{const n=typeof v==='function'?v(a[i]):v;"
+        "if(!Object.is(a[i],n)){a[i]=n;for(let m=owner;m;m=m.parent)m.dirty=true;G.__inlay_dirty=true;}}];};"
+        "G.useRef=init=>{const[a,i]=slot();if(i>=a.length)a[i]={current:init};return a[i];};"
+        "G.useMemo=(fn,deps)=>{const[a,i]=slot();"
+        "if(i>=a.length||!deps||!same(a[i].d,deps))a[i]={v:fn(),d:deps?deps.slice():null};return a[i].v;};"
+        "G.useCallback=(fn,deps)=>G.useMemo(()=>fn,deps);"
+        "G.useEffect=(fn,deps)=>{const[a,i]=slot();"
+        "if(i>=a.length){const r={__fx:1,d:deps?deps.slice():null,fn,cl:undefined};a[i]=r;G.__inlay_fx.push(r);}"
+        "else if(!deps||!same(a[i].d,deps)){a[i].d=deps?deps.slice():null;a[i].fn=fn;G.__inlay_fx.push(a[i]);}};})();"
+        R"JS(
+        (() => {
+            const G = globalThis;
+            function equalProps(a, b) {
+                const keys = Object.keys(a);
+                if (keys.length !== Object.keys(b).length) return false;
+                for (const key of keys) {
+                    if (!Object.hasOwn(b, key)) return false;
+                    const x = a[key], y = b[key];
+                    if (Object.is(x, y)) continue;
+                    if (key !== 'children' || !Array.isArray(x) || !Array.isArray(y) ||
+                        x.length !== y.length || !x.every((v, i) => Object.is(v, y[i]))) return false;
+                }
+                return true;
+            }
+            let nextMemoKey = 1;
+            G.memo = (component, equal = equalProps) => {
+                function Memo(props) {
+                    const ref = G.useRef(null);
+                    const cache = ref.current || (ref.current = {id: nextMemoKey++, rev: 0});
+                    const stack = G.__inlay_stk, frame = stack[stack.length - 1];
+                    const collect = G.__inlay_collect;
+                    cache.parent = frame.memo;
+                    if (cache.component === component && !cache.dirty && equal(cache.props, props)) {
+                        for (const key of cache.scopes) {
+                            G.__inlay_seen[key] = ++G.__inlay_visit;
+                            if (collect) collect.push(key);
+                        }
+                        return cache.tree;
+                    }
+                    cache.component = null;
+                    cache.dirty = false;
+                    frame.memo = cache;
+                    const scopes = [];
+                    G.__inlay_collect = scopes;
+                    try {
+                        cache.tree = G.h(component, props);
+                    } finally {
+                        G.__inlay_collect = collect;
+                        frame.memo = cache.parent;
+                    }
+                    // A nested boundary may have unmounted scopes while rendering.
+                    cache.scopes = scopes.filter(k => Object.hasOwn(G.__inlay_seen, k));
+                    if (collect) for (const key of cache.scopes) collect.push(key);
+                    cache.props = props;
+                    cache.component = component;
+                    cache.rev = (cache.rev + 1) >>> 0;
+                    if (cache.tree && typeof cache.tree === 'object' && !Array.isArray(cache.tree) &&
+                        typeof cache.tree.tag === 'string' && Object.isExtensible(cache.tree)) {
+                        Object.defineProperty(cache.tree, '__memoKey', {value: cache.id, configurable: true});
+                        Object.defineProperty(cache.tree, '__memoRev', {value: cache.rev, configurable: true});
+                    }
+                    return cache.tree;
+                }
+                Object.defineProperty(Memo, 'name', {value: 'memo(' + component.name + ')'});
+                return Memo;
+            };
+            function Content(p) {
+                const stk = G.__inlay_stk;
+                if (stk.length) stk[stk.length - 1].eb = p.ebKey;
+                return p.render();
+            }
+            function Fallback(p) { return p.render(p.error, p.retry); }
+            function ErrorBoundary(p) {
+                const stk = G.__inlay_stk, frame = stk.length ? stk[stk.length - 1] : null;
+                const ebKey = frame ? frame.k : '__root';
+                const slot = G.useRef(null);
+                const [, invalidate] = G.useState(0);
+                if (!slot.current || !Object.is(slot.current.key, p.resetKey))
+                    slot.current = {key: p.resetKey, failed: false};
+                const state = slot.current;
+                G.__inlay_eb_map[ebKey] = {slot, state, invalidate};
+                if (!state.failed) {
+                    const visit = G.__inlay_visit, effects = G.__inlay_fx.length;
+                    try {
+                        return G.h(Content, {render: p.render, ebKey});
+                    } catch (error) {
+                        G.__inlay_fx.length = effects;
+                        for (const key in G.__inlay_seen)
+                            if (G.__inlay_seen[key] > visit) delete G.__inlay_seen[key];
+                        state.failed = true;
+                        state.error = error;
+                    }
+                }
+                const retry = () => {
+                    if (state !== slot.current || !state.failed) return;
+                    slot.current = null;
+                    invalidate(n => n + 1);
+                };
+                return typeof p.fallback === 'function'
+                    ? G.h(Fallback, {render: p.fallback, error: state.error, retry})
+                    : G.ui.text(String(state.error));
+            }
+            G.__inlay_trip_eb = (key, err) => {
+                const r = G.__inlay_eb_map[key];
+                if (!r || r.state !== r.slot.current || r.state.failed) return false;
+                r.state.failed = true;
+                r.state.error = err;
+                r.invalidate(n => n + 1);
+                return true;
+            };
+            G.ErrorBoundary = ErrorBoundary;
+            G.ui.errorBoundary = p => G.h(ErrorBoundary, p);
+            G.ui.errorBoundary.__ui = true;
+        })();
+        )JS";
+
+    bool ran_bc = false;
+    if (stg->bootstrap_bc && stg->bootstrap_bc_len > 0u) {
+        const JSValue fn = JS_ReadObject(s->js, stg->bootstrap_bc, stg->bootstrap_bc_len, JS_READ_OBJ_BYTECODE);
+        if (!JS_IsException(fn)) {
+            const JSValue br = JS_EvalFunction(s->js, fn);
+            ran_bc = !JS_IsException(br);
+            JS_FreeValue(s->js, br);
+        }
+        if (!ran_bc && JS_HasException(s->js)) {
+            JS_FreeValue(s->js, JS_GetException(s->js));
+        }
+    }
+    if (!ran_bc) {
+        const JSValue fn = JS_Eval(s->js, bootstrap, sizeof(bootstrap) - 1u, "<inlay>",
+                                   JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
+        if (!JS_IsException(fn)) {
+            if (!stg->bootstrap_bc) {
+                size_t bc_len = 0u;
+                uint8_t* raw = JS_WriteObject(s->js, &bc_len, fn,
+                                              JS_WRITE_OBJ_BYTECODE | JS_WRITE_OBJ_STRIP_SOURCE);
+                if (raw) {
+                    if (bc_len > 0u) {
+                        auto* copy = static_cast<uint8_t*>(SDL_malloc(bc_len));
+                        if (copy) {
+                            std::memcpy(copy, raw, bc_len);
+                            stg->bootstrap_bc = copy;
+                            stg->bootstrap_bc_len = bc_len;
+                        }
+                    }
+                    js_free(s->js, raw);
+                } else if (JS_HasException(s->js)) {
+                    JS_FreeValue(s->js, JS_GetException(s->js));
+                }
+            }
+            const JSValue br = JS_EvalFunction(s->js, fn);
+            JS_FreeValue(s->js, br);
+        }
+    }
+    if (JS_HasException(s->js)) {
+        if (out_err) *out_err = "Unable to initialize script bootstrap";
+        return false;
+    }
+    return true;
+}
+
+bool load_hmr_staged(InlaySurface* s, EtchStr effective, const char* filename) {
+    static constexpr char prefix[] = "(function(){";
+    static constexpr char suffix[] =
+        "\n;return {render:typeof render==='function'?render:undefined,onEvent:typeof "
+        "onEvent==='function'?onEvent:undefined};})()";
+
+    auto* staged = static_cast<SurfaceStorage*>(SDL_calloc(1u, sizeof(SurfaceStorage)));
+    if (!staged) {
+        record_reload_error(s, "HMR staging allocation failed");
+        return false;
+    }
+    InlaySurface* st = &staged->pub;
+    auto* live_ext = ext(s);
+
+    st->etch = s->etch;
+    st->desc = s->desc;
+    st->frequency = s->frequency;
+    st->frame_counter = s->frame_counter;
+    st->last_view_width_px = s->last_view_width_px;
+    st->current_container_width_px = s->last_view_width_px;
+    st->next_timer = s->next_timer;
+    st->image_resolver_fn = s->image_resolver_fn;
+    st->image_resolver_user_data = s->image_resolver_user_data;
+    std::memcpy(st->path, s->path, sizeof(st->path));
+    std::memcpy(st->actions, s->actions, sizeof(st->actions));
+    st->action_count = s->action_count;
+    std::memcpy(st->slots, s->slots, sizeof(st->slots));
+    st->slot_count = s->slot_count;
+    for (auto& timer : st->timers) timer.function = JS_UNDEFINED;
+
+    staged->host_surface = s;
+    staged->has_view_width = live_ext->has_view_width;
+    staged->audit_fn = live_ext->audit_fn;
+    staged->audit_user = live_ext->audit_user;
+    staged->async_actions_closed = live_ext->async_actions_closed;
+    staged->next_async_action = live_ext->next_async_action;
+    staged->container_width_count = live_ext->container_width_count;
+    if (staged->container_width_count > 0u) {
+        std::memcpy(staged->container_widths, live_ext->container_widths,
+                    size_t(staged->container_width_count) * sizeof(ContainerWidthEntry));
+    }
+
+    // Borrow shared/read-only buffers from live surface (always restored & nulled before teardown).
+    st->json_scratch = s->json_scratch;
+    st->content = s->content;
+    st->content_count = s->content_count;
+    st->content_cap = s->content_cap;
+    st->vlist_cache = s->vlist_cache;
+    st->vlist_cache_count = s->vlist_cache_count;
+    st->vlist_cache_cap = s->vlist_cache_cap;
+    st->cls_cache = s->cls_cache;
+    st->cls_cache_strs = s->cls_cache_strs;
+    st->cls_cache_str_used = s->cls_cache_str_used;
+    st->cls_cache_clock = s->cls_cache_clock;
+    staged->action_policies = live_ext->action_policies;
+    staged->action_policy_count = live_ext->action_policy_count;
+    staged->action_policy_cap = live_ext->action_policy_cap;
+    staged->async_action_names = live_ext->async_action_names;
+    staged->async_action_name_count = live_ext->async_action_name_count;
+    staged->async_action_name_cap = live_ext->async_action_name_cap;
+    staged->bootstrap_bc = live_ext->bootstrap_bc;
+    staged->bootstrap_bc_len = live_ext->bootstrap_bc_len;
+
+    bool borrowed_released = false;
+    auto release_borrowed = [&]() noexcept {
+        if (borrowed_released) return;
+        borrowed_released = true;
+        s->cls_cache = st->cls_cache;
+        s->cls_cache_strs = st->cls_cache_strs;
+        s->cls_cache_str_used = st->cls_cache_str_used;
+        s->cls_cache_clock = st->cls_cache_clock;
+        if (!live_ext->bootstrap_bc && staged->bootstrap_bc) {
+            live_ext->bootstrap_bc = staged->bootstrap_bc;
+            live_ext->bootstrap_bc_len = staged->bootstrap_bc_len;
+        }
+        st->json_scratch = nullptr;
+        st->content = nullptr;
+        st->content_count = 0u;
+        st->content_cap = 0u;
+        st->vlist_cache = nullptr;
+        st->vlist_cache_count = 0u;
+        st->vlist_cache_cap = 0u;
+        st->cls_cache = nullptr;
+        st->cls_cache_strs = nullptr;
+        staged->action_policies = nullptr;
+        staged->action_policy_count = 0u;
+        staged->action_policy_cap = 0u;
+        staged->async_action_names = nullptr;
+        staged->async_action_name_count = 0u;
+        staged->async_action_name_cap = 0u;
+        staged->bootstrap_bc = nullptr;
+        staged->bootstrap_bc_len = 0u;
+    };
+
+    auto destroy_staged = [&]() noexcept {
+        release_borrowed();
+        if (staged->async_actions) {
+            if (st->js) {
+                for (uint32_t i = 0u; i < kAsyncActionCapacity; ++i) {
+                    auto& slot = staged->async_actions[i];
+                    if (slot.phase == AsyncActionPhase::Queued || slot.phase == AsyncActionPhase::Started) {
+                        release_async_action(st, slot, false);
+                    }
+                }
+            }
+            SDL_free(staged->async_actions);
+            staged->async_actions = nullptr;
+        }
+        clear_context(st);
+        if (st->runtime) {
+            JS_FreeRuntime(st->runtime);
+            st->runtime = nullptr;
+        }
+        free_spec_pools(st);
+        SDL_free(st->handlers);
+        SDL_free(staged->handler_eb_keys);
+        SDL_free(st->nodes);
+        SDL_free(st->styles);
+        SDL_free(staged->node_extra_idx);
+        SDL_free(staged->core_extras);
+        SDL_free(st->cold_visuals);
+        SDL_free(st->shadow_pool);
+        SDL_free(st->gradient_pool);
+        SDL_free(st->item_pool);
+        SDL_free(st->text);
+        SDL_free(st->source);
+        SDL_free(st->state);
+        SDL_free(staged);
+    };
+
+    const uint32_t init_nodes = st->desc.max_nodes < 64u ? st->desc.max_nodes : 64u;
+    const uint32_t init_text = st->desc.max_text_bytes < 2048u ? st->desc.max_text_bytes : 2048u;
+    st->nodes = static_cast<InlayUiNode*>(SDL_calloc(init_nodes, sizeof(InlayUiNode)));
+    st->styles = static_cast<NodeStyle*>(SDL_calloc(init_nodes, sizeof(NodeStyle)));
+    staged->node_extra_idx = static_cast<uint32_t*>(SDL_malloc(size_t(init_nodes) * sizeof(uint32_t)));
+    if (staged->node_extra_idx) {
+        for (uint32_t i = 0u; i < init_nodes; ++i) staged->node_extra_idx[i] = INLAY_UI_NONE;
+    }
+    st->node_capacity = init_nodes;
+    const bool text_ok = inlay_grow_pod(st->text, staged->text_capacity, init_text, init_text, st->desc.max_text_bytes);
+
+    const uint32_t needed = effective.length + uint32_t(sizeof(prefix) + sizeof(suffix));
+    uint32_t src_cap = 4096u;
+    while (src_cap < needed) src_cap *= 2u;
+    st->source = static_cast<char*>(SDL_malloc(src_cap));
+    st->source_capacity = st->source ? src_cap : 0u;
+
+    const bool state_ok = save_state(st, s->state ? s->state : "{}", s->state ? s->state_size : 2u);
+    if (!st->nodes || !st->styles || !staged->node_extra_idx || !text_ok || !st->text || !st->source || !state_ok) {
+        destroy_staged();
+        record_reload_error(s, "HMR staging storage allocation failed");
+        return false;
+    }
+    std::memcpy(st->source, prefix, sizeof(prefix) - 1u);
+    if (effective.length > 0u) {
+        std::memcpy(st->source + sizeof(prefix) - 1u, effective.chars, effective.length);
+    }
+    std::memcpy(st->source + sizeof(prefix) - 1u + effective.length, suffix, sizeof(suffix));
+    const size_t length = sizeof(prefix) - 1u + effective.length + sizeof(suffix) - 1u;
+
+    const char* vm_err = nullptr;
+    if (!init_vm_context(st, &vm_err)) {
+        destroy_staged();
+        record_reload_error(s, vm_err ? vm_err : "HMR staging VM initialization failed");
+        return false;
+    }
+
+    const uint64_t start = SDL_GetPerformanceCounter();
+    begin_tick(st);
+    const JSValue global = JS_GetGlobalObject(st->js);
+    bool ok = !JS_HasException(st->js) && install_state(st, global);
+    JS_FreeValue(st->js, global);
+    if (ok) {
+        const JSValue result = JS_Eval(st->js, st->source, length, filename, JS_EVAL_TYPE_GLOBAL);
+        ok = !JS_IsException(result);
+        if (ok) {
+            const JSValue target = JS_GetGlobalObject(st->js);
+            JS_SetPropertyStr(st->js, target, "render", JS_GetPropertyStr(st->js, result, "render"));
+            JS_SetPropertyStr(st->js, target, "onEvent", JS_GetPropertyStr(st->js, result, "onEvent"));
+            JS_FreeValue(st->js, target);
+        }
+        JS_FreeValue(st->js, result);
+    }
+    if (ok && !JS_HasException(st->js)) ok = rebuild(st, true);
+    const bool completed = finish_tick(st, start) && ok && !st->stats.has_error && !st->timed_out;
+
+    s->stats.js_ticks += st->stats.js_ticks;
+    s->stats.last_tick_ms = st->stats.last_tick_ms;
+
+    if (!completed) {
+        char err_copy[1024] = {};
+        std::snprintf(err_copy, sizeof(err_copy), "%s", st->error[0] ? st->error : "HMR candidate reload failed");
+        destroy_staged();
+        record_reload_error(s, err_copy);
+        return false;
+    }
+
+    // Candidate fully succeeded: commit transaction atomically into live surface.
+    release_borrowed();
+
+    // Retire old live runtime, timers, handlers, memo cache, and started async actions.
+    clear_context(s);
+    if (s->runtime) {
+        JS_FreeRuntime(s->runtime);
+        s->runtime = nullptr;
+    }
+
+    // Merge newly queued async actions from staged into live surface slots.
+    if (staged->async_actions) {
+        if (!live_ext->async_actions) {
+            live_ext->async_actions =
+                static_cast<AsyncActionSlot*>(SDL_calloc(kAsyncActionCapacity, sizeof(AsyncActionSlot)));
+        }
+        for (uint32_t i = 0u; i < kAsyncActionCapacity; ++i) {
+            auto& src_slot = staged->async_actions[i];
+            if (src_slot.phase != AsyncActionPhase::Queued) continue;
+            bool placed = false;
+            if (live_ext->async_actions) {
+                for (uint32_t j = 0u; j < kAsyncActionCapacity; ++j) {
+                    if (live_ext->async_actions[j].phase == AsyncActionPhase::Empty) {
+                        live_ext->async_actions[j] = src_slot;
+                        src_slot = {};
+                        placed = true;
+                        break;
+                    }
+                }
+            }
+            if (!placed) release_async_action(st, src_slot, false);
+        }
+        SDL_free(staged->async_actions);
+        staged->async_actions = nullptr;
+    }
+    live_ext->next_async_action = staged->next_async_action;
+
+    // Move validated VM, atoms, timers, memo cache, nodes, pools, handlers, source, and state.
+    s->runtime = st->runtime;           st->runtime = nullptr;
+    s->js = st->js;                     st->js = nullptr;
+    live_ext->atom_memo_key = staged->atom_memo_key; staged->atom_memo_key = JS_ATOM_NULL;
+    live_ext->atom_memo_rev = staged->atom_memo_rev; staged->atom_memo_rev = JS_ATOM_NULL;
+    live_ext->atom_eb_key = staged->atom_eb_key;     staged->atom_eb_key = JS_ATOM_NULL;
+    JS_SetInterruptHandler(s->runtime, interrupt, s);
+    JS_SetHostPromiseRejectionTracker(s->runtime, rejection_tracker, s);
+    JS_SetContextOpaque(s->js, s);
+
+    for (uint32_t i = 0u; i < 32u; ++i) {
+        s->timers[i] = st->timers[i];
+        st->timers[i] = {JS_UNDEFINED, 0.0, 0u};
+    }
+    s->next_timer = st->next_timer;
+
+    std::memcpy(live_ext->memo_cache, staged->memo_cache, sizeof(live_ext->memo_cache));
+    std::memset(staged->memo_cache, 0, sizeof(staged->memo_cache));
+    live_ext->memo_cache_clock = staged->memo_cache_clock;
+    live_ext->memo_cache_bytes = staged->memo_cache_bytes;
+    staged->memo_cache_bytes = 0u;
+
+    SDL_free(s->handlers);               s->handlers = st->handlers;                     st->handlers = nullptr;
+    SDL_free(live_ext->handler_eb_keys); live_ext->handler_eb_keys = staged->handler_eb_keys; staged->handler_eb_keys = nullptr;
+    s->handler_count = st->handler_count;       st->handler_count = 0u;
+    s->handler_capacity = st->handler_capacity; st->handler_capacity = 0u;
+
+    SDL_free(s->nodes);                  s->nodes = st->nodes;                           st->nodes = nullptr;
+    SDL_free(s->styles);                 s->styles = st->styles;                         st->styles = nullptr;
+    SDL_free(live_ext->node_extra_idx);  live_ext->node_extra_idx = staged->node_extra_idx; staged->node_extra_idx = nullptr;
+    s->node_count = st->node_count;             st->node_count = 0u;
+    s->node_capacity = st->node_capacity;       st->node_capacity = 0u;
+
+    SDL_free(live_ext->core_extras);     live_ext->core_extras = staged->core_extras;    staged->core_extras = nullptr;
+    live_ext->core_extra_count = staged->core_extra_count; staged->core_extra_count = 0u;
+    live_ext->core_extra_cap = staged->core_extra_cap;     staged->core_extra_cap = 0u;
+
+    SDL_free(s->cold_visuals);           s->cold_visuals = st->cold_visuals;             st->cold_visuals = nullptr;
+    s->cold_visual_count = st->cold_visual_count; st->cold_visual_count = 0u;
+    s->cold_visual_cap = st->cold_visual_cap;     st->cold_visual_cap = 0u;
+
+    SDL_free(s->shadow_pool);            s->shadow_pool = st->shadow_pool;               st->shadow_pool = nullptr;
+    s->shadow_pool_count = st->shadow_pool_count; st->shadow_pool_count = 0u;
+    s->shadow_pool_cap = st->shadow_pool_cap;     st->shadow_pool_cap = 0u;
+
+    SDL_free(s->gradient_pool);          s->gradient_pool = st->gradient_pool;           st->gradient_pool = nullptr;
+    s->gradient_pool_count = st->gradient_pool_count; st->gradient_pool_count = 0u;
+    s->gradient_pool_cap = st->gradient_pool_cap;     st->gradient_pool_cap = 0u;
+
+    SDL_free(s->item_pool);              s->item_pool = st->item_pool;                   st->item_pool = nullptr;
+    s->item_pool_count = st->item_pool_count;     st->item_pool_count = 0u;
+    s->item_pool_cap = st->item_pool_cap;         st->item_pool_cap = 0u;
+
+    move_spec_pools(s, st);
+
+    SDL_free(s->text);                   s->text = st->text;                             st->text = nullptr;
+    s->text_used = st->text_used;                 st->text_used = 0u;
+    live_ext->text_capacity = staged->text_capacity; staged->text_capacity = 0u;
+
+    SDL_free(s->source);                 s->source = st->source;                         st->source = nullptr;
+    s->source_capacity = st->source_capacity;     st->source_capacity = 0u;
+
+    SDL_free(s->state);                  s->state = st->state;                           st->state = nullptr;
+    s->state_size = st->state_size;               st->state_size = 0u;
+    s->state_capacity = st->state_capacity;       st->state_capacity = 0u;
+
+    live_ext->boundary_root_count = staged->boundary_root_count;
+    if (live_ext->boundary_root_count > 0u) {
+        std::memcpy(live_ext->boundary_roots, staged->boundary_roots,
+                    size_t(live_ext->boundary_root_count) * sizeof(BoundaryRootEntry));
+    }
+    live_ext->cur_eb_key = {};
+    live_ext->container_width_count = staged->container_width_count;
+    if (live_ext->container_width_count > 0u) {
+        std::memcpy(live_ext->container_widths, staged->container_widths,
+                    size_t(live_ext->container_width_count) * sizeof(ContainerWidthEntry));
+    }
+    live_ext->uses_responsive_cls = staged->uses_responsive_cls;
+    live_ext->responsive_cls_hits = staged->responsive_cls_hits;
+    live_ext->needs_container_rebuild = false;
+    s->memo_reused_nodes += st->memo_reused_nodes;
+
+    s->loaded = true;
+    s->stats.has_error = false;
+    s->error[0] = '\0';
+    s->stats.node_count = s->node_count;
+    s->pending_state = false;
+    s->state_dirty = false;
+    SDL_free(live_ext->reload_error);
+    live_ext->reload_error = nullptr;
+
+    destroy_staged();
+    etch_request_redraw(s->etch);
+    return true;
 }
 
 bool load(InlaySurface* s, EtchStr script, bool is_hmr = false) {
@@ -3901,6 +4910,12 @@ bool load(InlaySurface* s, EtchStr script, bool is_hmr = false) {
             effective = {s->jsx_buf, static_cast<uint32_t>(jsx_len), false};
         }
     }
+
+    // R03: Transactional HMR staging on live surfaces — candidate compiles, inits & renders in isolation.
+    if (is_hmr && s->loaded && !s->stats.has_error && s->js) {
+        return load_hmr_staged(s, effective, filename);
+    }
+
     const uint32_t needed = effective.length + uint32_t(sizeof(prefix) + sizeof(suffix));
     if (needed > s->source_capacity) {
         uint32_t cap = s->source_capacity ? s->source_capacity : 4096u;
@@ -3921,256 +4936,27 @@ bool load(InlaySurface* s, EtchStr script, bool is_hmr = false) {
     std::memcpy(s->source + sizeof(prefix) - 1u + effective.length, suffix, sizeof(suffix));
     const size_t length = sizeof(prefix) - 1u + effective.length + sizeof(suffix) - 1u;
 
-    const bool fresh = !is_hmr || !s->loaded || s->stats.has_error || !s->js;
-    JSValue compiled = JS_UNDEFINED;
-    uint64_t start = 0u;
-    if (fresh) {
-        clear_context(s);
-        if (s->runtime) JS_FreeRuntime(s->runtime);
-        s->runtime = JS_NewRuntime();
-        if (!s->runtime) {
-            record_error(s, "Unable to allocate script runtime");
-            return false;
-        }
-        JS_SetMemoryLimit(s->runtime, s->desc.memory_limit_bytes);
-        JS_SetMaxStackSize(s->runtime, s->desc.max_stack_bytes);
-        JS_SetInterruptHandler(s->runtime, interrupt, s);
-        JS_SetHostPromiseRejectionTracker(s->runtime, rejection_tracker, s);
-        s->js = JS_NewContext(s->runtime);
-        if (!s->js) {
-            record_error(s, "Unable to allocate script context");
-            return false;
-        }
-        JS_SetContextOpaque(s->js, s);
-        ext(s)->atom_memo_key = JS_NewAtom(s->js, "__memoKey");
-        ext(s)->atom_memo_rev = JS_NewAtom(s->js, "__memoRev");
-    } else {
-        start = SDL_GetPerformanceCounter();
-        begin_tick(s);
-        compiled = JS_Eval(s->js, s->source, length, filename,
-                           JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
-        const bool expired = SDL_GetPerformanceCounter() >= s->deadline;
-        if (JS_IsException(compiled) || expired) {
-            if (JS_IsException(compiled)) {
-                const JSValue error = JS_GetException(s->js);
-                const char* message = JS_ToCString(s->js, error);
-                record_reload_error(s, expired ? "Script compilation exceeded its tick time limit"
-                                               : message ? message : "HMR script compilation failed");
-                if (message) JS_FreeCString(s->js, message);
-                JS_FreeValue(s->js, error);
-                if (JS_HasException(s->js)) JS_FreeValue(s->js, JS_GetException(s->js));
-            } else {
-                JS_FreeValue(s->js, compiled);
-                record_reload_error(s, "Script compilation exceeded its tick time limit");
-            }
-            s->deadline = 0u;
-            s->running = false;
-            s->stats.last_tick_ms = double(SDL_GetPerformanceCounter() - start) * 1000.0 / s->frequency;
-            return false;
-        }
-        clear_memo_cache(s);
-        retire_async_actions(s);
-        for (auto& timer : s->timers) {
-            JS_FreeValue(s->js, timer.function);
-            timer.function = JS_UNDEFINED;
-            timer.id = 0u;
-        }
+    ext(s)->container_width_count = 0u;
+    ext(s)->needs_container_rebuild = false;
+    const char* vm_err = nullptr;
+    if (!init_vm_context(s, &vm_err)) {
+        record_error(s, vm_err ? vm_err : "Unable to allocate script context");
+        return false;
     }
 
     s->stats.has_error = false;
     s->error[0] = '\0';
     s->pending_state = false;
     s->state_dirty = false;
+    // The fixed framework bootstrap runs in a new, empty VM. Start the
+    // caller's execution budget before installing state or running user JS.
+    const uint64_t start = SDL_GetPerformanceCounter();
+    begin_tick(s);
     const JSValue global = JS_GetGlobalObject(s->js);
-    if (fresh) {
-        JS_SetPropertyStr(s->js, global, "action", JS_NewCFunction(s->js, js_action, "action", 2));
-        JS_SetPropertyStr(s->js, global, "request", JS_NewCFunction(s->js, js_request_async_action, "request", 2));
-        JS_SetPropertyStr(s->js, global, "setTimeout",
-                          JS_NewCFunction(s->js, js_set_timeout, "setTimeout", 2));
-        JS_SetPropertyStr(s->js, global, "clearTimeout",
-                          JS_NewCFunction(s->js, js_clear_timeout, "clearTimeout", 1));
-        JS_SetPropertyStr(s->js, global, "Atomics", JS_UNDEFINED);
-        JS_SetPropertyStr(s->js, global, "SharedArrayBuffer", JS_UNDEFINED);
-        static constexpr char bootstrap[] =
-            "globalThis.__frag=Symbol('frag');"
-            "globalThis.__inlay_hm=Object.create(null);globalThis.__inlay_stk=[];globalThis.__inlay_has_hm=false;"
-            "globalThis.__inlay_seen=Object.create(null);globalThis.__inlay_fx=[];globalThis.__inlay_dirty=false;"
-            "globalThis.__inlay_begin=()=>{globalThis.__inlay_dirty=false;globalThis.__inlay_seen=Object.create(null);"
-            "globalThis.__inlay_fx.length=0;globalThis.__inlay_stk=[{k:'__root',i:0,c:0}];"
-            "globalThis.__inlay_seen.__root=globalThis.__inlay_visit=1;};"
-            "globalThis.__inlay_commit=()=>{if(globalThis.__inlay_has_hm){const hm=globalThis.__inlay_hm,seen=globalThis.__inlay_seen;"
-            "let any=false;for(const k in hm){if(!seen[k]){const a=hm[k];for(let j=0;j<a.length;++j){"
-            "const sl=a[j];if(sl&&sl.__fx&&typeof sl.cl==='function'){try{sl.cl();}catch(_){}}}delete hm[k];}else any=true;}"
-            "globalThis.__inlay_has_hm=any;}const fx=globalThis.__inlay_fx;if(!fx.length)return;"
-            "globalThis.__inlay_fx=[];for(let j=0;j<fx.length;++j){const r=fx[j];if(typeof r.cl==='function')r.cl();"
-            "const cl=r.fn();r.cl=typeof cl==='function'?cl:undefined;}};"
-            "globalThis.h=(tag,props,...children)=>{"
-            "if(tag===globalThis.__frag)return children;"
-            "if(tag===Math)tag='math';"
-            "if(typeof tag==='function'){"
-            "if(tag.__ui)return tag(props||{},...children);"
-            "const stk=globalThis.__inlay_stk,pf=stk.length?stk[stk.length-1]:{k:'__root',i:0,c:0};"
-            "const nm=tag.name||'C',hk=props&&props.key!==undefined&&props.key!==null;"
-            "const sk=pf.k+'/'+(hk?(nm+'#'+String(props.key)):(nm+'@'+(pf.c++)));"
-            "globalThis.__inlay_seen[sk]=++globalThis.__inlay_visit;stk.push({k:sk,i:0,c:0,memo:pf.memo});"
-            "const mp=children.length||!(props&&'children'in props)?Object.assign({},props,{children}):Object.assign({},props);"
-            "try{return tag(mp);}finally{stk.pop();}}"
-            "if(tag==='switch')return{tag:'toggle',props:props||{},children};"
-            "return{tag,props:props||{},children};};"
-            "globalThis.__jsx=globalThis.h;"
-            "(()=>{"
-            "const isP=p=>!!(p&&typeof p==='object'&&!Array.isArray(p)&&typeof p.tag!=='string'),"
-            "mk=f=>{f.__ui=true;return f;},"
-            "m=t=>mk((p,...c)=>isP(p)?h(t,p,...c):((p===undefined||p===null)&&!c.length?h(t,{}):h(t,{},p,...c))),"
-            "x=(t,k='text')=>mk((p,...c)=>typeof p==='string'?h(t,{[k]:p},...c):m(t)(p,...c));"
-            "globalThis.ui={"
-            "box:m('box'),row:m('row'),col:m('col'),card:m('card'),form:m('form'),spacer:m('spacer'),"
-            "text:x('text'),button:x('button'),input:m('input'),toggle:m('toggle'),switch:m('toggle'),"
-            "checkbox:m('checkbox'),tabs:m('tabs'),combobox:m('combobox'),scroll:m('scroll'),"
-            "progress:m('progress'),slider:m('slider'),badge:x('badge'),divider:m('divider'),"
-            "image:m('image'),modal:m('modal'),popover:m('popover'),tooltip:m('tooltip'),"
-            "split:m('split'),math:x('math'),diagram:x('diagram'),slot:x('slot','name'),"
-            "doc:x('doc','markdown'),codeEditor:x('codeEditor','buffer'),terminal:x('terminal','ansi'),virtualList:m('virtualList'),"
-            "table:m('table'),tree:m('tree'),treeItem:x('treeItem','label'),"
-            "menu:m('menu'),contextMenu:m('contextMenu'),avatar:x('avatar','name'),"
-            "toast:x('toast','description'),accordion:x('accordion','title'),skeleton:m('skeleton'),"
-            "h:globalThis.h,fragment:(...c)=>c};"
-            "const G=globalThis;"
-            "G.Box='box';G.Row='row';G.Col='col';G.Card='card';G.Form='form';G.Text='text';"
-            "G.Button='button';G.Input='input';G.Toggle='toggle';G.Switch='switch';"
-            "G.Checkbox='checkbox';G.Tabs='tabs';G.Combobox='combobox';G.Scroll='scroll';"
-            "G.Progress='progress';G.Slider='slider';G.Badge='badge';G.Divider='divider';"
-            "G.Image='image';G.Modal='modal';G.Popover='popover';G.Tooltip='tooltip';"
-            "G.Split='split';G.Spacer='spacer';G.Diagram='diagram';G.Slot='slot';"
-            "G.Doc='doc';G.CodeEditor='codeEditor';G.Terminal='terminal';G.VirtualList='virtualList';G.Table='table';"
-            "G.Tree='tree';G.TreeItem='treeItem';G.Menu='menu';G.ContextMenu='contextMenu';"
-            "G.Avatar='avatar';G.Toast='toast';G.Accordion='accordion';G.Skeleton='skeleton';"
-            "G.Fragment=G.__frag;"
-            "const slot=()=>{const stk=G.__inlay_stk,f=stk.length?stk[stk.length-1]:{k:'__root',i:0,c:0};"
-            "if(f.i===0&&G.__inlay_collect)G.__inlay_collect.push(f.k);"
-            "const hm=G.__inlay_hm;let a=hm[f.k];if(!a){a=hm[f.k]=[];G.__inlay_has_hm=true;}return[a,f.i++];};"
-            "const same=(a,b)=>{if(!a||!b||a.length!==b.length)return false;"
-            "for(let j=0;j<a.length;++j)if(!Object.is(a[j],b[j]))return false;return true;};"
-            "G.useState=init=>{const[a,i]=slot();if(i>=a.length)a[i]=typeof init==='function'?init():init;"
-            "const frame=G.__inlay_stk[G.__inlay_stk.length-1],owner=frame&&frame.memo;"
-            "return[a[i],v=>{const n=typeof v==='function'?v(a[i]):v;"
-            "if(!Object.is(a[i],n)){a[i]=n;for(let m=owner;m;m=m.parent)m.dirty=true;G.__inlay_dirty=true;}}];};"
-            "G.useRef=init=>{const[a,i]=slot();if(i>=a.length)a[i]={current:init};return a[i];};"
-            "G.useMemo=(fn,deps)=>{const[a,i]=slot();"
-            "if(i>=a.length||!deps||!same(a[i].d,deps))a[i]={v:fn(),d:deps?deps.slice():null};return a[i].v;};"
-            "G.useCallback=(fn,deps)=>G.useMemo(()=>fn,deps);"
-            "G.useEffect=(fn,deps)=>{const[a,i]=slot();"
-            "if(i>=a.length){const r={__fx:1,d:deps?deps.slice():null,fn,cl:undefined};a[i]=r;G.__inlay_fx.push(r);}"
-            "else if(!deps||!same(a[i].d,deps)){a[i].d=deps?deps.slice():null;a[i].fn=fn;G.__inlay_fx.push(a[i]);}};})();"
-            R"JS(
-            (() => {
-                const G = globalThis;
-                function equalProps(a, b) {
-                    const keys = Object.keys(a);
-                    if (keys.length !== Object.keys(b).length) return false;
-                    for (const key of keys) {
-                        if (!Object.hasOwn(b, key)) return false;
-                        const x = a[key], y = b[key];
-                        if (Object.is(x, y)) continue;
-                        if (key !== 'children' || !Array.isArray(x) || !Array.isArray(y) ||
-                            x.length !== y.length || !x.every((v, i) => Object.is(v, y[i]))) return false;
-                    }
-                    return true;
-                }
-                let nextMemoKey = 1;
-                G.memo = (component, equal = equalProps) => {
-                    function Memo(props) {
-                        const ref = G.useRef(null);
-                        const cache = ref.current || (ref.current = {id: nextMemoKey++, rev: 0});
-                        const stack = G.__inlay_stk, frame = stack[stack.length - 1];
-                        const collect = G.__inlay_collect;
-                        cache.parent = frame.memo;
-                        if (cache.component === component && !cache.dirty && equal(cache.props, props)) {
-                            for (const key of cache.scopes) {
-                                G.__inlay_seen[key] = ++G.__inlay_visit;
-                                if (collect) collect.push(key);
-                            }
-                            return cache.tree;
-                        }
-                        cache.component = null;
-                        cache.dirty = false;
-                        frame.memo = cache;
-                        const scopes = [];
-                        G.__inlay_collect = scopes;
-                        try {
-                            cache.tree = G.h(component, props);
-                        } finally {
-                            G.__inlay_collect = collect;
-                            frame.memo = cache.parent;
-                        }
-                        // A nested boundary may have unmounted scopes while rendering.
-                        cache.scopes = scopes.filter(k => Object.hasOwn(G.__inlay_seen, k));
-                        if (collect) for (const key of cache.scopes) collect.push(key);
-                        cache.props = props;
-                        cache.component = component;
-                        cache.rev = (cache.rev + 1) >>> 0;
-                        if (cache.tree && typeof cache.tree === 'object' && !Array.isArray(cache.tree) &&
-                            typeof cache.tree.tag === 'string' && Object.isExtensible(cache.tree)) {
-                            Object.defineProperty(cache.tree, '__memoKey', {value: cache.id, configurable: true});
-                            Object.defineProperty(cache.tree, '__memoRev', {value: cache.rev, configurable: true});
-                        }
-                        return cache.tree;
-                    }
-                    Object.defineProperty(Memo, 'name', {value: 'memo(' + component.name + ')'});
-                    return Memo;
-                };
-                function Content(p) { return p.render(); }
-                function Fallback(p) { return p.render(p.error, p.retry); }
-                function ErrorBoundary(p) {
-                    const slot = G.useRef(null);
-                    const [, invalidate] = G.useState(0);
-                    if (!slot.current || !Object.is(slot.current.key, p.resetKey))
-                        slot.current = {key: p.resetKey, failed: false};
-                    const state = slot.current;
-                    if (!state.failed) {
-                        const visit = G.__inlay_visit, effects = G.__inlay_fx.length;
-                        try {
-                            return G.h(Content, {render: p.render});
-                        } catch (error) {
-                            G.__inlay_fx.length = effects;
-                            for (const key in G.__inlay_seen)
-                                if (G.__inlay_seen[key] > visit) delete G.__inlay_seen[key];
-                            state.failed = true;
-                            state.error = error;
-                        }
-                    }
-                    const retry = () => {
-                        if (state !== slot.current || !state.failed) return;
-                        slot.current = null;
-                        invalidate(n => n + 1);
-                    };
-                    return typeof p.fallback === 'function'
-                        ? G.h(Fallback, {render: p.fallback, error: state.error, retry})
-                        : G.ui.text(String(state.error));
-                }
-                G.ErrorBoundary = ErrorBoundary;
-                G.ui.errorBoundary = p => G.h(ErrorBoundary, p);
-                G.ui.errorBoundary.__ui = true;
-            })();
-            )JS";
-        const JSValue bootstrap_result =
-            JS_Eval(s->js, bootstrap, sizeof(bootstrap) - 1u, "<inlay>", JS_EVAL_TYPE_GLOBAL);
-        JS_FreeValue(s->js, bootstrap_result);
-        // The fixed framework bootstrap runs in a new, empty VM. Start the
-        // caller's execution budget before installing state or running user JS.
-        start = SDL_GetPerformanceCounter();
-        begin_tick(s);
-    }
-    JSValue result = JS_UNDEFINED;
     bool ok = !JS_HasException(s->js) && install_state(s, global);
     JS_FreeValue(s->js, global);
     if (ok) {
-        if (fresh) {
-            result = JS_Eval(s->js, s->source, length, filename, JS_EVAL_TYPE_GLOBAL);
-        } else {
-            result = JS_EvalFunction(s->js, compiled);
-            compiled = JS_UNDEFINED;
-        }
+        const JSValue result = JS_Eval(s->js, s->source, length, filename, JS_EVAL_TYPE_GLOBAL);
         ok = !JS_IsException(result);
         if (ok) {
             const JSValue target = JS_GetGlobalObject(s->js);
@@ -4180,7 +4966,6 @@ bool load(InlaySurface* s, EtchStr script, bool is_hmr = false) {
         }
         JS_FreeValue(s->js, result);
     }
-    JS_FreeValue(s->js, compiled);
     if (ok && !JS_HasException(s->js)) ok = rebuild(s, true);
     const bool completed = finish_tick(s, start) && ok;
     s->loaded = completed;
@@ -4914,6 +5699,7 @@ bool inlay_ui_opt_int_prop(InlaySurface* s, JSValueConst obj, const char* name,
 }
 
 uint32_t inlay_ui_register_handler(InlaySurface* s, JSValueConst fn) {
+    auto* e = ext(s);
     if (s->handler_count == s->handler_capacity) {
         uint32_t cap = s->handler_capacity ? s->handler_capacity * 2u : 64u;
         if (cap > s->desc.max_nodes) cap = s->desc.max_nodes;
@@ -4927,10 +5713,17 @@ uint32_t inlay_ui_register_handler(InlaySurface* s, JSValueConst fn) {
             return INLAY_UI_NONE;
         }
         s->handlers = mem;
+        auto* eb = static_cast<TextSlice*>(SDL_realloc(e->handler_eb_keys, size_t(cap) * sizeof(TextSlice)));
+        if (!eb) {
+            JS_ThrowInternalError(s->js, "UI handler allocation failed");
+            return INLAY_UI_NONE;
+        }
+        e->handler_eb_keys = eb;
         s->handler_capacity = cap;
     }
     const uint32_t idx = s->handler_count++;
     s->handlers[idx] = JS_DupValue(s->js, fn);
+    e->handler_eb_keys[idx] = e->cur_eb_key;
     return idx;
 }
 
@@ -4975,6 +5768,9 @@ void inlay_ui_queue_event(InlaySurface* s, WidgetEvents* events, EtchStr name, u
         if (!copy.chars) return;
     }
     *event = {nullptr, copy, payload, handler, is_click};
+    if (ext(s)->draw_eb_key.len > 0u && ext(s)->event_eb_tag_count < kMaxEventBoundaryTags) {
+        ext(s)->event_eb_tags[ext(s)->event_eb_tag_count++] = {event, ext(s)->draw_eb_key};
+    }
     if (events->last) events->last->next = event;
     else events->first = event;
     events->last = event;
@@ -5260,6 +6056,22 @@ void inlay_ui_draw_node(InlaySurface* s, uint32_t index, uint32_t parent,
     }
 
     const uint32_t id = etch_id_index(parent, n.id);
+    const uint32_t prev_draw_path = ext(s)->draw_path_id;
+    const uint32_t cur_draw_path = etch_id_index(prev_draw_path, n.id);
+    ext(s)->draw_path_id = cur_draw_path;
+    if ((st.flags2 & kNf2Container) != 0u) {
+        observe_container_width(s, cur_draw_path, etch_element_bounds(id).w);
+    }
+    const TextSlice prev_draw_eb = ext(s)->draw_eb_key;
+    if (ext(s)->boundary_root_count > 0u) {
+        const auto* e = ext(s);
+        for (uint32_t bi = 0u; bi < e->boundary_root_count; ++bi) {
+            if (e->boundary_roots[bi].node_idx == index) {
+                ext(s)->draw_eb_key = e->boundary_roots[bi].eb_key;
+                break;
+            }
+        }
+    }
     const ColdVisualStyle* cold = inlay_ui_get_cold(s, st);
     const CoreNodeExtra* extra = get_core_extra(s, index);
     const bool dark = inlay_is_dark_theme(theme);
@@ -5441,12 +6253,48 @@ void inlay_ui_draw_node(InlaySurface* s, uint32_t index, uint32_t parent,
                 } else {
                     form_state->show_errors = true;
                     etch_request_redraw(s->etch);
+                    uint32_t first_invalid_id = 0u;
+                    EtchStr first_invalid_name = {};
+                    EtchStr first_invalid_err = {};
+                    uint32_t invalid_count = 0u;
                     for (uint32_t fi = 0u; fi < form_ctx.field_count; ++fi) {
                         if (!form_ctx.fields[fi].valid) {
+                            if (first_invalid_id == 0u) {
+                                first_invalid_id = form_ctx.fields[fi].element_id;
+                                first_invalid_name = form_ctx.fields[fi].name;
+                                first_invalid_err = form_ctx.fields[fi].error;
+                            }
+                            ++invalid_count;
                             EtchA11yOverrideDesc inv_ov = {};
                             inv_ov.element_id = form_ctx.fields[fi].element_id;
                             inv_ov.add_states = uint32_t(ETCH_A11Y_STATE_INVALID);
                             etch_set_a11y_override(&inv_ov);
+                        }
+                    }
+                    if (first_invalid_id != 0u) {
+                        etch_request_focus(first_invalid_id);
+                        char ann_buf[256] = {};
+                        int ann_len = 0;
+                        if (first_invalid_err.length > 0u) {
+                            ann_len = std::snprintf(
+                                ann_buf, sizeof(ann_buf), "Form validation failed (%u): %.*s: %.*s",
+                                invalid_count,
+                                int(first_invalid_name.length),
+                                first_invalid_name.chars ? first_invalid_name.chars : "",
+                                int(first_invalid_err.length),
+                                first_invalid_err.chars ? first_invalid_err.chars : "");
+                        } else {
+                            ann_len = std::snprintf(
+                                ann_buf, sizeof(ann_buf), "Form validation failed (%u): %.*s is invalid",
+                                invalid_count,
+                                int(first_invalid_name.length),
+                                first_invalid_name.chars ? first_invalid_name.chars : "");
+                        }
+                        if (ann_len > 0) {
+                            const uint32_t clamped = ann_len < int(sizeof(ann_buf))
+                                ? static_cast<uint32_t>(ann_len)
+                                : static_cast<uint32_t>(sizeof(ann_buf) - 1u);
+                            etch_a11y_announce({ann_buf, clamped, false}, ETCH_A11Y_LIVE_ASSERTIVE, s->etch, nullptr);
                         }
                     }
                     if (extra && has_event(extra->field_error, extra->invalid_handler)) {
@@ -5859,7 +6707,10 @@ void inlay_ui_draw_node(InlaySurface* s, uint32_t index, uint32_t parent,
                 field_key = fn > 0 ? inlay_ui_frame_text(s, {fb, static_cast<uint32_t>(fn), false}) : ETCH_STR_LIT("field");
             }
             const EtchStr field_val = inlay_ui_frame_text(s, {s->edit_buffer, edit.byte_length, false});
-            active_form->fields[active_form->field_count++] = {id, field_key, field_val, post_valid};
+            const EtchStr field_err = (!post_valid && post_err_str.length > 0u)
+                ? inlay_ui_frame_text(s, post_err_str)
+                : EtchStr{};
+            active_form->fields[active_form->field_count++] = {id, field_key, field_val, field_err, post_valid};
         }
         if (edit.changed && has_event(st.action, st.handler)) {
             inlay_ui_queue_event(s, events, inlay_ui_slice(s, st.action), st.handler,
@@ -6728,6 +7579,8 @@ void inlay_ui_draw_node(InlaySurface* s, uint32_t index, uint32_t parent,
     }
 
     if (use_layer) etch_pop_layer();
+    ext(s)->draw_eb_key = prev_draw_eb;
+    ext(s)->draw_path_id = prev_draw_path;
 }
 
 // ============================================================================
@@ -6786,6 +7639,7 @@ INLAY_API InlaySurface* inlay_surface_create(EtchContext* context, const InlaySu
     JS_SetContextOpaque(s->js, s);
     storage->atom_memo_key = JS_NewAtom(s->js, "__memoKey");
     storage->atom_memo_rev = JS_NewAtom(s->js, "__memoRev");
+    storage->atom_eb_key = JS_NewAtom(s->js, "__ebKey");
     return s;
 }
 
@@ -6798,9 +7652,11 @@ INLAY_API void inlay_surface_destroy(InlaySurface* s) {
     SDL_free(storage->async_actions);
     SDL_free(storage->async_action_names);
     SDL_free(storage->reload_error);
+    SDL_free(storage->bootstrap_bc);
     if (s->runtime) JS_FreeRuntime(s->runtime);
     inlay_ui_free_widget_caches(s);
     SDL_free(s->handlers);
+    SDL_free(storage->handler_eb_keys);
     SDL_free(s->nodes);
     SDL_free(s->styles);
     SDL_free(s->cold_visuals);
@@ -7060,7 +7916,11 @@ static bool bind_content(InlaySurface* s, EtchStr name, InlayUiKind kind, void* 
 }
 
 INLAY_API bool inlay_surface_bind_model(InlaySurface* s, EtchStr name, InlayModel* model) {
-    return bind_content(s, name, INLAY_UI_VIRTUAL_LIST, model);
+    const bool ok = bind_content(s, name, INLAY_UI_VIRTUAL_LIST, model);
+    if (ok && model && !model->bound_ctx) {
+        model->bound_ctx = s->etch;
+    }
+    return ok;
 }
 
 INLAY_API uint64_t inlay_surface_memo_reused_nodes(const InlaySurface* s) {
@@ -7437,7 +8297,8 @@ INLAY_API void inlay_surface_view(InlaySurface* s, const InlaySurfaceViewDesc* i
         }
         if (eff_view_w > 0.f) {
             const bool had_width = ext(s)->has_view_width;
-            const uint8_t prev_bp = responsive_width_bucket(s->last_view_width_px);
+            const float prev_view_w = s->last_view_width_px;
+            const uint8_t prev_bp = responsive_width_bucket(prev_view_w);
             const uint8_t next_bp = responsive_width_bucket(eff_view_w);
             s->last_view_width_px = eff_view_w;
             s->current_container_width_px = eff_view_w;
@@ -7445,6 +8306,9 @@ INLAY_API void inlay_surface_view(InlaySurface* s, const InlaySurfaceViewDesc* i
             if (ext(s)->uses_responsive_cls && (!had_width || prev_bp != next_bp) &&
                 s->js && s->loaded && !s->stats.has_error) {
                 run_update(s, {}, {});
+            } else if (ext(s)->container_width_count > 0u &&
+                       (!had_width || std::fabs(eff_view_w - prev_view_w) > 0.5f)) {
+                etch_request_redraw(s->etch);
             }
         } else if (ext(s)->uses_responsive_cls && !ext(s)->has_view_width) {
             etch_request_redraw(s->etch);
@@ -7477,6 +8341,10 @@ INLAY_API void inlay_surface_view(InlaySurface* s, const InlaySurfaceViewDesc* i
             s->drawing = true;
             s->draw_parent_col = true;
             ext(s)->child_consumed_mask = 0u;
+            ext(s)->draw_path_id = 0u;
+            ext(s)->draw_eb_key = {};
+            ext(s)->event_eb_tag_count = 0u;
+            ext(s)->needs_container_rebuild = false;
             inlay_ui_draw_node(s, 0u, input.id, theme, &events);
             s->drawing = false;
         }
@@ -7521,7 +8389,9 @@ INLAY_API void inlay_surface_view(InlaySurface* s, const InlaySurfaceViewDesc* i
         }
     }
 
-    if ((events.first || s->pending_state || vlist_refill) && s->js && s->loaded && !s->running) {
+    if ((events.first || s->pending_state || vlist_refill || ext(s)->needs_container_rebuild) &&
+        s->js && s->loaded && !s->running) {
+        ext(s)->needs_container_rebuild = false;
         run_batch(s, events.first);
     }
 }

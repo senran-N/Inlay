@@ -25,10 +25,17 @@ struct StreamEntry {
     InlayStreamStatus status;
     float progress;
     uint64_t revision;
+    uint64_t last_cursor;
     OwnedBuf title;
     OwnedBuf body;
     OwnedBuf metadata_json;
+    char utf8_carry[4];
+    uint8_t utf8_carry_len;
 };
+
+inline size_t entry_bytes(const StreamEntry& e) noexcept {
+    return size_t(e.title.len) + size_t(e.body.len) + size_t(e.metadata_json.len) + size_t(e.utf8_carry_len);
+}
 
 void buf_free(OwnedBuf& b) noexcept {
     SDL_free(b.data);
@@ -46,43 +53,77 @@ bool buf_push_bytes(OwnedBuf& b, const char* bytes, uint32_t n) noexcept {
     return true;
 }
 
-bool buf_assign(OwnedBuf& b, EtchStr src) noexcept {
-    if (src.length == 0u) {
-        b.len = 0u;
-        if (b.data) b.data[0] = '\0';
-        return true;
-    }
+bool buf_clone(OwnedBuf& dst, EtchStr src) noexcept {
+    dst = {};
+    if (src.length == 0u) return true;
     if (src.length > kMaxFieldBytes) return false;
-    const uintptr_t p = reinterpret_cast<uintptr_t>(src.chars);
-    const uintptr_t base = reinterpret_cast<uintptr_t>(b.data);
-    const bool overlaps = b.data != nullptr && p >= base && p < base + b.cap;
-    if (overlaps) {
-        if (src.chars != b.data) std::memmove(b.data, src.chars, src.length);
-        b.len = src.length;
-        b.data[b.len] = '\0';
-        return true;
-    }
-    if (!inlay_grow_pod(b.data, b.cap, src.length + 1u, 64u, kMaxFieldBytes + 1u)) return false;
-    std::memcpy(b.data, src.chars, src.length);
-    b.len = src.length;
-    b.data[b.len] = '\0';
+    const uint32_t cap = src.length + 1u;
+    char* mem = static_cast<char*>(SDL_malloc(cap));
+    if (!mem) return false;
+    std::memcpy(mem, src.chars, src.length);
+    mem[src.length] = '\0';
+    dst.data = mem;
+    dst.len = src.length;
+    dst.cap = cap;
     return true;
 }
 
-bool buf_append(OwnedBuf& b, EtchStr delta) noexcept {
-    if (delta.length == 0u) return true;
-    if (delta.length > kMaxFieldBytes - b.len) return false;
-    const uintptr_t p = reinterpret_cast<uintptr_t>(delta.chars);
-    const uintptr_t base = reinterpret_cast<uintptr_t>(b.data);
-    const bool overlaps = b.data != nullptr && p >= base && p < base + b.cap;
-    const size_t rel_off = overlaps ? static_cast<size_t>(p - base) : 0u;
-    const uint32_t needed = b.len + delta.length + 1u;
-    if (!inlay_grow_pod(b.data, b.cap, needed, 128u, kMaxFieldBytes + 1u)) return false;
-    const char* src = overlaps ? (b.data + rel_off) : delta.chars;
-    std::memmove(b.data + b.len, src, delta.length);
-    b.len += delta.length;
-    b.data[b.len] = '\0';
+bool scan_utf8_stream(const char* carry, uint32_t carry_len,
+                      const char* chunk, uint32_t chunk_len,
+                      uint32_t* out_complete_bytes) noexcept {
+    const uint32_t total = carry_len + chunk_len;
+    auto byte_at = [&](uint32_t i) noexcept -> uint8_t {
+        return static_cast<uint8_t>(i < carry_len ? carry[i] : chunk[i - carry_len]);
+    };
+    uint32_t pos = 0u;
+    while (pos < total) {
+        const uint8_t b0 = byte_at(pos);
+        if (b0 < 0x80u) {
+            ++pos;
+            continue;
+        }
+        if (b0 >= 0xC2u && b0 <= 0xDFu) {
+            if (pos + 1u >= total) break;
+            const uint8_t b1 = byte_at(pos + 1u);
+            if ((b1 & 0xC0u) != 0x80u) return false;
+            pos += 2u;
+            continue;
+        }
+        if (b0 >= 0xE0u && b0 <= 0xEFu) {
+            if (pos + 1u >= total) break;
+            const uint8_t b1 = byte_at(pos + 1u);
+            if ((b1 & 0xC0u) != 0x80u) return false;
+            if ((b0 == 0xE0u && b1 < 0xA0u) || (b0 == 0xEDu && b1 >= 0xA0u)) return false;
+            if (pos + 2u >= total) break;
+            const uint8_t b2 = byte_at(pos + 2u);
+            if ((b2 & 0xC0u) != 0x80u) return false;
+            pos += 3u;
+            continue;
+        }
+        if (b0 >= 0xF0u && b0 <= 0xF4u) {
+            if (pos + 1u >= total) break;
+            const uint8_t b1 = byte_at(pos + 1u);
+            if ((b1 & 0xC0u) != 0x80u) return false;
+            if ((b0 == 0xF0u && b1 < 0x90u) || (b0 == 0xF4u && b1 >= 0x90u)) return false;
+            if (pos + 2u >= total) break;
+            const uint8_t b2 = byte_at(pos + 2u);
+            if ((b2 & 0xC0u) != 0x80u) return false;
+            if (pos + 3u >= total) break;
+            const uint8_t b3 = byte_at(pos + 3u);
+            if ((b3 & 0xC0u) != 0x80u) return false;
+            pos += 4u;
+            continue;
+        }
+        return false;
+    }
+    *out_complete_bytes = pos;
     return true;
+}
+
+bool is_valid_utf8_complete(const char* bytes, uint32_t len) noexcept {
+    if (len == 0u) return true;
+    uint32_t complete = 0u;
+    return scan_utf8_stream(nullptr, 0u, bytes, len, &complete) && complete == len;
 }
 
 inline EtchStr buf_view(const OwnedBuf& b) noexcept {
@@ -93,6 +134,8 @@ void entry_free(StreamEntry& e) noexcept {
     buf_free(e.title);
     buf_free(e.body);
     buf_free(e.metadata_json);
+    std::memset(e.utf8_carry, 0, sizeof(e.utf8_carry));
+    e.utf8_carry_len = 0u;
 }
 
 void fill_public_item(const StreamEntry& e, InlayStreamItem* out) noexcept {
@@ -508,6 +551,7 @@ bool parse_stream_item(JsonScanner& sc, StreamEntry& e) noexcept {
     if (!sc.consume('{')) return false;
     e = {};
     e.revision = 1u;
+    e.last_cursor = UINT64_MAX;
     bool has_id = false;
     char c = '\0';
     if (sc.peek(&c) && c == '}') {
@@ -547,6 +591,10 @@ bool parse_stream_item(JsonScanner& sc, StreamEntry& e) noexcept {
             uint64_t v = 0u;
             if (!sc.parse_u64(&v)) return false;
             e.revision = v;
+        } else if (key_eq(key, klen, "lastCursor")) {
+            uint64_t v = 0u;
+            if (!sc.parse_u64(&v)) return false;
+            e.last_cursor = v;
         } else if (key_eq(key, klen, "title")) {
             if (!sc.parse_string_into(e.title)) return false;
         } else if (key_eq(key, klen, "body")) {
@@ -567,7 +615,39 @@ bool parse_stream_item(JsonScanner& sc, StreamEntry& e) noexcept {
         }
         return false;
     }
-    return has_id && e.id != 0u;
+    if (!has_id || e.id == 0u) return false;
+    if (!is_valid_utf8_complete(e.title.data, e.title.len) ||
+        !is_valid_utf8_complete(e.body.data, e.body.len) ||
+        !is_valid_utf8_complete(e.metadata_json.data, e.metadata_json.len)) {
+        return false;
+    }
+    return true;
+}
+
+void write_stream_entry_json(JsonWriter& w, const StreamEntry& e) noexcept {
+    w.put_lit("{\"id\":");
+    w.put_u64(e.id);
+    w.put_lit(",\"messageId\":");
+    w.put_u64(e.message_id);
+    w.put_lit(",\"role\":");
+    w.put_u32(static_cast<uint32_t>(e.role));
+    w.put_lit(",\"kind\":");
+    w.put_u32(static_cast<uint32_t>(e.kind));
+    w.put_lit(",\"status\":");
+    w.put_u32(static_cast<uint32_t>(e.status));
+    w.put_lit(",\"progress\":");
+    w.put_float(e.progress);
+    w.put_lit(",\"revision\":");
+    w.put_u64(e.revision);
+    w.put_lit(",\"lastCursor\":");
+    w.put_u64(e.last_cursor);
+    w.put_lit(",\"title\":");
+    w.put_json_str(e.title);
+    w.put_lit(",\"body\":");
+    w.put_json_str(e.body);
+    w.put_lit(",\"metadata\":");
+    w.put_json_str(e.metadata_json);
+    w.put_char('}');
 }
 
 } // namespace
@@ -577,6 +657,8 @@ struct InlayStream {
     uint32_t count;
     uint32_t cap;
     uint64_t cursor;
+    size_t max_bytes;
+    size_t total_bytes;
 };
 
 namespace {
@@ -589,6 +671,7 @@ void clear_stream_entries(InlayStream& st) noexcept {
     st.items = nullptr;
     st.count = 0u;
     st.cap = 0u;
+    st.total_bytes = 0u;
 }
 
 uint32_t find_index(const InlayStream* s, uint64_t id) noexcept {
@@ -596,6 +679,26 @@ uint32_t find_index(const InlayStream* s, uint64_t id) noexcept {
         if (s->items[i].id == id) return i;
     }
     return UINT32_MAX;
+}
+
+uint32_t evict_oldest_except(InlayStream* s, uint32_t keep_idx) noexcept {
+    if (s->max_bytes == 0u || s->total_bytes <= s->max_bytes) return 0u;
+    uint32_t write_idx = 0u;
+    uint32_t evicted = 0u;
+    for (uint32_t i = 0u; i < s->count; ++i) {
+        if (i != keep_idx && s->total_bytes > s->max_bytes) {
+            s->total_bytes -= entry_bytes(s->items[i]);
+            entry_free(s->items[i]);
+            ++evicted;
+        } else {
+            if (write_idx != i) {
+                s->items[write_idx] = s->items[i];
+            }
+            ++write_idx;
+        }
+    }
+    s->count = write_idx;
+    return evicted;
 }
 
 } // namespace
@@ -612,6 +715,16 @@ INLAY_API void inlay_stream_destroy(InlayStream* s) {
     SDL_free(s);
 }
 
+INLAY_API void inlay_stream_set_max_bytes(InlayStream* s, size_t max_bytes) {
+    if (!s) return;
+    s->max_bytes = max_bytes;
+    if (s->max_bytes > 0u && s->total_bytes > s->max_bytes) {
+        if (evict_oldest_except(s, UINT32_MAX) > 0u) {
+            ++s->cursor;
+        }
+    }
+}
+
 INLAY_API bool inlay_stream_upsert(InlayStream* s, const InlayStreamItem* item) {
     if (!s || !item || item->id == 0u) return false;
     if ((!item->title.chars && item->title.length > 0u) ||
@@ -619,21 +732,66 @@ INLAY_API bool inlay_stream_upsert(InlayStream* s, const InlayStreamItem* item) 
         (!item->metadata_json.chars && item->metadata_json.length > 0u)) {
         return false;
     }
+    if (item->title.length > kMaxFieldBytes ||
+        item->body.length > kMaxFieldBytes ||
+        item->metadata_json.length > kMaxFieldBytes) {
+        return false;
+    }
     if (static_cast<uint32_t>(item->role) > static_cast<uint32_t>(INLAY_STREAM_ROLE_SYSTEM) ||
         static_cast<uint32_t>(item->kind) > static_cast<uint32_t>(INLAY_STREAM_ITEM_PROGRESS) ||
         static_cast<uint32_t>(item->status) > static_cast<uint32_t>(INLAY_STREAM_STATUS_CANCELLED)) {
         return false;
     }
-    const float progress = std::isfinite(item->progress) ? item->progress : 0.f;
+    if (!is_valid_utf8_complete(item->title.chars, item->title.length) ||
+        !is_valid_utf8_complete(item->body.chars, item->body.length) ||
+        !is_valid_utf8_complete(item->metadata_json.chars, item->metadata_json.length)) {
+        return false;
+    }
 
+    const size_t new_bytes = size_t(item->title.length) + size_t(item->body.length) + size_t(item->metadata_json.length);
+    if (s->max_bytes > 0u && new_bytes > s->max_bytes) {
+        return false;
+    }
+
+    const float progress = std::isfinite(item->progress) ? item->progress : 0.f;
     const uint32_t existing = find_index(s, item->id);
+
+    uint32_t evict_count = 0u;
+    if (existing == UINT32_MAX) {
+        if (s->max_bytes > 0u) {
+            const size_t budget_for_kept = s->max_bytes - new_bytes;
+            size_t kept_bytes = s->total_bytes;
+            while (evict_count < s->count && kept_bytes > budget_for_kept) {
+                kept_bytes -= entry_bytes(s->items[evict_count]);
+                ++evict_count;
+            }
+        }
+        if ((s->count - evict_count) + 1u > kMaxStreamItems) return false;
+    }
+
+    OwnedBuf new_title = {};
+    OwnedBuf new_body = {};
+    OwnedBuf new_meta = {};
+    if (!buf_clone(new_title, item->title) ||
+        !buf_clone(new_body, item->body) ||
+        !buf_clone(new_meta, item->metadata_json)) {
+        buf_free(new_title);
+        buf_free(new_body);
+        buf_free(new_meta);
+        return false;
+    }
+
     if (existing != UINT32_MAX) {
         StreamEntry& e = s->items[existing];
-        if (!buf_assign(e.title, item->title) ||
-            !buf_assign(e.body, item->body) ||
-            !buf_assign(e.metadata_json, item->metadata_json)) {
-            return false;
-        }
+        const size_t old_bytes = entry_bytes(e);
+        buf_free(e.title);
+        buf_free(e.body);
+        buf_free(e.metadata_json);
+        e.title = new_title;
+        e.body = new_body;
+        e.metadata_json = new_meta;
+        std::memset(e.utf8_carry, 0, sizeof(e.utf8_carry));
+        e.utf8_carry_len = 0u;
         e.message_id = item->message_id;
         e.role = item->role;
         e.kind = item->kind;
@@ -641,10 +799,34 @@ INLAY_API bool inlay_stream_upsert(InlayStream* s, const InlayStreamItem* item) 
         e.progress = progress;
         ++e.revision;
         ++s->cursor;
+        e.last_cursor = s->cursor;
+        s->total_bytes = (s->total_bytes - old_bytes) + new_bytes;
+        if (s->max_bytes > 0u && s->total_bytes > s->max_bytes) {
+            evict_oldest_except(s, existing);
+        }
         return true;
     }
 
-    if (!inlay_grow_pod(s->items, s->cap, s->count + 1u, 16u, kMaxStreamItems)) return false;
+    const uint32_t final_count = (s->count - evict_count) + 1u;
+    if (final_count > s->cap && !inlay_grow_pod(s->items, s->cap, final_count, 16u, kMaxStreamItems)) {
+        buf_free(new_title);
+        buf_free(new_body);
+        buf_free(new_meta);
+        return false;
+    }
+
+    if (evict_count > 0u) {
+        for (uint32_t i = 0u; i < evict_count; ++i) {
+            s->total_bytes -= entry_bytes(s->items[i]);
+            entry_free(s->items[i]);
+        }
+        const uint32_t remain = s->count - evict_count;
+        if (remain > 0u) {
+            std::memmove(&s->items[0], &s->items[evict_count], size_t(remain) * sizeof(StreamEntry));
+        }
+        s->count = remain;
+    }
+
     StreamEntry fresh = {};
     fresh.id = item->id;
     fresh.message_id = item->message_id;
@@ -653,14 +835,13 @@ INLAY_API bool inlay_stream_upsert(InlayStream* s, const InlayStreamItem* item) 
     fresh.status = item->status;
     fresh.progress = progress;
     fresh.revision = 1u;
-    if (!buf_assign(fresh.title, item->title) ||
-        !buf_assign(fresh.body, item->body) ||
-        !buf_assign(fresh.metadata_json, item->metadata_json)) {
-        entry_free(fresh);
-        return false;
-    }
-    s->items[s->count++] = fresh;
     ++s->cursor;
+    fresh.last_cursor = s->cursor;
+    fresh.title = new_title;
+    fresh.body = new_body;
+    fresh.metadata_json = new_meta;
+    s->items[s->count++] = fresh;
+    s->total_bytes += new_bytes;
     return true;
 }
 
@@ -669,9 +850,64 @@ INLAY_API bool inlay_stream_append_body(InlayStream* s, uint64_t id, EtchStr del
     const uint32_t idx = find_index(s, id);
     if (idx == UINT32_MAX) return false;
     StreamEntry& e = s->items[idx];
-    if (!buf_append(e.body, delta_utf8)) return false;
+
+    const uint32_t carry_len = static_cast<uint32_t>(e.utf8_carry_len);
+    const uint32_t existing_body_total = e.body.len + carry_len;
+    if (existing_body_total > kMaxFieldBytes || delta_utf8.length > kMaxFieldBytes - existing_body_total) {
+        return false;
+    }
+
+    uint32_t complete = 0u;
+    if (!scan_utf8_stream(e.utf8_carry, carry_len, delta_utf8.chars, delta_utf8.length, &complete)) {
+        return false;
+    }
+
+    const uint32_t total_in = carry_len + delta_utf8.length;
+    const uint32_t new_carry_len = total_in - complete;
+    const size_t old_entry_bytes = entry_bytes(e);
+    const size_t new_entry_bytes = size_t(e.title.len) + size_t(e.body.len) + size_t(complete) +
+                                   size_t(new_carry_len) + size_t(e.metadata_json.len);
+    if (s->max_bytes > 0u && new_entry_bytes > s->max_bytes) {
+        return false;
+    }
+
+    char new_carry[4] = {};
+    for (uint32_t i = 0u; i < new_carry_len; ++i) {
+        const uint32_t at = complete + i;
+        new_carry[i] = (at < carry_len) ? e.utf8_carry[at] : delta_utf8.chars[at - carry_len];
+    }
+
+    if (complete > 0u) {
+        const uint32_t chunk_take = complete - carry_len;
+        const uintptr_t p = reinterpret_cast<uintptr_t>(delta_utf8.chars);
+        const uintptr_t base = reinterpret_cast<uintptr_t>(e.body.data);
+        const bool overlaps = chunk_take > 0u && e.body.data != nullptr && p >= base && p < base + e.body.cap;
+        const size_t rel_off = overlaps ? static_cast<size_t>(p - base) : 0u;
+        const uint32_t needed = e.body.len + complete + 1u;
+        if (!inlay_grow_pod(e.body.data, e.body.cap, needed, 128u, kMaxFieldBytes + 1u)) {
+            return false;
+        }
+        const char* chunk_src = overlaps ? (e.body.data + rel_off) : delta_utf8.chars;
+        if (carry_len > 0u) {
+            std::memcpy(e.body.data + e.body.len, e.utf8_carry, carry_len);
+        }
+        if (chunk_take > 0u) {
+            std::memmove(e.body.data + e.body.len + carry_len, chunk_src, chunk_take);
+        }
+        e.body.len += complete;
+        e.body.data[e.body.len] = '\0';
+    }
+
+    std::memcpy(e.utf8_carry, new_carry, sizeof(e.utf8_carry));
+    e.utf8_carry_len = static_cast<uint8_t>(new_carry_len);
     ++e.revision;
     ++s->cursor;
+    e.last_cursor = s->cursor;
+    s->total_bytes = (s->total_bytes - old_entry_bytes) + new_entry_bytes;
+
+    if (s->max_bytes > 0u && s->total_bytes > s->max_bytes) {
+        evict_oldest_except(s, idx);
+    }
     return true;
 }
 
@@ -679,6 +915,7 @@ INLAY_API bool inlay_stream_remove(InlayStream* s, uint64_t id) {
     if (!s || id == 0u) return false;
     const uint32_t idx = find_index(s, id);
     if (idx == UINT32_MAX) return false;
+    s->total_bytes -= entry_bytes(s->items[idx]);
     entry_free(s->items[idx]);
     const uint32_t tail = s->count - idx - 1u;
     if (tail > 0u) {
@@ -722,28 +959,31 @@ INLAY_API uint32_t inlay_stream_export_json(const InlayStream* s, char* out_buf,
     w.put_lit(",\"items\":[");
     for (uint32_t i = 0u; i < s->count; ++i) {
         if (i > 0u) w.put_char(',');
+        write_stream_entry_json(w, s->items[i]);
+    }
+    w.put_lit("]}");
+    return w.finish();
+}
+
+INLAY_API uint32_t inlay_stream_export_since_json(const InlayStream* s, uint64_t since_cursor,
+                                                  char* out_buf, uint32_t cap) {
+    if (!s) {
+        if (out_buf && cap > 0u) out_buf[0] = '\0';
+        return 0u;
+    }
+    JsonWriter w = {out_buf, cap, 0u};
+    w.put_lit("{\"cursor\":");
+    w.put_u64(s->cursor);
+    w.put_lit(",\"since\":");
+    w.put_u64(since_cursor);
+    w.put_lit(",\"items\":[");
+    bool first = true;
+    for (uint32_t i = 0u; i < s->count; ++i) {
         const StreamEntry& e = s->items[i];
-        w.put_lit("{\"id\":");
-        w.put_u64(e.id);
-        w.put_lit(",\"messageId\":");
-        w.put_u64(e.message_id);
-        w.put_lit(",\"role\":");
-        w.put_u32(static_cast<uint32_t>(e.role));
-        w.put_lit(",\"kind\":");
-        w.put_u32(static_cast<uint32_t>(e.kind));
-        w.put_lit(",\"status\":");
-        w.put_u32(static_cast<uint32_t>(e.status));
-        w.put_lit(",\"progress\":");
-        w.put_float(e.progress);
-        w.put_lit(",\"revision\":");
-        w.put_u64(e.revision);
-        w.put_lit(",\"title\":");
-        w.put_json_str(e.title);
-        w.put_lit(",\"body\":");
-        w.put_json_str(e.body);
-        w.put_lit(",\"metadata\":");
-        w.put_json_str(e.metadata_json);
-        w.put_char('}');
+        if (e.last_cursor <= since_cursor) continue;
+        if (!first) w.put_char(',');
+        first = false;
+        write_stream_entry_json(w, e);
     }
     w.put_lit("]}");
     return w.finish();
@@ -755,6 +995,7 @@ INLAY_API bool inlay_stream_import_json(InlayStream* s, EtchStr json) {
     if (!sc.consume('{')) return false;
 
     InlayStream tmp = {};
+    tmp.max_bytes = s->max_bytes;
     bool has_items = false;
     bool ok = true;
     char c = '\0';
@@ -791,13 +1032,17 @@ INLAY_API bool inlay_stream_import_json(InlayStream* s, EtchStr json) {
                             ok = false;
                             break;
                         }
+                        const size_t item_bytes = entry_bytes(entry);
                         if (find_index(&tmp, entry.id) != UINT32_MAX ||
+                            (tmp.max_bytes > 0u &&
+                             (item_bytes > tmp.max_bytes || tmp.total_bytes > tmp.max_bytes - item_bytes)) ||
                             !inlay_grow_pod(tmp.items, tmp.cap, tmp.count + 1u, 16u, kMaxStreamItems)) {
                             entry_free(entry);
                             ok = false;
                             break;
                         }
                         tmp.items[tmp.count++] = entry;
+                        tmp.total_bytes += item_bytes;
                         if (!sc.peek(&c)) {
                             ok = false;
                             break;
@@ -847,6 +1092,12 @@ INLAY_API bool inlay_stream_import_json(InlayStream* s, EtchStr json) {
     if (!ok) {
         clear_stream_entries(tmp);
         return false;
+    }
+
+    for (uint32_t i = 0u; i < tmp.count; ++i) {
+        if (tmp.items[i].last_cursor == UINT64_MAX) {
+            tmp.items[i].last_cursor = tmp.cursor;
+        }
     }
 
     clear_stream_entries(*s);

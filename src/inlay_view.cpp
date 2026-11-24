@@ -3186,6 +3186,195 @@ void emit_inline_markdown_slice(const InlayMeasure* m, EtchStr source, uint32_t 
  }
 }
 
+void md_out_write_html_escaped(MdOut* out, const char* s, uint32_t n) noexcept {
+ uint32_t run = 0u;
+ for (uint32_t i = 0u; i < n; ++i) {
+  const char* rep = nullptr;
+  switch (s[i]) {
+   case '&': rep = "&amp;"; break;
+   case '<': rep = "&lt;"; break;
+   case '>': rep = "&gt;"; break;
+   case '"': rep = "&quot;"; break;
+   default: break;
+  }
+  if (rep) {
+   if (i > run) out->write(s + run, i - run);
+   out->write_lit(rep);
+   run = i + 1u;
+  }
+ }
+ if (n > run) out->write(s + run, n - run);
+}
+
+void emit_inline_html_slice(const InlayMeasure* m, EtchStr source, uint32_t line_src_a, uint32_t line_src_b,
+                            uint32_t local_lo, uint32_t local_hi, bool table, MdOut* out) noexcept {
+ uint32_t low = 0u, high = m->token_count;
+ while (low < high) {
+  const uint32_t mid = low + (high - low) / 2u;
+  if (m->tokens[mid].offset + m->tokens[mid].length <= line_src_a) low = mid + 1u; else high = mid;
+ }
+ uint32_t pcur = 0u;
+ for (uint32_t i = low; i < m->token_count && m->tokens[i].offset < line_src_b; ++i) {
+  const auto& t = m->tokens[i];
+  const uint32_t a = t.offset > line_src_a ? t.offset : line_src_a;
+  const uint32_t b = t.offset + t.length < line_src_b ? t.offset + t.length : line_src_b;
+  if (b <= a) continue;
+  const uint32_t plen = table ? table_text_copy(source.chars + a, b - a, nullptr) : (b - a);
+  const uint32_t ov_lo = local_lo > pcur ? local_lo : pcur;
+  const uint32_t ov_hi = local_hi < pcur + plen ? local_hi : (pcur + plen);
+  if (ov_hi > ov_lo) {
+   const bool link = (t.flags & InlayInlineLink) != 0u;
+   const bool bold = (t.flags & InlayInlineBold) != 0u;
+   const bool em = (t.flags & InlayInlineEmphasis) != 0u;
+   const bool strike = (t.flags & InlayInlineStrike) != 0u;
+   const bool hl = (t.flags & InlayInlineHighlight) != 0u;
+   const bool code = (t.flags & InlayInlineCode) != 0u;
+   const bool math = (t.flags & InlayInlineMath) != 0u;
+   const bool fn = (t.flags & InlayInlineFootnote) != 0u;
+   const bool img = (t.flags & InlayInlineImage) != 0u;
+   if (img && ov_lo == pcur && ov_hi == pcur + plen) {
+    out->write_lit("<img src=\"");
+    const EtchStr src_u = slice(source, t.url_offset, t.url_length);
+    md_out_write_html_escaped(out, src_u.chars, src_u.length);
+    out->write_lit("\" alt=\"");
+    md_out_write_html_escaped(out, source.chars + a, b - a);
+    out->write_lit("\">");
+    pcur += plen;
+    continue;
+   }
+   if (link) {
+    out->write_lit("<a href=\"");
+    const EtchStr url = (t.flags & InlayInlineUrlInPool)
+     ? EtchStr{m->doc->ast_text + t.url_offset, t.url_length, false}
+     : slice(source, t.url_offset, t.url_length);
+    md_out_write_html_escaped(out, url.chars, url.length);
+    out->write_lit("\">");
+   }
+   if (bold) out->write_lit("<strong>");
+   if (em) out->write_lit("<em>");
+   if (strike) out->write_lit("<del>");
+   if (hl) out->write_lit("<mark>");
+   if (code) out->write_lit("<code>");
+   if (math) out->write_lit("<span class=\"math\">");
+   if (fn) out->write_lit("<sup>");
+   if (table) {
+    uint32_t ti = 0u;
+    const uint32_t want_lo = ov_lo - pcur;
+    const uint32_t want_hi = ov_hi - pcur;
+    for (uint32_t k = a; k < b; ++k) {
+     if (source.chars[k] == '\\' && k + 1u < b) {
+      if (source.chars[k + 1u] == '|') {
+       ++k;
+      } else if (source.chars[k + 1u] == '\\') {
+       if (ti >= want_lo && ti < want_hi) md_out_write_html_escaped(out, source.chars + k, 1u);
+       ++ti;
+       ++k;
+      }
+     }
+     if (ti >= want_lo && ti < want_hi) md_out_write_html_escaped(out, source.chars + k, 1u);
+     ++ti;
+    }
+   } else {
+    const uint32_t sub_a = a + (ov_lo - pcur);
+    const uint32_t sub_n = ov_hi - ov_lo;
+    md_out_write_html_escaped(out, source.chars + sub_a, sub_a + sub_n <= b ? sub_n : (b - sub_a));
+   }
+   if (fn) out->write_lit("</sup>");
+   if (math) out->write_lit("</span>");
+   if (code) out->write_lit("</code>");
+   if (hl) out->write_lit("</mark>");
+   if (strike) out->write_lit("</del>");
+   if (em) out->write_lit("</em>");
+   if (bold) out->write_lit("</strong>");
+   if (link) out->write_lit("</a>");
+  }
+  pcur += plen;
+ }
+}
+
+void emit_row_inline_html(const InlayDoc* doc, const InlayMeasure* m, EtchStr source,
+                          const InlayRow& row, const InlayBlock& blk,
+                          uint32_t ov_lo, uint32_t ov_hi, MdOut* out) noexcept {
+ if (blk.kind == INLAY_DETAILS) {
+  const auto& range = m->details[row.block];
+  const uint32_t s = row.offset > range.body ? row.offset : range.body;
+  const uint32_t e = row.offset + row.length < range.end ? row.offset + row.length : range.end;
+  uint32_t pos = s;
+  uint32_t row_pcur = 0u;
+  bool first_line = true;
+  while (pos < e) {
+   uint32_t next = pos;
+   while (next < e && source.chars[next] != '\n') ++next;
+   if (!first_line) {
+    if (row_pcur >= ov_lo && row_pcur < ov_hi) out->write_lit("\n");
+    ++row_pcur;
+   }
+   first_line = false;
+   const uint32_t need = extract_inline_range_plain(m, source, pos, next, false, nullptr);
+   if (need > 0u) {
+    const uint32_t l_lo = ov_lo > row_pcur ? (ov_lo - row_pcur) : 0u;
+    const uint32_t l_hi = ov_hi < row_pcur + need ? (ov_hi - row_pcur) : need;
+    if (l_hi > l_lo) emit_inline_html_slice(m, source, pos, next, l_lo, l_hi, false, out);
+    row_pcur += need;
+   }
+   pos = next < e ? next + 1u : e;
+  }
+  return;
+ }
+ uint32_t pos = row.offset;
+ const uint32_t end = pos + row.length;
+ uint32_t row_pcur = 0u;
+ bool first_line = true;
+ while (pos < end) {
+  uint32_t next = pos;
+  while (next < end && source.chars[next] != '\n') ++next;
+  uint32_t logical = pos, logical_end = next;
+  if (logical_end > logical && source.chars[logical_end - 1u] == '\r') --logical_end;
+  uint32_t content_start = blk.offset;
+  if (blk.quote_depth > 0u) {
+   content_start += strip_quote_prefix(source.chars + content_start, source.length - content_start, blk.quote_depth);
+  }
+  if (blk.kind == INLAY_HEADING || blk.kind == INLAY_FOOTNOTE) content_start = blk.content_offset;
+  const bool continuation = pos > content_start && pos > 0u && source.chars[pos - 1u] != '\n';
+  if (!first_line) {
+   if (row_pcur >= ov_lo && row_pcur < ov_hi) out->write_lit("\n");
+   ++row_pcur;
+  }
+  first_line = false;
+  EtchStr line = slice(source, logical, logical_end - logical);
+  if (!continuation && blk.quote_depth > 0u) {
+   const uint32_t qskip = strip_quote_prefix(line.chars, line.length, blk.quote_depth);
+   line.chars += qskip;
+   line.length -= qskip;
+  }
+  if (blk.kind == INLAY_ALERT && !continuation && line.length >= 3u && line.chars[0] == '[' && line.chars[1] == '!') {
+   pos = next < end ? next + 1u : end;
+   continue;
+  }
+  if ((blk.kind == INLAY_LIST || blk.kind == INLAY_TASK_LIST) && !continuation) {
+   const InlayListItemMeta* meta = (row.list_item_index != UINT32_MAX && row.list_item_index < doc->list_item_count)
+    ? &doc->list_items[row.list_item_index] : nullptr;
+   uint32_t trim = 0u;
+   strip_list_marker(&line, meta, nullptr, nullptr, nullptr, &trim);
+   line.chars += trim;
+   line.length -= trim;
+  }
+  const uint32_t off = uint32_t(line.chars - source.chars);
+  const uint32_t r_start = pos > off ? pos : off;
+  const uint32_t r_end = logical_end < off + line.length ? logical_end : (off + line.length);
+  if (r_end > r_start) {
+   const uint32_t need = extract_inline_range_plain(m, source, r_start, r_end, false, nullptr);
+   if (need > 0u) {
+    const uint32_t l_lo = ov_lo > row_pcur ? (ov_lo - row_pcur) : 0u;
+    const uint32_t l_hi = ov_hi < row_pcur + need ? (ov_hi - row_pcur) : need;
+    if (l_hi > l_lo) emit_inline_html_slice(m, source, r_start, r_end, l_lo, l_hi, false, out);
+    row_pcur += need;
+   }
+  }
+  pos = next < end ? next + 1u : end;
+ }
+}
+
 } // namespace
 
 extern "C" {
@@ -3301,6 +3490,48 @@ INLAY_API InlayDocSelection inlay_doc_view_find_text(
   ++pos;
  }
  return {0u, 0u, m->plain_len, false};
+}
+
+INLAY_API uint32_t inlay_doc_view_find_all(
+ const InlayDoc* doc, uint32_t view_id, EtchStr query, InlayDocSelection* out_matches, uint32_t max_matches) {
+ const InlayMeasure* m = find_view(doc, view_id);
+ if (!m || m->revision != doc->revision || !query.chars || !query.length || query.length > m->plain_len) {
+  return 0u;
+ }
+ const auto lo_ch = [](uint8_t c) noexcept -> uint8_t {
+  return (c >= 'A' && c <= 'Z') ? uint8_t(c + ('a' - 'A')) : c;
+ };
+ const uint8_t first_lo = lo_ch(static_cast<uint8_t>(query.chars[0]));
+ const uint32_t last_start = m->plain_len - query.length;
+ uint32_t total = 0u;
+ uint32_t pos = 0u;
+ while (pos <= last_start) {
+  if (lo_ch(static_cast<uint8_t>(m->plain_text[pos])) != first_lo) {
+   ++pos;
+   continue;
+  }
+  const uint32_t end = pos + query.length;
+  if (utf8_clamp(m->plain_text, m->plain_len, pos) == pos &&
+      utf8_clamp(m->plain_text, m->plain_len, end) == end) {
+   bool matched = true;
+   for (uint32_t k = 1u; k < query.length; ++k) {
+    if (lo_ch(static_cast<uint8_t>(m->plain_text[pos + k])) != lo_ch(static_cast<uint8_t>(query.chars[k]))) {
+     matched = false;
+     break;
+    }
+   }
+   if (matched) {
+    if (out_matches && total < max_matches) {
+     out_matches[total] = {pos, end, m->plain_len, true};
+    }
+    ++total;
+    pos = end;
+    continue;
+   }
+  }
+  ++pos;
+ }
+ return total;
 }
 
 INLAY_API bool inlay_doc_view_reveal_text(
@@ -3463,6 +3694,177 @@ INLAY_API uint32_t inlay_doc_view_copy_markdown(const InlayDoc* doc, uint32_t vi
  return out.len;
 }
 
+INLAY_API uint32_t inlay_doc_view_copy_html(const InlayDoc* doc, uint32_t view_id, char* out_buf, uint32_t cap) {
+ const InlayMeasure* m = find_view(doc, view_id);
+ if (!m || m->revision != doc->revision || !m->doc_sel_active || m->doc_sel_anchor == m->doc_sel_focus || !m->plain_text) {
+  if (out_buf && cap > 0u) out_buf[0] = 0;
+  return 0u;
+ }
+ const uint32_t lo = utf8_clamp(m->plain_text, m->plain_len, m->doc_sel_anchor < m->doc_sel_focus ? m->doc_sel_anchor : m->doc_sel_focus);
+ const uint32_t hi = utf8_clamp(m->plain_text, m->plain_len, m->doc_sel_anchor > m->doc_sel_focus ? m->doc_sel_anchor : m->doc_sel_focus);
+ if (hi <= lo) {
+  if (out_buf && cap > 0u) out_buf[0] = 0;
+  return 0u;
+ }
+ enum OpenHtmlBlk : uint8_t {
+  HtmlBlkNone = 0u,
+  HtmlBlkHeading,
+  HtmlBlkPara,
+  HtmlBlkCode,
+  HtmlBlkQuote,
+  HtmlBlkUl,
+  HtmlBlkOl,
+  HtmlBlkTable
+ };
+ MdOut out = {out_buf, cap, 0u};
+ const EtchStr source = doc_source_str(doc);
+ uint32_t prev_blk = UINT32_MAX;
+ OpenHtmlBlk open_blk = HtmlBlkNone;
+ uint32_t open_heading_lvl = 1u;
+ bool li_open = false;
+
+ const auto close_open_block = [&]() noexcept {
+  if (li_open) {
+   out.write_lit("</li>\n");
+   li_open = false;
+  }
+  switch (open_blk) {
+   case HtmlBlkHeading: {
+    const char ch[5] = {'<', '/', 'h', char('0' + open_heading_lvl), '>'};
+    out.write(ch, 5u);
+    break;
+   }
+   case HtmlBlkPara:  out.write_lit("</p>"); break;
+   case HtmlBlkCode:  out.write_lit("</code></pre>"); break;
+   case HtmlBlkQuote: out.write_lit("</p></blockquote>"); break;
+   case HtmlBlkUl:    out.write_lit("</ul>"); break;
+   case HtmlBlkOl:    out.write_lit("</ol>"); break;
+   case HtmlBlkTable: out.write_lit("</table>"); break;
+   case HtmlBlkNone:  break;
+  }
+  open_blk = HtmlBlkNone;
+ };
+
+ for (uint32_t r = 0u; r < m->count; ++r) {
+  const auto& row = m->rows[r];
+  if (row.doc_text_length == 0u || row.block >= doc->block_count) continue;
+  const uint32_t r_lo = row.doc_text_offset;
+  const uint32_t r_hi = r_lo + row.doc_text_length;
+  if (r_hi <= lo || r_lo >= hi) continue;
+  const uint32_t ov_lo = lo > r_lo ? (lo - r_lo) : 0u;
+  const uint32_t ov_hi = hi < r_hi ? (hi - r_lo) : row.doc_text_length;
+  const auto& blk = doc->blocks[row.block];
+  const bool new_blk = row.block != prev_blk;
+  const bool sep_nl = !new_blk && row.offset > 0u &&
+   ((blk.flags & INLAY_BLOCK_FLAG_SYNTHETIC)
+     ? (doc->ast_text[doc->block_meta[row.block].pool_offset + row.offset - 1u] == '\n')
+     : (source.chars[row.offset - 1u] == '\n'));
+
+  if (new_blk) {
+   if (open_blk != HtmlBlkNone) {
+    close_open_block();
+    out.write_lit("\n");
+   }
+   prev_blk = row.block;
+   if (blk.kind == INLAY_HEADING) {
+    open_heading_lvl = blk.level < 1u ? 1u : (blk.level > 6u ? 6u : blk.level);
+    const char oh[4] = {'<', 'h', char('0' + open_heading_lvl), '>'};
+    out.write(oh, 4u);
+    open_blk = HtmlBlkHeading;
+   } else if (blk.kind == INLAY_CODE_BLOCK) {
+    out.write_lit("<pre><code");
+    if (blk.language_length > 0u && blk.language_offset + blk.language_length <= source.length) {
+     out.write_lit(" class=\"language-");
+     md_out_write_html_escaped(&out, source.chars + blk.language_offset, blk.language_length);
+     out.write_lit("\"");
+    }
+    out.write_lit(">");
+    open_blk = HtmlBlkCode;
+   } else if (blk.kind == INLAY_BLOCKQUOTE || blk.kind == INLAY_ALERT) {
+    out.write_lit("<blockquote><p>");
+    open_blk = HtmlBlkQuote;
+   } else if (blk.kind == INLAY_LIST || blk.kind == INLAY_TASK_LIST) {
+    const InlayListItemMeta* meta = (row.list_item_index != UINT32_MAX && row.list_item_index < doc->list_item_count)
+     ? &doc->list_items[row.list_item_index] : nullptr;
+    const bool ordered = meta ? (meta->ordered != 0u) : ((blk.flags & INLAY_BLOCK_FLAG_ORDERED) != 0u);
+    out.write_lit(ordered ? "<ol>\n" : "<ul>\n");
+    open_blk = ordered ? HtmlBlkOl : HtmlBlkUl;
+   } else if (blk.kind == INLAY_TABLE) {
+    out.write_lit("<table>\n");
+    open_blk = HtmlBlkTable;
+   } else {
+    out.write_lit("<p>");
+    open_blk = HtmlBlkPara;
+   }
+  }
+
+  if (blk.kind == INLAY_CODE_BLOCK) {
+   if (!new_blk && sep_nl) out.write_lit("\n");
+   md_out_write_html_escaped(&out, m->plain_text + r_lo + ov_lo, ov_hi - ov_lo);
+   continue;
+  }
+
+  if (blk.kind == INLAY_TABLE) {
+   EtchStr line = table_line(source, row, blk.quote_depth);
+   const uint32_t columns = m->rows[row.table_header].table_columns;
+   uint32_t start = 0u;
+   table_row_range(&line, &start);
+   uint32_t cell_pcur = 0u;
+   out.write_lit("<tr>");
+   for (uint32_t col = 0u; col < columns && start < line.length; ++col) {
+    const uint32_t stop = table_cell_end(line, start);
+    if (col > 0u) ++cell_pcur;
+    const uint32_t abs_a = uint32_t((line.chars + start) - source.chars);
+    const uint32_t abs_b = uint32_t((line.chars + stop) - source.chars);
+    const uint32_t need = extract_inline_range_plain(m, source, abs_a, abs_b, true, nullptr);
+    const uint32_t c_lo = ov_lo > cell_pcur ? (ov_lo - cell_pcur) : 0u;
+    const uint32_t c_hi = ov_hi < cell_pcur + need ? (ov_hi - cell_pcur) : need;
+    if (c_hi > c_lo) {
+     out.write_lit(row.first ? "<th>" : "<td>");
+     emit_inline_html_slice(m, source, abs_a, abs_b, c_lo, c_hi, true, &out);
+     out.write_lit(row.first ? "</th>" : "</td>");
+    }
+    cell_pcur += need;
+    start = stop + 1u;
+   }
+   out.write_lit("</tr>\n");
+   continue;
+  }
+
+  if (blk.kind == INLAY_LIST || blk.kind == INLAY_TASK_LIST) {
+   const bool cont_row = !new_blk && !sep_nl;
+   if (!cont_row) {
+    if (li_open) out.write_lit("</li>\n");
+    out.write_lit("<li>");
+    li_open = true;
+    const InlayListItemMeta* meta = (row.list_item_index != UINT32_MAX && row.list_item_index < doc->list_item_count)
+     ? &doc->list_items[row.list_item_index] : nullptr;
+    if (ov_lo == 0u && meta && meta->is_task) {
+     const bool chk = (meta->task_mark_offset < source.length) ? (source.chars[meta->task_mark_offset] != ' ') : (meta->checked != 0u);
+     out.write_lit(chk ? "<input type=\"checkbox\" disabled checked> " : "<input type=\"checkbox\" disabled> ");
+    }
+   }
+   if (blk.flags & INLAY_BLOCK_FLAG_SYNTHETIC) {
+    md_out_write_html_escaped(&out, m->plain_text + r_lo + ov_lo, ov_hi - ov_lo);
+   } else {
+    emit_row_inline_html(doc, m, source, row, blk, ov_lo, ov_hi, &out);
+   }
+   continue;
+  }
+
+  if (!new_blk && sep_nl) out.write_lit("\n");
+  if (blk.flags & INLAY_BLOCK_FLAG_SYNTHETIC) {
+   md_out_write_html_escaped(&out, m->plain_text + r_lo + ov_lo, ov_hi - ov_lo);
+  } else {
+   emit_row_inline_html(doc, m, source, row, blk, ov_lo, ov_hi, &out);
+  }
+ }
+
+ close_open_block();
+ if (out_buf && cap > 0u) out_buf[out.len < cap - 1u ? out.len : (cap - 1u)] = '\0';
+ return out.len;
+}
+
 INLAY_API InlayDocResult inlay_doc_view(InlayDoc* doc, const InlayDocViewDesc* input_in) {
  InlayDocResult result = {};
  InlayDocViewDesc view = inlay_doc_view_desc_default();
@@ -3565,7 +3967,7 @@ INLAY_API InlayDocResult inlay_doc_view(InlayDoc* doc, const InlayDocViewDesc* i
   result.at_bottom = visible.at_bottom;
  }
  const uint32_t doc_a11y_actions = flow ? 0u
-  : (etch_a11y_action_bit(ETCH_A11Y_ACT_INCREMENT) | etch_a11y_action_bit(ETCH_A11Y_ACT_DECREMENT));
+  : (etch_a11y_action_bit(ETCH_A11Y_ACT_SCROLL_UP) | etch_a11y_action_bit(ETCH_A11Y_ACT_SCROLL_DOWN));
  etch_emit_a11y_node(view.id, ETCH_A11Y_DOCUMENT, ETCH_STR_LIT("Document"), {},
                      ETCH_A11Y_STATE_NONE, doc_a11y_actions, 0.f, {});
  const auto theme = etch_get_theme(doc->context);
@@ -3685,7 +4087,8 @@ INLAY_API InlayDocResult inlay_doc_view(InlayDoc* doc, const InlayDocViewDesc* i
   if (is_code_card) {
    const float r = theme.radius_panel_px;
    box.background = style.code_bg.a != 0 ? style.code_bg : theme.bg_elevated;
-   box.border_color = style.code_border.a != 0 ? style.code_border : theme.border_subtle;
+   box.border_color = style.code_border.a != 0 ? style.code_border
+    : ((is_mermaid && !inlay_is_dark_theme(theme)) ? etch_rgba8(15, 23, 42, 42) : theme.border_subtle);
    box.border_width = 0.f;
    box.border_sides = {1.f, 1.f, info.first ? 1.f : 0.f, info.last_in_block ? 1.f : 0.f};
    box.radius = {info.first ? r : 0.f, info.first ? r : 0.f, info.last_in_block ? r : 0.f, info.last_in_block ? r : 0.f};
@@ -3817,7 +4220,8 @@ INLAY_API InlayDocResult inlay_doc_view(InlayDoc* doc, const InlayDocViewDesc* i
     hdr.background = code_header_bg_color(style, theme);
     hdr.radius = {r, r, 0.f, 0.f};
     hdr.continuous_corners = true;
-    hdr.border_color = style.code_border.a != 0 ? style.code_border : theme.border_subtle;
+    hdr.border_color = style.code_border.a != 0 ? style.code_border
+     : (inlay_is_dark_theme(theme) ? theme.border_subtle : etch_rgba8(15, 23, 42, 36));
     hdr.border_sides = {0, 0, 0, 1};
     etch_begin_box(&hdr);
     auto ld = etch_text_desc_default();

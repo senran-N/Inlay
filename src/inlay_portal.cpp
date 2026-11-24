@@ -3,8 +3,21 @@
 #include <cstdlib>
 #include <cstring>
 
+#ifndef INLAY_PORTAL_HOST_HOOKS_DEFINED
+#define INLAY_PORTAL_HOST_HOOKS_DEFINED
+struct InlayPortalHostHooks {
+  InlayPortalNavDecision (*on_nav_check)(void *ctx, EtchStr url,
+                                         bool is_new_window) noexcept;
+  void (*on_web_message)(void *ctx, EtchStr msg) noexcept;
+  bool (*on_perm_check)(void *ctx, EtchStr origin, EtchStr perm_kind) noexcept;
+  void *ctx;
+};
+#endif
+
 bool inlay_portal_webview2_post_message(void *backend, EtchStr msg) noexcept;
 bool inlay_portal_webview2_nav_action(void *backend, int action) noexcept;
+void inlay_portal_webview2_set_hooks(void *backend,
+                                     const InlayPortalHostHooks *hooks) noexcept;
 
 struct PortalMsg {
   char *data;
@@ -410,6 +423,62 @@ bool enqueue_message(InlayPortal *p, const char *data, uint32_t len) noexcept {
   ++p->msg_count;
   return true;
 }
+bool valid_portal_str(EtchStr s) noexcept {
+  return s.chars && s.length > 0u && s.length <= InlayPortal::kMaxMessageBytes &&
+         !std::memchr(s.chars, 0, s.length) && is_valid_utf8(s.chars, s.length);
+}
+InlayPortalNavDecision evaluate_navigation_policy(InlayPortal *p, EtchStr url,
+                                                  bool is_new_window) noexcept {
+  const InlayPortalNavFn nav_fn = p->policy.on_navigate;
+  void *const user_data = p->policy.user_data;
+  if (nav_fn) {
+    const InlayPortalNavDecision decision =
+        nav_fn(p, url, is_new_window, user_data);
+    if (is_new_window && !p->policy.allow_new_windows &&
+        decision == INLAY_PORTAL_NAV_ALLOW)
+      return INLAY_PORTAL_NAV_BLOCK;
+    return decision;
+  }
+  if (is_new_window && !p->policy.allow_new_windows)
+    return INLAY_PORTAL_NAV_BLOCK;
+  if (p->allowed_origins_len > 0u &&
+      !origin_in_allowlist(url, p->allowed_origins, p->allowed_origins_len)) {
+    return p->policy.allow_external_links ? INLAY_PORTAL_NAV_OPEN_EXTERNAL
+                                          : INLAY_PORTAL_NAV_BLOCK;
+  }
+  return INLAY_PORTAL_NAV_ALLOW;
+}
+bool deliver_incoming_message(InlayPortal *p, EtchStr msg) noexcept {
+  if (!enqueue_message(p, msg.chars, msg.length))
+    return false;
+  const InlayPortalMessageFn msg_fn = p->policy.on_message;
+  void *const user_data = p->policy.user_data;
+  if (msg_fn && !p->dispatching_message) {
+    p->dispatching_message = true;
+    msg_fn(p, msg, user_data);
+    p->dispatching_message = false;
+  }
+  return true;
+}
+InlayPortalNavDecision portal_hook_nav_check(void *ctx, EtchStr url,
+                                             bool is_new_window) noexcept {
+  return evaluate_navigation_policy(static_cast<InlayPortal *>(ctx), url,
+                                    is_new_window);
+}
+void portal_hook_web_message(void *ctx, EtchStr msg) noexcept {
+  auto *p = static_cast<InlayPortal *>(ctx);
+  if (!valid_portal_str(msg))
+    return;
+  (void)deliver_incoming_message(p, msg);
+}
+bool portal_hook_perm_check(void *ctx, EtchStr origin,
+                            EtchStr perm_kind) noexcept {
+  auto *p = static_cast<InlayPortal *>(ctx);
+  const InlayPortalPermissionFn perm_fn = p->policy.on_permission;
+  if (!perm_fn)
+    return false;
+  return perm_fn(p, origin, perm_kind, p->policy.user_data);
+}
 } // namespace
 extern "C" {
 INLAY_API const InlayPortalBackendVTable *inlay_portal_mock_backend(void) {
@@ -455,6 +524,15 @@ INLAY_API InlayPortal *inlay_portal_create(EtchContext *ctx,
       return nullptr;
     }
   }
+  if (p->is_webview2) {
+    const InlayPortalHostHooks hooks = {
+        portal_hook_nav_check,
+        portal_hook_web_message,
+        portal_hook_perm_check,
+        p,
+    };
+    inlay_portal_webview2_set_hooks(p->backend, &hooks);
+  }
   return p;
 }
 INLAY_API bool inlay_portal_destroy(InlayPortal *p) {
@@ -462,6 +540,8 @@ INLAY_API bool inlay_portal_destroy(InlayPortal *p) {
     return true;
   if (p->pending_draw)
     return false;
+  if (p->is_webview2)
+    inlay_portal_webview2_set_hooks(p->backend, nullptr);
   p->api.destroy(p->backend);
   etch_destroy_loaded_texture(p->context, &p->texture);
   std::free(p->allowed_origins);
@@ -480,21 +560,10 @@ INLAY_API void inlay_portal_frame_submitted(InlayPortal *p) {
     p->pending_draw = false;
 }
 INLAY_API bool inlay_portal_load_url(InlayPortal *p, EtchStr s) {
-  if (!p || !s.chars || s.length == 0u ||
-      s.length > InlayPortal::kMaxMessageBytes ||
-      std::memchr(s.chars, 0, s.length) || !is_valid_utf8(s.chars, s.length) ||
-      !p->api.load_url)
+  if (!p || !valid_portal_str(s) || !p->api.load_url)
     return false;
-  const InlayPortalNavFn nav_fn = p->policy.on_navigate;
-  void *const user_data = p->policy.user_data;
-  if (nav_fn) {
-    if (nav_fn(p, s, false, user_data) != INLAY_PORTAL_NAV_ALLOW)
-      return false;
-  } else if (p->allowed_origins_len > 0u &&
-             !origin_in_allowlist(s, p->allowed_origins,
-                                  p->allowed_origins_len)) {
+  if (evaluate_navigation_policy(p, s, false) != INLAY_PORTAL_NAV_ALLOW)
     return false;
-  }
   if (!p->api.load_url(p->backend, s))
     return false;
   push_history(p, s);
@@ -734,23 +803,16 @@ INLAY_API void inlay_portal_set_policy(InlayPortal *p,
   p->policy = next;
 }
 INLAY_API bool inlay_portal_post_message(InlayPortal *p, EtchStr message_json) {
-  if (!p || !message_json.chars || message_json.length == 0u ||
-      message_json.length > InlayPortal::kMaxMessageBytes ||
-      std::memchr(message_json.chars, 0, message_json.length) ||
-      !is_valid_utf8(message_json.chars, message_json.length))
+  if (!p || !valid_portal_str(message_json))
     return false;
   if (p->is_webview2)
     return inlay_portal_webview2_post_message(p->backend, message_json);
-  if (!enqueue_message(p, message_json.chars, message_json.length))
-    return false;
-  const InlayPortalMessageFn msg_fn = p->policy.on_message;
-  void *const user_data = p->policy.user_data;
-  if (msg_fn && !p->dispatching_message) {
-    p->dispatching_message = true;
-    msg_fn(p, message_json, user_data);
-    p->dispatching_message = false;
-  }
-  return true;
+  return deliver_incoming_message(p, message_json);
+}
+INLAY_API uint32_t inlay_portal_peek_message_size(const InlayPortal *p) {
+  if (!p || p->msg_count == 0u)
+    return 0u;
+  return p->msg_queue[p->msg_head].len;
 }
 INLAY_API uint32_t inlay_portal_poll_message(InlayPortal *p, char *out_buf,
                                              uint32_t cap) {
@@ -760,15 +822,21 @@ INLAY_API uint32_t inlay_portal_poll_message(InlayPortal *p, char *out_buf,
     return 0u;
   }
   const PortalMsg front = p->msg_queue[p->msg_head];
-  p->msg_queue[p->msg_head] = {nullptr, 0u};
-  p->msg_head = (p->msg_head + 1u) % InlayPortal::kMaxMsgQueue;
-  --p->msg_count;
-  if (out_buf && cap > 0u) {
-    const uint32_t copy_len = front.len < (cap - 1u) ? front.len : (cap - 1u);
+  if (!out_buf || cap == 0u)
+    return front.len;
+  if (cap <= front.len) {
+    const uint32_t copy_len = cap - 1u;
     if (copy_len > 0u)
       std::memcpy(out_buf, front.data, copy_len);
     out_buf[copy_len] = '\0';
+    return front.len;
   }
+  if (front.len > 0u)
+    std::memcpy(out_buf, front.data, front.len);
+  out_buf[front.len] = '\0';
+  p->msg_queue[p->msg_head] = {nullptr, 0u};
+  p->msg_head = (p->msg_head + 1u) % InlayPortal::kMaxMsgQueue;
+  --p->msg_count;
   const uint32_t full_len = front.len;
   std::free(front.data);
   return full_len;

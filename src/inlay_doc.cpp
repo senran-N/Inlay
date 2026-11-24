@@ -1911,6 +1911,70 @@ void move_anchors(InlayDoc* d, uint32_t begin, uint32_t end, uint32_t inserted) 
  }
 }
 
+bool delta_may_close_code_fence(const char* src, uint32_t content_off, uint32_t old_size, uint32_t new_size,
+                                char fence_char, uint32_t fence_len) noexcept {
+ uint32_t scan = old_size;
+ if (old_size > content_off && src[old_size - 1u] != '\n') {
+  uint32_t p = old_size;
+  uint32_t fc_cnt = 0u;
+  while (p > content_off && src[p - 1u] == fence_char && fc_cnt < fence_len) { --p; ++fc_cnt; }
+  uint32_t sp_cnt = 0u;
+  while (p > content_off && src[p - 1u] == ' ' && sp_cnt < 3u) { --p; ++sp_cnt; }
+  const bool at_line_start = (p == content_off || src[p - 1u] == '\n');
+  const uint32_t first_nl = line_end_of(src, old_size, new_size);
+  if (at_line_start) {
+   uint32_t ll = first_nl - p;
+   if (ll && src[first_nl - 1u] == '\r') --ll;
+   if (is_code_fence_close(src + p, ll, fence_char, fence_len)) return true;
+  }
+  scan = first_nl < new_size ? (first_nl + 1u) : new_size;
+ }
+ while (scan < new_size) {
+  const uint32_t le = line_end_of(src, scan, new_size);
+  uint32_t ll = le - scan;
+  if (ll && src[le - 1u] == '\r') --ll;
+  uint32_t ind = 0u;
+  while (ind < ll && ind < 3u && src[scan + ind] == ' ') ++ind;
+  if (ind < ll && src[scan + ind] == fence_char) return true;
+  scan = le < new_size ? (le + 1u) : new_size;
+ }
+ return false;
+}
+
+bool try_extend_open_code_fence(InlayDoc* d, uint32_t old_size) noexcept {
+ if (!d || d->block_count == 0u || d->source_size <= old_size) return false;
+ InlayBlock& tail = d->blocks[d->block_count - 1u];
+ if (tail.kind != INLAY_CODE_BLOCK || tail.complete) return false;
+ if (tail.quote_depth != 0u || tail.list_depth != 0u || tail.depth != 0u) return false;
+ if ((tail.flags & INLAY_BLOCK_FLAG_SYNTHETIC) != 0u) return false;
+ if (tail.level < 3u) return false;
+ if (tail.offset + tail.length != old_size) return false;
+ if (tail.content_offset <= tail.offset || tail.content_offset > old_size) return false;
+ if (d->source[tail.content_offset - 1u] != '\n') return false;
+ if (tail.content_offset + tail.content_length != old_size) return false;
+ uint32_t fi = 0u;
+ while (tail.offset + fi < tail.content_offset && fi < 3u && d->source[tail.offset + fi] == ' ') ++fi;
+ if (tail.offset + fi >= tail.content_offset) return false;
+ const char fence_char = d->source[tail.offset + fi];
+ if (fence_char != '`' && fence_char != '~') return false;
+ if (delta_may_close_code_fence(d->source, tail.content_offset, old_size, d->source_size, fence_char, tail.level)) {
+  return false;
+ }
+ const uint32_t delta = d->source_size - old_size;
+ tail.length += delta;
+ tail.content_length += delta;
+ const int32_t ast_idx = d->block_meta[d->block_count - 1u].ast_index;
+ if (ast_idx >= 0 && uint32_t(ast_idx) < d->ast_node_count) {
+  auto& node = d->ast_nodes[ast_idx];
+  node.src_length += delta;
+  if (node.parent >= 0 && uint32_t(node.parent) < d->ast_node_count) {
+   auto& par = d->ast_nodes[node.parent];
+   if (par.src_offset + par.src_length == old_size) par.src_length += delta;
+  }
+ }
+ return true;
+}
+
 bool update_doc_text(InlayDoc* d, EtchStr chunk, bool replace) noexcept {
  if (!d || (!chunk.chars && chunk.length)) return false;
  const uint32_t old_size = replace ? 0u : d->source_size;
@@ -1944,8 +2008,10 @@ bool update_doc_text(InlayDoc* d, EtchStr chunk, bool replace) noexcept {
  std::memcpy(d->utf8_carry, carry, 4);
 
  if (valid > 0u && !d->parse_pending) {
-  d->parse_pending = true;
-  d->parse_from = old_size;
+  if (replace || !try_extend_open_code_fence(d, old_size)) {
+   d->parse_pending = true;
+   d->parse_from = old_size;
+  }
  }
  ++d->revision;
  etch_request_redraw(d->context);
@@ -1955,6 +2021,10 @@ bool update_doc_text(InlayDoc* d, EtchStr chunk, bool replace) noexcept {
 
 void inlay_doc_parse_pending(InlayDoc* d) noexcept {
  if (!d->parse_pending) return;
+ if (try_extend_open_code_fence(d, d->parse_from)) {
+  d->parse_pending = false;
+  return;
+ }
  // A new definition can resolve links in the frozen prefix.
  uint32_t scan = line_start_of(d->source, d->parse_from, 0u);
  while (scan < d->source_size) {
@@ -2717,5 +2787,39 @@ INLAY_API uint32_t inlay_doc_export_html(const InlayDoc* doc, char* out_buf, uin
   out_buf[out.len < cap - 1u ? out.len : (cap - 1u)] = '\0';
  }
  return out.len;
+}
+
+INLAY_API uint32_t inlay_doc_outline_count(const InlayDoc* doc) {
+ if (!doc) return 0u;
+ inlay_doc_parse_pending(const_cast<InlayDoc*>(doc));
+ uint32_t count = 0u;
+ for (uint32_t bi = 0u; bi < doc->block_count; ++bi) {
+  if (doc->blocks[bi].kind == INLAY_HEADING) ++count;
+ }
+ return count;
+}
+
+INLAY_API bool inlay_doc_outline_at(const InlayDoc* doc, uint32_t index, InlayDocOutlineEntry* out) {
+ if (!doc || !out) return false;
+ inlay_doc_parse_pending(const_cast<InlayDoc*>(doc));
+ const char* src = doc->source;
+ const uint32_t src_len = doc->source_size;
+ uint32_t seen = 0u;
+ for (uint32_t bi = 0u; bi < doc->block_count; ++bi) {
+  const InlayBlock& b = doc->blocks[bi];
+  if (b.kind != INLAY_HEADING) continue;
+  if (seen++ != index) continue;
+  const InlayBlockMeta& meta = doc->block_meta[bi];
+  const bool synthetic = (b.flags & INLAY_BLOCK_FLAG_SYNTHETIC) != 0u;
+  const char* ptr = synthetic ? (doc->ast_text + meta.pool_offset)
+   : (b.content_offset <= src_len ? src + b.content_offset : src);
+  const uint32_t raw_len = synthetic ? meta.pool_length
+   : (b.content_offset <= src_len ? (b.content_length <= src_len - b.content_offset ? b.content_length : src_len - b.content_offset) : 0u);
+  const uint32_t len = html_trim_eol(ptr, raw_len);
+  const uint8_t lvl = b.level < 1u ? 1u : (b.level > 6u ? 6u : static_cast<uint8_t>(b.level));
+  *out = {bi, b.offset, lvl, EtchStr{ptr, len, false}};
+  return true;
+ }
+ return false;
 }
 } // extern "C"

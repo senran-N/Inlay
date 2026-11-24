@@ -1,4 +1,16 @@
 #include "inlay_internal.h"
+#ifndef INLAY_PORTAL_HOST_HOOKS_DEFINED
+#define INLAY_PORTAL_HOST_HOOKS_DEFINED
+struct InlayPortalHostHooks {
+  InlayPortalNavDecision (*on_nav_check)(void *ctx, EtchStr url,
+                                         bool is_new_window) noexcept;
+  void (*on_web_message)(void *ctx, EtchStr msg) noexcept;
+  bool (*on_perm_check)(void *ctx, EtchStr origin, EtchStr perm_kind) noexcept;
+  void *ctx;
+};
+#endif
+void inlay_portal_webview2_set_hooks(void *backend,
+                                     const InlayPortalHostHooks *hooks) noexcept;
 #if defined(_WIN32) && INLAY_ENABLE_PORTAL_WEBVIEW2
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -22,6 +34,10 @@ ULONG release(WebPortal *p) noexcept;
 HRESULT on_environment_ready(WebPortal *p, HRESULT result, ICoreWebView2Environment *env) noexcept;
 HRESULT on_controller_ready(WebPortal *p, HRESULT result, ICoreWebView2Controller *ctrl) noexcept;
 HRESULT on_composition_ready(WebPortal *p, HRESULT result, ICoreWebView2CompositionController *comp) noexcept;
+HRESULT on_navigation_starting(WebPortal *p, ICoreWebView2NavigationStartingEventArgs *args) noexcept;
+HRESULT on_new_window_requested(WebPortal *p, ICoreWebView2NewWindowRequestedEventArgs *args) noexcept;
+HRESULT on_web_message_received(WebPortal *p, ICoreWebView2WebMessageReceivedEventArgs *args) noexcept;
+HRESULT on_permission_requested(WebPortal *p, ICoreWebView2PermissionRequestedEventArgs *args) noexcept;
 
 struct EnvironmentHandler final : ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler {
   WebPortal *owner;
@@ -86,10 +102,102 @@ struct CompositionHandler final : ICoreWebView2CreateCoreWebView2CompositionCont
   }
 };
 
+struct NavStartingHandler final : ICoreWebView2NavigationStartingEventHandler {
+  WebPortal *owner;
+  explicit NavStartingHandler(WebPortal *o) noexcept : owner(o) {}
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id, void **out) override {
+    if (!out)
+      return E_POINTER;
+    *out = nullptr;
+    if (!IsEqualIID(id, IID_IUnknown) &&
+        !IsEqualIID(id, IID_ICoreWebView2NavigationStartingEventHandler))
+      return E_NOINTERFACE;
+    *out = static_cast<ICoreWebView2NavigationStartingEventHandler *>(this);
+    AddRef();
+    return S_OK;
+  }
+  ULONG STDMETHODCALLTYPE AddRef() override { return retain(owner); }
+  ULONG STDMETHODCALLTYPE Release() override { return release(owner); }
+  HRESULT STDMETHODCALLTYPE Invoke(ICoreWebView2 *,
+                                   ICoreWebView2NavigationStartingEventArgs *args) override {
+    return on_navigation_starting(owner, args);
+  }
+};
+
+struct NewWindowHandler final : ICoreWebView2NewWindowRequestedEventHandler {
+  WebPortal *owner;
+  explicit NewWindowHandler(WebPortal *o) noexcept : owner(o) {}
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id, void **out) override {
+    if (!out)
+      return E_POINTER;
+    *out = nullptr;
+    if (!IsEqualIID(id, IID_IUnknown) &&
+        !IsEqualIID(id, IID_ICoreWebView2NewWindowRequestedEventHandler))
+      return E_NOINTERFACE;
+    *out = static_cast<ICoreWebView2NewWindowRequestedEventHandler *>(this);
+    AddRef();
+    return S_OK;
+  }
+  ULONG STDMETHODCALLTYPE AddRef() override { return retain(owner); }
+  ULONG STDMETHODCALLTYPE Release() override { return release(owner); }
+  HRESULT STDMETHODCALLTYPE Invoke(ICoreWebView2 *,
+                                   ICoreWebView2NewWindowRequestedEventArgs *args) override {
+    return on_new_window_requested(owner, args);
+  }
+};
+
+struct WebMessageHandler final : ICoreWebView2WebMessageReceivedEventHandler {
+  WebPortal *owner;
+  explicit WebMessageHandler(WebPortal *o) noexcept : owner(o) {}
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id, void **out) override {
+    if (!out)
+      return E_POINTER;
+    *out = nullptr;
+    if (!IsEqualIID(id, IID_IUnknown) &&
+        !IsEqualIID(id, IID_ICoreWebView2WebMessageReceivedEventHandler))
+      return E_NOINTERFACE;
+    *out = static_cast<ICoreWebView2WebMessageReceivedEventHandler *>(this);
+    AddRef();
+    return S_OK;
+  }
+  ULONG STDMETHODCALLTYPE AddRef() override { return retain(owner); }
+  ULONG STDMETHODCALLTYPE Release() override { return release(owner); }
+  HRESULT STDMETHODCALLTYPE Invoke(ICoreWebView2 *,
+                                   ICoreWebView2WebMessageReceivedEventArgs *args) override {
+    return on_web_message_received(owner, args);
+  }
+};
+
+struct PermissionHandler final : ICoreWebView2PermissionRequestedEventHandler {
+  WebPortal *owner;
+  explicit PermissionHandler(WebPortal *o) noexcept : owner(o) {}
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id, void **out) override {
+    if (!out)
+      return E_POINTER;
+    *out = nullptr;
+    if (!IsEqualIID(id, IID_IUnknown) &&
+        !IsEqualIID(id, IID_ICoreWebView2PermissionRequestedEventHandler))
+      return E_NOINTERFACE;
+    *out = static_cast<ICoreWebView2PermissionRequestedEventHandler *>(this);
+    AddRef();
+    return S_OK;
+  }
+  ULONG STDMETHODCALLTYPE AddRef() override { return retain(owner); }
+  ULONG STDMETHODCALLTYPE Release() override { return release(owner); }
+  HRESULT STDMETHODCALLTYPE Invoke(ICoreWebView2 *,
+                                   ICoreWebView2PermissionRequestedEventArgs *args) override {
+    return on_permission_requested(owner, args);
+  }
+};
+
 struct WebPortal {
   EnvironmentHandler environment_handler;
   ControllerHandler controller_handler;
   CompositionHandler composition_handler;
+  NavStartingHandler nav_starting_handler;
+  NewWindowHandler new_window_handler;
+  WebMessageHandler web_message_handler;
+  PermissionHandler perm_requested_handler;
   volatile LONG references;
   DWORD com_thread;
   HWND parent;
@@ -105,6 +213,12 @@ struct WebPortal {
   ICoreWebView2CompositionController *comp_controller;
   ICoreWebView2Controller *controller;
   ICoreWebView2 *web;
+  EventRegistrationToken nav_starting_token;
+  EventRegistrationToken new_window_token;
+  EventRegistrationToken web_message_token;
+  EventRegistrationToken perm_requested_token;
+  bool has_nav_starting, has_new_window, has_web_message, has_perm_requested;
+  InlayPortalHostHooks hooks;
   wchar_t *navigation;
   bool html, closed, com_initialized, disable_dcomp, using_dcomp;
   void (*completed)(void *, int32_t);
@@ -122,6 +236,10 @@ struct WebPortal {
       : environment_handler(this),
         controller_handler(this),
         composition_handler(this),
+        nav_starting_handler(this),
+        new_window_handler(this),
+        web_message_handler(this),
+        perm_requested_handler(this),
         references(1),
         com_thread(0),
         parent(nullptr),
@@ -137,6 +255,15 @@ struct WebPortal {
         comp_controller(nullptr),
         controller(nullptr),
         web(nullptr),
+        nav_starting_token{},
+        new_window_token{},
+        web_message_token{},
+        perm_requested_token{},
+        has_nav_starting(false),
+        has_new_window(false),
+        has_web_message(false),
+        has_perm_requested(false),
+        hooks{},
         navigation(nullptr),
         html(false),
         closed(false),
@@ -383,6 +510,225 @@ wchar_t *wide(const char *bytes, uint32_t length) noexcept {
   return out;
 }
 
+char *narrow_utf8(LPCWSTR ws, uint32_t *out_len) noexcept {
+  *out_len = 0u;
+  if (!ws || !ws[0])
+    return nullptr;
+  const int n = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, ws, -1,
+                                    nullptr, 0, nullptr, nullptr);
+  if (n <= 1)
+    return nullptr;
+  auto *out = static_cast<char *>(std::malloc(static_cast<size_t>(n)));
+  if (!out)
+    return nullptr;
+  const int written = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, ws, -1,
+                                          out, n, nullptr, nullptr);
+  if (written <= 1) {
+    std::free(out);
+    return nullptr;
+  }
+  out[written - 1] = '\0';
+  *out_len = static_cast<uint32_t>(written - 1);
+  return out;
+}
+
+const char *permission_kind_name(COREWEBVIEW2_PERMISSION_KIND kind) noexcept {
+  switch (kind) {
+  case COREWEBVIEW2_PERMISSION_KIND_MICROPHONE:
+    return "microphone";
+  case COREWEBVIEW2_PERMISSION_KIND_CAMERA:
+    return "camera";
+  case COREWEBVIEW2_PERMISSION_KIND_GEOLOCATION:
+    return "geolocation";
+  case COREWEBVIEW2_PERMISSION_KIND_NOTIFICATIONS:
+    return "notifications";
+  case COREWEBVIEW2_PERMISSION_KIND_OTHER_SENSORS:
+    return "other_sensors";
+  case COREWEBVIEW2_PERMISSION_KIND_CLIPBOARD_READ:
+    return "clipboard_read";
+  case COREWEBVIEW2_PERMISSION_KIND_MULTIPLE_AUTOMATIC_DOWNLOADS:
+    return "multiple_automatic_downloads";
+  case COREWEBVIEW2_PERMISSION_KIND_FILE_READ_WRITE:
+    return "file_read_write";
+  case COREWEBVIEW2_PERMISSION_KIND_AUTOPLAY:
+    return "autoplay";
+  case COREWEBVIEW2_PERMISSION_KIND_LOCAL_FONTS:
+    return "local_fonts";
+  case COREWEBVIEW2_PERMISSION_KIND_MIDI_SYSTEM_EXCLUSIVE_MESSAGES:
+    return "midi_sysex";
+  case COREWEBVIEW2_PERMISSION_KIND_WINDOW_MANAGEMENT:
+    return "window_management";
+  case COREWEBVIEW2_PERMISSION_KIND_PERSISTENT_STORAGE:
+    return "persistent_storage";
+  case COREWEBVIEW2_PERMISSION_KIND_UNKNOWN_PERMISSION:
+  default:
+    return "unknown";
+  }
+}
+
+void attach_web_events(WebPortal *p) noexcept {
+  if (!p->web)
+    return;
+  if (!p->has_nav_starting &&
+      SUCCEEDED(p->web->add_NavigationStarting(&p->nav_starting_handler,
+                                               &p->nav_starting_token)))
+    p->has_nav_starting = true;
+  if (!p->has_new_window &&
+      SUCCEEDED(p->web->add_NewWindowRequested(&p->new_window_handler,
+                                               &p->new_window_token)))
+    p->has_new_window = true;
+  if (!p->has_web_message &&
+      SUCCEEDED(p->web->add_WebMessageReceived(&p->web_message_handler,
+                                               &p->web_message_token)))
+    p->has_web_message = true;
+  if (!p->has_perm_requested &&
+      SUCCEEDED(p->web->add_PermissionRequested(&p->perm_requested_handler,
+                                                &p->perm_requested_token)))
+    p->has_perm_requested = true;
+}
+
+void detach_web_events(WebPortal *p) noexcept {
+  if (!p->web)
+    return;
+  if (p->has_nav_starting) {
+    p->web->remove_NavigationStarting(p->nav_starting_token);
+    p->has_nav_starting = false;
+  }
+  if (p->has_new_window) {
+    p->web->remove_NewWindowRequested(p->new_window_token);
+    p->has_new_window = false;
+  }
+  if (p->has_web_message) {
+    p->web->remove_WebMessageReceived(p->web_message_token);
+    p->has_web_message = false;
+  }
+  if (p->has_perm_requested) {
+    p->web->remove_PermissionRequested(p->perm_requested_token);
+    p->has_perm_requested = false;
+  }
+}
+
+HRESULT on_navigation_starting(
+    WebPortal *p, ICoreWebView2NavigationStartingEventArgs *args) noexcept {
+  if (p->closed || !args)
+    return S_OK;
+  const auto check = p->hooks.on_nav_check;
+  void *const ctx = p->hooks.ctx;
+  if (!check)
+    return S_OK;
+  LPWSTR uri = nullptr;
+  const HRESULT hr = args->get_Uri(&uri);
+  const bool had_uri = SUCCEEDED(hr) && uri && uri[0] != 0;
+  uint32_t url_len = 0u;
+  char *url_utf8 = had_uri ? narrow_utf8(uri, &url_len) : nullptr;
+  if (uri)
+    CoTaskMemFree(uri);
+  if (had_uri && !url_utf8) {
+    args->put_Cancel(TRUE);
+    return S_OK;
+  }
+  const EtchStr url = {url_utf8 ? url_utf8 : "", url_len, false};
+  const InlayPortalNavDecision decision = check(ctx, url, false);
+  std::free(url_utf8);
+  if (decision != INLAY_PORTAL_NAV_ALLOW)
+    args->put_Cancel(TRUE);
+  return S_OK;
+}
+
+HRESULT on_new_window_requested(
+    WebPortal *p, ICoreWebView2NewWindowRequestedEventArgs *args) noexcept {
+  if (p->closed || !args)
+    return S_OK;
+  const auto check = p->hooks.on_nav_check;
+  void *const ctx = p->hooks.ctx;
+  if (!check)
+    return S_OK;
+  LPWSTR uri = nullptr;
+  const HRESULT hr = args->get_Uri(&uri);
+  const bool had_uri = SUCCEEDED(hr) && uri && uri[0] != 0;
+  uint32_t url_len = 0u;
+  char *url_utf8 = had_uri ? narrow_utf8(uri, &url_len) : nullptr;
+  if (uri)
+    CoTaskMemFree(uri);
+  if (had_uri && !url_utf8) {
+    args->put_Handled(TRUE);
+    return S_OK;
+  }
+  const EtchStr url = {url_utf8 ? url_utf8 : "", url_len, false};
+  const InlayPortalNavDecision decision = check(ctx, url, true);
+  std::free(url_utf8);
+  if (decision != INLAY_PORTAL_NAV_ALLOW)
+    args->put_Handled(TRUE);
+  return S_OK;
+}
+
+HRESULT on_web_message_received(
+    WebPortal *p, ICoreWebView2WebMessageReceivedEventArgs *args) noexcept {
+  if (p->closed || !args)
+    return S_OK;
+  const auto on_msg = p->hooks.on_web_message;
+  void *const ctx = p->hooks.ctx;
+  if (!on_msg)
+    return S_OK;
+  LPWSTR wmsg = nullptr;
+  HRESULT hr = args->TryGetWebMessageAsString(&wmsg);
+  if (FAILED(hr) || !wmsg) {
+    if (wmsg) {
+      CoTaskMemFree(wmsg);
+      wmsg = nullptr;
+    }
+    hr = args->get_WebMessageAsJson(&wmsg);
+  }
+  if (FAILED(hr) || !wmsg) {
+    if (wmsg)
+      CoTaskMemFree(wmsg);
+    return S_OK;
+  }
+  uint32_t len = 0u;
+  char *utf8 = narrow_utf8(wmsg, &len);
+  CoTaskMemFree(wmsg);
+  if (!utf8 || len == 0u) {
+    std::free(utf8);
+    return S_OK;
+  }
+  on_msg(ctx, {utf8, len, false});
+  std::free(utf8);
+  return S_OK;
+}
+
+HRESULT on_permission_requested(
+    WebPortal *p, ICoreWebView2PermissionRequestedEventArgs *args) noexcept {
+  if (p->closed || !args)
+    return S_OK;
+  const auto check = p->hooks.on_perm_check;
+  void *const ctx = p->hooks.ctx;
+  if (!check)
+    return S_OK;
+  LPWSTR uri = nullptr;
+  const HRESULT hr = args->get_Uri(&uri);
+  const bool had_uri = SUCCEEDED(hr) && uri && uri[0] != 0;
+  uint32_t origin_len = 0u;
+  char *origin_utf8 = had_uri ? narrow_utf8(uri, &origin_len) : nullptr;
+  if (uri)
+    CoTaskMemFree(uri);
+  if (had_uri && !origin_utf8) {
+    args->put_State(COREWEBVIEW2_PERMISSION_STATE_DENY);
+    return S_OK;
+  }
+  COREWEBVIEW2_PERMISSION_KIND kind =
+      COREWEBVIEW2_PERMISSION_KIND_UNKNOWN_PERMISSION;
+  (void)args->get_PermissionKind(&kind);
+  const char *kind_str = permission_kind_name(kind);
+  const EtchStr origin = {origin_utf8 ? origin_utf8 : "", origin_len, false};
+  const EtchStr perm = {kind_str, static_cast<uint32_t>(std::strlen(kind_str)),
+                        true};
+  const bool allowed = check(ctx, origin, perm);
+  std::free(origin_utf8);
+  args->put_State(allowed ? COREWEBVIEW2_PERMISSION_STATE_ALLOW
+                          : COREWEBVIEW2_PERMISSION_STATE_DENY);
+  return S_OK;
+}
+
 HRESULT navigate(WebPortal *p) noexcept {
   if (!p->navigation || !p->web)
     return S_OK;
@@ -416,6 +762,7 @@ HRESULT on_controller_ready(WebPortal *p, HRESULT result,
   controller->AddRef();
   controller->get_CoreWebView2(&p->web);
   p->using_dcomp = false;
+  attach_web_events(p);
   apply_bounds(p);
   if (p->web)
     navigate(p);
@@ -471,6 +818,7 @@ HRESULT on_composition_ready(WebPortal *p, HRESULT result,
   p->controller = ctrl;
   p->using_dcomp = true;
   p->controller->get_CoreWebView2(&p->web);
+  attach_web_events(p);
   apply_bounds(p);
   if (p->web)
     navigate(p);
@@ -592,6 +940,8 @@ void *create(void *user, uint32_t w, uint32_t h) {
 void destroy(void *backend) {
   auto *p = static_cast<WebPortal *>(backend);
   p->closed = true;
+  p->hooks = {};
+  detach_web_events(p);
   if (p->comp_controller) {
     p->comp_controller->put_RootVisualTarget(nullptr);
     p->comp_controller->Release();
@@ -756,6 +1106,17 @@ bool inlay_portal_webview2_nav_action(void *backend, int action) noexcept {
   }
 }
 
+void inlay_portal_webview2_set_hooks(void *backend,
+                                     const InlayPortalHostHooks *hooks) noexcept {
+  if (!backend)
+    return;
+  auto *p = static_cast<WebPortal *>(backend);
+  if (hooks)
+    p->hooks = *hooks;
+  else
+    p->hooks = {};
+}
+
 extern "C" INLAY_API const InlayPortalBackendVTable *
 inlay_portal_webview2_backend(void) {
   return &api;
@@ -768,6 +1129,9 @@ bool inlay_portal_webview2_post_message(void *, EtchStr) noexcept {
 bool inlay_portal_webview2_nav_action(void *, int) noexcept {
   return false;
 }
+
+void inlay_portal_webview2_set_hooks(void *,
+                                     const InlayPortalHostHooks *) noexcept {}
 
 extern "C" INLAY_API const InlayPortalBackendVTable *
 inlay_portal_webview2_backend(void) {

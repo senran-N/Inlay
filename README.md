@@ -1,6 +1,6 @@
 # Inlay
 Native streamed documents, publication-grade math/diagrams, and high-velocity declarative QuickJS-NG UI surfaces on Etch, through its public C99 API. Build with CMake
-and Ninja in `build/`; a sibling `../Etch` is used when Etch 0.28 is not installed. Inlay 0.13.0 requires Etch 0.28.
+and Ninja in `build/`; a sibling `../Etch` is used when Etch 0.29 is not installed. Inlay 0.14.0 requires Etch 0.29.
 C99 includes `<inlay/inlay_c.h>`; C++20 may include `<inlay/inlay.h>`.
 
 Create a document with an Etch context, append UTF-8 chunks, and call
@@ -95,24 +95,34 @@ Define `const Panel = memo(PanelBody)` at script scope to reuse a keyed
 component's JS tree and materialize cached native UI subtrees while its props
 and responsive breakpoint remain unchanged (`inlay_surface_memo_reused_nodes`).
 Responsive and container-query prefixes (`sm:`, `md:`, `lg:`, `xl:`, `@sm:`,
-`@md:`, `@lg:`) work inside `cls`. Bind reusable host row/tree data sources via
-`InlayModel` + `inlay_surface_bind_model`, custom measured/accessible slots via
-`inlay_surface_bind_slot_ex`, grouped `<Form>` validation/submit, scoped
-`stopPropagation` routing, action permission policies + audit hooks
-(`inlay_surface_set_action_policy`, `inlay_surface_set_action_audit_hook`), and
-export typed host declarations with `inlay_surface_export_dts`.
+`@md:`, `@lg:`) work inside `cls` using measured layout widths. Bind reusable
+host row/tree data sources with range-aware notifications (`notify_change`,
+`notify_insert`, `notify_remove`, `notify_move`, `bind_context`, scroll-anchor
+preservation) via `InlayModel` + `inlay_surface_bind_model`, custom measured/
+accessible slots via `inlay_surface_bind_slot_ex`, grouped `<Form>` validation/
+auto-focus/assertive A11y announcements/submit, scoped `stopPropagation`
+routing, `<ErrorBoundary>` render and event exception isolation, transactional
+staging HMR that preserves live UI/timers/async requests on candidate failure,
+action permission policies + audit hooks (`inlay_surface_set_action_policy`,
+`inlay_surface_set_action_audit_hook`), and typed host declarations via
+`inlay_surface_export_dts`.
 
 For AI workbenches, rich exports, media, and portals, Inlay also provides
-`InlayStream` (stable 64-bit IDs, delta appends, resumable cursor, JSON
-session persistence), verifiable Generative UI schema validation & safe surface
-rendering (`inlay_genui_*`), W3C DTCG Design Token import/export
-(`inlay_tokens_*`), cross-frame Mermaid layout caching
-(`inlay_doc_diagram_cache_stats`), semantic document/heading/link/math/diagram
-A11y emission, semantic HTML5 & standalone vector SVG export
-(`inlay_doc_export_html`, `inlay_diagram_export_svg`, `inlay_math_export_svg`),
-a non-blocking `InlayImageLoader` with bounded VRAM LRU eviction, and Portal
-navigation/origin policies, history, and bidirectional messaging
-(`inlay_portal_set_policy`, `inlay_portal_post_message`,
+`InlayStream` (atomic upsert, strict RFC 3629 UTF-8 streaming with 4-byte carry,
+stable 64-bit IDs, resumable cursor, incremental `inlay_stream_export_since_json`,
+and byte-budget eviction), verifiable Generative UI schema validation & safe
+surface rendering (`inlay_genui_*`), W3C DTCG Design Token import/export
+(`inlay_tokens_*`), streaming trailing-fence fast-path parsing, heading outline
+queries (`inlay_doc_outline_*`), multi-hit search (`inlay_doc_view_find_all`),
+rich HTML clipboard copy (`inlay_doc_view_copy_html`), cross-frame Mermaid
+layout caching (`inlay_doc_diagram_cache_stats`), semantic document/heading/
+link/math/diagram A11y emission with `ETCH_A11Y_ACT_SCROLL_UP`/`DOWN`, semantic
+HTML5, standalone SVG, and MathML export (`inlay_doc_export_html`,
+`inlay_diagram_export_svg`, `inlay_math_export_svg`, `inlay_math_export_mathml`),
+a non-blocking `InlayImageLoader` with off-thread CPU image/SVG decoding and
+bounded VRAM LRU eviction, and Portal navigation/origin/permission/message
+policies wired to both Mock and WebView2 COM events (`inlay_portal_set_policy`,
+`inlay_portal_post_message`, `inlay_portal_peek_message_size`,
 `inlay_portal_poll_message`, `inlay_portal_end_frame_sync`).
 Wrap a panel in `<ErrorBoundary render={() => <Panel/>} fallback={(err, retry) => <Button text={String(err)} onClick={retry}/>}/>`
 or pass the same props to `ui.errorBoundary`. A synchronous render exception
@@ -239,7 +249,9 @@ vtable; the built-in web accessor returns NULL when disabled or unsupported. No
 unimplemented native feature is silently mocked.
 Set `INLAY_WEBVIEW2_LOADER` to enable the real-runtime async/destruction smoke test.
 
-Release candidate scope: Inlay 0.13.0 requires Etch 0.28 and remains pre-1.0.
+Release candidate scope: Inlay 0.14.0 requires Etch 0.29 (`SameMinorVersion`)
+and remains pre-1.0. `cmake --install` installs `LICENSE` and
+`THIRD_PARTY_NOTICES.md` alongside the library, headers, and CMake package.
 Local release checks cover Windows Vulkan/D3D12, installed/subproject C99 and
 C++20 consumers, script/browser enabled and disabled configurations, bounded
 portal scratch memory and idle uploads. Metal and Linux browser/compositor

@@ -370,9 +370,11 @@ int main(int argc, char **argv) {
         policy_ok &= inlay_portal_destroy(hp);
       }
 
-      // Bidirectional host<->web message bridge (post_message + on_message + poll_message).
+      // Bidirectional host<->web message bridge (post_message + on_message + peek/poll_message).
       inlay_portal_set_policy(sp, &pol);
       char msg_buf[128] = {};
+      policy_ok &= inlay_portal_peek_message_size(nullptr) == 0u &&
+                   inlay_portal_peek_message_size(sp) == 0u;
       policy_ok &= inlay_portal_poll_message(
                        sp, msg_buf, static_cast<uint32_t>(sizeof(msg_buf))) == 0u;
       policy_ok &= !inlay_portal_post_message(nullptr, ETCH_STR_LIT("{\"a\":1}"));
@@ -388,16 +390,29 @@ int main(int argc, char **argv) {
       policy_ok &= inlay_portal_post_message(sp, m2);
       policy_ok &= probe.msg_calls == 2u;
 
+      policy_ok &= inlay_portal_peek_message_size(sp) == m1.length &&
+                   inlay_portal_poll_message(sp, nullptr, 0u) == m1.length &&
+                   inlay_portal_peek_message_size(sp) == m1.length;
       const uint32_t len1 = inlay_portal_poll_message(
           sp, msg_buf, static_cast<uint32_t>(sizeof(msg_buf)));
       policy_ok &= len1 == m1.length &&
                    std::strcmp(msg_buf, "{\"type\":\"ping\",\"id\":1}") == 0;
+      policy_ok &= inlay_portal_peek_message_size(sp) == m2.length;
       char tiny_buf[6] = {};
       const uint32_t len2 = inlay_portal_poll_message(
           sp, tiny_buf, static_cast<uint32_t>(sizeof(tiny_buf)));
       policy_ok &= len2 == m2.length && tiny_buf[5] == '\0' &&
                    std::strcmp(tiny_buf, "{\"typ") == 0;
-      policy_ok &= inlay_portal_poll_message(
+      // Short buffer must preserve m2 in the queue (including exact len without room for NUL).
+      policy_ok &= inlay_portal_peek_message_size(sp) == m2.length &&
+                   inlay_portal_poll_message(sp, msg_buf, m2.length) == m2.length &&
+                   inlay_portal_peek_message_size(sp) == m2.length;
+      const uint32_t len2_full = inlay_portal_poll_message(
+          sp, msg_buf, static_cast<uint32_t>(sizeof(msg_buf)));
+      policy_ok &= len2_full == m2.length &&
+                   std::strcmp(msg_buf, "{\"type\":\"tool\",\"ok\":true}") == 0;
+      policy_ok &= inlay_portal_peek_message_size(sp) == 0u &&
+                   inlay_portal_poll_message(
                        sp, msg_buf, static_cast<uint32_t>(sizeof(msg_buf))) == 0u &&
                    msg_buf[0] == '\0';
 

@@ -1,5 +1,5 @@
 @PACKAGE_INIT@
 include(CMakeFindDependencyMacro)
-find_dependency(Etch 0.28 CONFIG REQUIRED)
+find_dependency(Etch 0.29 CONFIG REQUIRED)
 include("${CMAKE_CURRENT_LIST_DIR}/InlayTargets.cmake")
 check_required_components(Inlay)

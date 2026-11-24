@@ -56,19 +56,20 @@ int main(void) {
   inlay_inbox_destroy(inbox);
   if(!ok)return 1;
  }
-#if INLAY_VERSION_MAJOR != 0 || INLAY_VERSION_MINOR != 13
+#if INLAY_VERSION_MAJOR != 0 || INLAY_VERSION_MINOR != 14
 #error "Unexpected Inlay version"
 #endif
- /* Verify all v0.13.0 InlayUiKind enum values compile & remain distinct even with INLAY_ENABLE_SCRIPT=OFF */
+ /* Verify all v0.13-v0.14 InlayUiKind enum values compile & remain distinct even with INLAY_ENABLE_SCRIPT=OFF */
  {
-  const InlayUiKind v013_kinds[12]={
+  const InlayUiKind ui_kinds[14]={
    INLAY_UI_DOC, INLAY_UI_TERMINAL, INLAY_UI_VIRTUAL_LIST, INLAY_UI_TABLE,
    INLAY_UI_TREE, INLAY_UI_TREE_ITEM, INLAY_UI_MENU, INLAY_UI_CONTEXT_MENU,
-   INLAY_UI_AVATAR, INLAY_UI_TOAST, INLAY_UI_ACCORDION, INLAY_UI_SKELETON
+   INLAY_UI_AVATAR, INLAY_UI_TOAST, INLAY_UI_ACCORDION, INLAY_UI_SKELETON,
+   INLAY_UI_CODE_EDITOR, INLAY_UI_FORM
   };
-  for(size_t i=0;i<12u;++i) {
-   if(v013_kinds[i]<=INLAY_UI_SLOT)return 1;
-   for(size_t j=i+1u;j<12u;++j)if(v013_kinds[i]==v013_kinds[j])return 1;
+  for(size_t i=0;i<14u;++i) {
+   if(ui_kinds[i]<=INLAY_UI_SLOT)return 1;
+   for(size_t j=i+1u;j<14u;++j)if(ui_kinds[i]==ui_kinds[j])return 1;
   }
  }
  EtchContextDesc c=etch_context_desc_default();c.headless=true;
@@ -185,6 +186,7 @@ int main(void) {
  {
   InlayStream* stream=inlay_stream_create();
   if(!stream)return 1;
+  inlay_stream_set_max_bytes(stream,65536u);
   InlayStreamItem item={0};
   item.id=101u;
   item.message_id=1u;
@@ -202,6 +204,9 @@ int main(void) {
   char stream_json[512];
   const uint32_t sj_len=inlay_stream_export_json(stream,stream_json,(uint32_t)sizeof(stream_json));
   if(sj_len==0u || strstr(stream_json,"Hello world")==NULL)return 1;
+  char delta_json[512];
+  const uint32_t dj_len=inlay_stream_export_since_json(stream,cur0,delta_json,(uint32_t)sizeof(delta_json));
+  if(dj_len==0u || strstr(delta_json,"Hello world")==NULL)return 1;
   inlay_stream_destroy(stream);
  }
  /* Generative UI JSON schema validator & action lister C99 ABI smoke */
@@ -233,12 +238,29 @@ int main(void) {
  {
   InlayModel* model=inlay_model_create(read_c99_model_row,NULL);
   if(!model)return 1;
+  inlay_model_bind_context(model,ctx);
   const uint64_t r0=inlay_model_revision(model);
   inlay_model_set_count(model,12u);
   const uint64_t r1=inlay_model_revision(model);
   inlay_model_notify_change(model,2u,4u);
   const uint64_t r2=inlay_model_revision(model);
-  if(inlay_model_count(model)!=12u || r1<=r0 || r2<=r1)return 1;
+  InlayModelChange mc={0};
+  if(!inlay_model_last_change(model,&mc) || mc.kind!=INLAY_MODEL_CHANGE_UPDATE ||
+     mc.first_row!=2u || mc.count!=4u)return 1;
+  inlay_model_notify_insert(model,3u,2u);
+  const uint64_t r3=inlay_model_revision(model);
+  if(!inlay_model_last_change(model,&mc) || mc.kind!=INLAY_MODEL_CHANGE_INSERT ||
+     mc.first_row!=3u || mc.count!=2u)return 1;
+  inlay_model_notify_remove(model,3u,2u);
+  const uint64_t r4=inlay_model_revision(model);
+  if(!inlay_model_last_change(model,&mc) || mc.kind!=INLAY_MODEL_CHANGE_REMOVE ||
+     mc.first_row!=3u || mc.count!=2u)return 1;
+  inlay_model_notify_move(model,1u,5u,2u);
+  const uint64_t r5=inlay_model_revision(model);
+  if(!inlay_model_last_change(model,&mc) || mc.kind!=INLAY_MODEL_CHANGE_MOVE ||
+     mc.first_row!=1u || mc.dst_row!=5u || mc.count!=2u || mc.revision!=r5)return 1;
+  if(inlay_model_count(model)!=12u || r1<=r0 || r2<=r1 || r3<=r2 || r4<=r3 || r5<=r4)return 1;
+  inlay_model_bind_context(model,NULL);
   inlay_model_destroy(model);
  }
  /* Async image loader C99 ABI smoke */
@@ -280,9 +302,14 @@ int main(void) {
   if(!cur_url.chars || cur_url.length!=24u || memcmp(cur_url.chars,"https://safe.inlay.dev/a",24u)!=0)return 1;
   if(!inlay_portal_go_forward(portal) || !inlay_portal_reload(portal))return 1;
   if(!inlay_portal_post_message(portal,ETCH_STR_LIT("{\"ping\":1}")))return 1;
+  if(inlay_portal_peek_message_size(portal)!=10u)return 1;
+  char tiny_pmsg[4];
+  if(inlay_portal_poll_message(portal,tiny_pmsg,(uint32_t)sizeof(tiny_pmsg))!=10u ||
+     strcmp(tiny_pmsg,"{\"p")!=0 || inlay_portal_peek_message_size(portal)!=10u)return 1;
   char pmsg[64];
   const uint32_t pmsg_len=inlay_portal_poll_message(portal,pmsg,(uint32_t)sizeof(pmsg));
-  if(pmsg_len!=10u || strcmp(pmsg,"{\"ping\":1}")!=0)return 1;
+  if(pmsg_len!=10u || strcmp(pmsg,"{\"ping\":1}")!=0 ||
+     inlay_portal_peek_message_size(portal)!=0u)return 1;
   EtchFrameDesc pf=etch_frame_desc_default();
   pf.viewport_w=320;pf.viewport_h=240;
   InlayPortalViewDesc pv=inlay_portal_view_desc_default();
@@ -363,37 +390,51 @@ int main(void) {
  const uint32_t diag_svg_len=inlay_diagram_export_svg(ETCH_STR_LIT("flowchart LR\nA --> B"),&diagram,diag_svg,(uint32_t)sizeof(diag_svg));
  char math_svg[8192];
  const uint32_t math_svg_len=inlay_math_export_svg(ETCH_STR_LIT("\\frac{a+b}{c}"),&math,math_svg,(uint32_t)sizeof(math_svg));
+ char math_ml[4096];
+ const uint32_t math_ml_len=inlay_math_export_mathml(ETCH_STR_LIT("\\frac{a+b}{c}"),math_ml,(uint32_t)sizeof(math_ml));
  etch_end_frame(ctx);
  if(bad_res.total_rows!=0 || !dashed || legacy_res.total_rows!=7 ||
     !legacy_graph.valid || legacy_graph.scale!=1.0f ||
     !fit_graph.valid || fit_graph.scale>=1.0f || fit_graph.width>220.5f ||
     fit_graph.natural_width<=220.0f ||
     diag_svg_len==0u || strstr(diag_svg,"<svg")==NULL ||
-    math_svg_len==0u || strstr(math_svg,"<svg")==NULL)return 1;
- /* Doc HTML export & Mermaid diagram cache stats C99 ABI smoke */
+    math_svg_len==0u || strstr(math_svg,"<svg")==NULL ||
+    math_ml_len==0u || strstr(math_ml,"<math")==NULL)return 1;
+ /* Doc HTML export, outline, multi-match find & Mermaid diagram cache stats C99 ABI smoke */
  {
   char html_buf[4096];
   const uint32_t html_len=inlay_doc_export_html(doc,html_buf,(uint32_t)sizeof(html_buf));
   if(html_len==0u || strstr(html_buf,"C99 consumer")==NULL)return 1;
+  const uint32_t outline_cnt=inlay_doc_outline_count(doc);
+  InlayDocOutlineEntry outline_entry={0};
+  if(outline_cnt!=1u || !inlay_doc_outline_at(doc,0u,&outline_entry) ||
+     outline_entry.level!=1u || !outline_entry.text.chars || outline_entry.text.length==0u)return 1;
+  InlayDocSelection matches[4];
+  memset(matches,0,sizeof(matches));
+  const uint32_t match_cnt=inlay_doc_view_find_all(doc,view.id,ETCH_STR_LIT("C99"),matches,4u);
+  if(match_cnt<1u || !matches[0].active)return 1;
   uint32_t cache_entries=0u;
   uint64_t cache_hits=0u,cache_misses=0u;
   inlay_doc_diagram_cache_stats(doc,&cache_entries,&cache_hits,&cache_misses);
   (void)cache_entries;(void)cache_hits;(void)cache_misses;
  }
- /* Selection + plain text / markdown copy API smoke */
+ /* Selection + plain text / markdown / HTML copy API smoke */
  inlay_doc_view_select_all(doc,view.id);
  const InlayDocSelection sel=inlay_doc_view_selection(doc,view.id);
  char plain_buf[256];
  const uint32_t plain_len=inlay_doc_view_copy_plain_text(doc,view.id,plain_buf,(uint32_t)sizeof(plain_buf));
  char md_buf[256];
  const uint32_t md_len=inlay_doc_view_copy_markdown(doc,view.id,md_buf,(uint32_t)sizeof(md_buf));
+ char sel_html_buf[4096];
+ const uint32_t sel_html_len=inlay_doc_view_copy_html(doc,view.id,sel_html_buf,(uint32_t)sizeof(sel_html_buf));
  inlay_doc_view_clear_selection(doc,view.id);
  const InlayBlock* img_blk=inlay_doc_block(doc,2);
  const InlayBlock* fn_blk=inlay_doc_block(doc,3);
  const bool ok=estimate>0 && called && img_called && custom_called && hdr_called && diag_hdr_called &&
                result.clicked_kind==INLAY_INLINE_TEXT && result.clicked_mods==0 &&
-               sel.active && sel.focus==sel.total_bytes && plain_len>0 && md_len>0 &&
+               sel.active && sel.focus==sel.total_bytes && plain_len>0 && md_len>0 && sel_html_len>0 &&
                strstr(plain_buf,"C99 consumer")!=NULL && strstr(md_buf,"# C99 consumer")!=NULL &&
+               strstr(sel_html_buf,"C99 consumer")!=NULL &&
                !inlay_doc_view_selection(doc,view.id).active &&
                result.at_bottom && inlay_doc_view_is_at_bottom(view.id) &&
                result.measured_height_px>0 &&
