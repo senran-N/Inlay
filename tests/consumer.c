@@ -61,16 +61,46 @@ int main(void) {
 #endif
  /* Verify all v0.13-v0.14 InlayUiKind enum values compile & remain distinct even with INLAY_ENABLE_SCRIPT=OFF */
  {
-  const InlayUiKind ui_kinds[14]={
+  const InlayUiKind ui_kinds[25]={
    INLAY_UI_DOC, INLAY_UI_TERMINAL, INLAY_UI_VIRTUAL_LIST, INLAY_UI_TABLE,
    INLAY_UI_TREE, INLAY_UI_TREE_ITEM, INLAY_UI_MENU, INLAY_UI_CONTEXT_MENU,
    INLAY_UI_AVATAR, INLAY_UI_TOAST, INLAY_UI_ACCORDION, INLAY_UI_SKELETON,
-   INLAY_UI_CODE_EDITOR, INLAY_UI_FORM
+   INLAY_UI_CODE_EDITOR, INLAY_UI_FORM, INLAY_UI_PORTAL,
+   INLAY_UI_DOCK_SPACE, INLAY_UI_DOCK_PANE, INLAY_UI_SHEET, INLAY_UI_HOVER_CARD,
+   INLAY_UI_RADIO_GROUP, INLAY_UI_TOGGLE_GROUP, INLAY_UI_COLOR_PICKER, INLAY_UI_CHART,
+   INLAY_UI_VIEW_ZONE, INLAY_UI_DIFF_VIEW
   };
-  for(size_t i=0;i<14u;++i) {
+  for(size_t i=0;i<25u;++i) {
    if(ui_kinds[i]<=INLAY_UI_SLOT)return 1;
-   for(size_t j=i+1u;j<14u;++j)if(ui_kinds[i]==ui_kinds[j])return 1;
+   for(size_t j=i+1u;j<25u;++j)if(ui_kinds[i]==ui_kinds[j])return 1;
   }
+  const InlayTerminalSnapshot tsnap=inlay_terminal_snapshot_default();
+  if(tsnap.struct_size!=(uint32_t)sizeof(InlayTerminalSnapshot) || !tsnap.cursor_visible)return 1;
+  const InlayPortalState pstate=inlay_portal_state_default();
+  if(pstate.struct_size!=(uint32_t)sizeof(InlayPortalState) || pstate.zoom_factor!=1.0f)return 1;
+  const InlayPortalFindResult pfind=inlay_portal_find_result_default();
+  if(pfind.struct_size!=(uint32_t)sizeof(InlayPortalFindResult) || pfind.active)return 1;
+  const InlayPortalMacOSOptions pmac=inlay_portal_macos_options_default();
+  const InlayPortalGtkOptions pgtk=inlay_portal_gtk_options_default();
+  if(pmac.struct_size!=(uint32_t)sizeof(InlayPortalMacOSOptions) ||
+     pgtk.struct_size!=(uint32_t)sizeof(InlayPortalGtkOptions))return 1;
+  (void)inlay_portal_native_backend();
+  EtchRect dummy_rect={0};
+  if(inlay_doc_view_selection_rect(NULL,0u,&dummy_rect))return 1;
+  if(inlay_portal_state(NULL,NULL) || inlay_portal_set_zoom(NULL,1.0f) ||
+     inlay_portal_find_in_page(NULL,ETCH_STR_LIT("a"),true,false) || inlay_portal_stop_find(NULL) ||
+     inlay_portal_find_status(NULL,NULL) ||
+     inlay_portal_inject_mouse_button(NULL,(EtchVec2){0.0f,0.0f},1u,true) ||
+     inlay_portal_capture_preview_rgba(NULL,NULL,0u,0u))return 1;
+  (void)inlay_surface_bind_terminal(NULL,ETCH_STR_LIT("t"),NULL,NULL);
+  (void)inlay_surface_bind_portal(NULL,ETCH_STR_LIT("p"),NULL);
+  (void)inlay_surface_bind_stream(NULL,ETCH_STR_LIT("s"),NULL);
+  inlay_surface_set_console_callback(NULL,NULL,NULL);
+  inlay_surface_set_storage_hooks(NULL,NULL,NULL,NULL,NULL);
+  inlay_surface_set_code_tokenizer(NULL,NULL,NULL);
+  inlay_surface_set_doc_hooks(NULL,NULL,NULL,NULL,NULL,NULL);
+  (void)inlay_surface_register_module(NULL,ETCH_STR_LIT("m"),ETCH_STR_LIT(""));
+  (void)inlay_surface_unregister_module(NULL,ETCH_STR_LIT("m"));
  }
  EtchContextDesc c=etch_context_desc_default();c.headless=true;
  EtchContext* ctx=etch_create_context(&c);if(!ctx)return 1;
@@ -106,7 +136,7 @@ int main(void) {
     inlay_surface_poll_async_action(NULL).kind!=INLAY_ASYNC_ACTION_NONE)return 1;
  const InlaySurfaceDesc surface=inlay_surface_desc_default();
  if(surface.struct_size!=(uint32_t)sizeof(InlaySurfaceDesc) ||
-    surface.disable_jsx ||
+    surface.disable_jsx || surface.max_state_bytes!=65536u ||
     surface.max_tick_ms<=0 || inlay_surface_stats(NULL).js_ticks || inlay_surface_next_timer_ms(NULL)!=-1 ||
     inlay_surface_set_script(NULL,ETCH_STR_LIT("")) || inlay_surface_bind_slot(NULL,ETCH_STR_LIT("slot"),render_c99_slot,NULL))return 1;
  InlaySurfaceDesc bad_surface=surface;bad_surface.struct_size=1u;
@@ -297,7 +327,10 @@ int main(void) {
   if(!inlay_portal_load_url(portal,ETCH_STR_LIT("https://safe.inlay.dev/a")) ||
      !inlay_portal_load_url(portal,ETCH_STR_LIT("https://safe.inlay.dev/b")) ||
      !inlay_portal_can_go_back(portal) || inlay_portal_can_go_forward(portal) ||
-     !inlay_portal_go_back(portal) || !inlay_portal_can_go_forward(portal))return 1;
+     !inlay_portal_go_back(portal) || !inlay_portal_can_go_forward(portal) ||
+     !inlay_portal_eval_script(portal,ETCH_STR_LIT("1+1")) ||
+     !inlay_portal_add_init_script(portal,ETCH_STR_LIT("window.__c99=1;")) ||
+     !inlay_portal_open_devtools(portal))return 1;
   const EtchStr cur_url=inlay_portal_current_url(portal);
   if(!cur_url.chars || cur_url.length!=24u || memcmp(cur_url.chars,"https://safe.inlay.dev/a",24u)!=0)return 1;
   if(!inlay_portal_go_forward(portal) || !inlay_portal_reload(portal))return 1;
@@ -332,11 +365,18 @@ int main(void) {
     style.mono_font_id!=ETCH_INVALID_FONT || style.has_background ||
     style.inline_code_no_border || style.inline_code_padding_x!=0.0f ||
     style.inline_code_padding_y!=0.0f || style.inline_code_radius_px!=0.0f ||
-    style.alert_bg_alpha!=0.0f)return 1;
+    style.alert_bg_alpha!=0.0f || style.code_border_width!=0.0f ||
+    style.code_radius_px!=0.0f || style.quote_border_width!=0.0f ||
+    style.table_border_width!=0.0f || style.quote_no_bg)return 1;
  style.has_background=true;
  style.highlight_bg=etch_rgba8(255,220,80,120);
  style.inline_code_no_border=true;
  style.inline_code_radius_px=4.0f;
+ style.code_border_width=0.5f;
+ style.code_radius_px=6.0f;
+ style.quote_border_width=0.5f;
+ style.table_border_width=0.5f;
+ style.quote_no_bg=true;
  style.alert_colors[0]=etch_rgba8(64,156,255,255);
  InlayDocViewDesc view=inlay_doc_view_desc_default();
  if(view.struct_size!=(uint32_t)sizeof(InlayDocViewDesc) ||
@@ -384,8 +424,10 @@ int main(void) {
  const InlayDiagramResult fit_graph=inlay_diagram_layout(ETCH_STR_LIT("flowchart LR\nA[One] --> B[Two] --> C[Three] --> D[Four]"),&fit_diag);
  const InlayDocResult result=inlay_doc_view(doc,&view);
  const InlayDiagramResult graph=inlay_diagram_layout(ETCH_STR_LIT("flowchart TD\nA -. retry .-> B"),&diagram);
+ const InlayDiagramResult state_g=inlay_diagram_layout(ETCH_STR_LIT("stateDiagram-v2\n[*] --> Ready\nReady --> [*]"),&diagram);
  const bool dashed=graph.valid && graph.edge_count==1 && graph.edges[0].dashed && graph.edges[0].label.length==5 &&
-                   graph.scale==1.0f && graph.natural_width==graph.width;
+                   graph.scale==1.0f && graph.natural_width==graph.width &&
+                   state_g.valid && state_g.node_count==3 && state_g.edge_count==2;
  char diag_svg[8192];
  const uint32_t diag_svg_len=inlay_diagram_export_svg(ETCH_STR_LIT("flowchart LR\nA --> B"),&diagram,diag_svg,(uint32_t)sizeof(diag_svg));
  char math_svg[8192];
@@ -432,6 +474,7 @@ int main(void) {
  const InlayBlock* fn_blk=inlay_doc_block(doc,3);
  const bool ok=estimate>0 && called && img_called && custom_called && hdr_called && diag_hdr_called &&
                result.clicked_kind==INLAY_INLINE_TEXT && result.clicked_mods==0 &&
+               result.clicked_diagram_node.length==0u &&
                sel.active && sel.focus==sel.total_bytes && plain_len>0 && md_len>0 && sel_html_len>0 &&
                strstr(plain_buf,"C99 consumer")!=NULL && strstr(md_buf,"# C99 consumer")!=NULL &&
                strstr(sel_html_buf,"C99 consumer")!=NULL &&

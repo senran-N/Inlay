@@ -1,4 +1,6 @@
 #include <inlay/inlay_c.h>
+#include <SDL3/SDL_events.h>
+#include <SDL3/SDL_timer.h>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -994,6 +996,1326 @@ bool test_inbox_drain_to_surface(EtchContext* ctx) {
     return ok;
 }
 
+struct LiveTermCtx {
+    EtchTerminalCell cells[40];
+    uint32_t reads;
+};
+
+static bool read_live_term(InlayTerminalSnapshot* out, void* user) {
+    auto* t = static_cast<LiveTermCtx*>(user);
+    if (!t || !out) return false;
+    ++t->reads;
+    out->cells = t->cells;
+    out->cell_count = 40u;
+    out->columns = 10u;
+    out->rows = 4u;
+    out->cursor_column = 2;
+    out->cursor_row = 1;
+    out->cursor_shape = ETCH_TERMINAL_CURSOR_BLOCK;
+    out->cursor_visible = true;
+    out->revision = t->reads;
+    return true;
+}
+
+static bool test_ade_surface_upgrades(EtchContext* ctx) {
+    bool ok = true;
+    // 1. useReducer + createContext / useContext / provideContext + memo() invalidation
+    {
+        InlaySurface* s = inlay_surface_create(ctx, nullptr);
+        if (!s) return true; // Script engine disabled (INLAY_ENABLE_SCRIPT=OFF)
+        static const char kScript[] =
+            "const ThemeCtx = createContext('light');\n"
+            "let memoRenders = 0;\n"
+            "let dispatchRef = null;\n"
+            "const Leaf = memo(function Leaf() {\n"
+            "  memoRenders++;\n"
+            "  const t = useContext(ThemeCtx);\n"
+            "  return <Text>{t + ':' + memoRenders}</Text>;\n"
+            "});\n"
+            "function Counter(p) {\n"
+            "  const [st, dispatch] = useReducer((cur, act) => act === 'inc' ? {n: cur.n + 1} : cur, {n: 0});\n"
+            "  if (!dispatchRef) dispatchRef = dispatch;\n"
+            "  if (dispatchRef !== dispatch) throw new Error('unstable dispatch');\n"
+            "  if (p.bump > st.n) dispatch('inc');\n"
+            "  return <Box><Text>{'cnt=' + st.n}</Text><Leaf /></Box>;\n"
+            "}\n"
+            "function render(state) {\n"
+            "  return <ThemeCtx.Provider value={state.theme}>{() => <Counter bump={state.bump} />}</ThemeCtx.Provider>;\n"
+            "}\n";
+        ok &= check(inlay_surface_set_state_json(s, ETCH_STR_LIT("{\"theme\":\"light\",\"bump\":0}")),
+                    "set initial context state");
+        ok &= check(inlay_surface_set_script(s, {kScript, uint32_t(sizeof(kScript) - 1u), true}),
+                    "load hooks/context script");
+        auto find_text = [&](const char* substr) -> bool {
+            uint32_t cnt = 0u;
+            const InlayUiNode* nodes = inlay_surface_nodes(s, &cnt);
+            for (uint32_t i = 0u; i < cnt; ++i) {
+                if (nodes[i].kind == INLAY_UI_TEXT && nodes[i].text.chars && nodes[i].text.length) {
+                    if (std::strstr(nodes[i].text.chars, substr) != nullptr) return true;
+                }
+            }
+            return false;
+        };
+        ok &= check(find_text("light:1") && find_text("cnt=0"), "initial context & reducer render");
+        // Changing bump triggers reducer without changing theme: memo Leaf stays at 1 render
+        ok &= check(inlay_surface_set_state_json(s, ETCH_STR_LIT("{\"theme\":\"light\",\"bump\":1}")),
+                    "bump reducer state");
+        ok &= check(find_text("light:1") && find_text("cnt=1"), "memo preserved when context unchanged");
+        // Changing theme invalidates memo Leaf even with identical props!
+        ok &= check(inlay_surface_set_state_json(s, ETCH_STR_LIT("{\"theme\":\"dark\",\"bump\":1}")),
+                    "switch context theme");
+        ok &= check(find_text("dark:2") && find_text("cnt=1"), "memo invalidated on context change");
+        inlay_surface_destroy(s);
+    }
+
+    // 2. Sandboxed ES Module Loader (with JSX transpilation & path escape rejection)
+    {
+        InlaySurface* s = inlay_surface_create(ctx, nullptr);
+        ok &= check(s != nullptr, "create surface for es modules");
+        if (!s) return false;
+        ok &= check(inlay_surface_register_module(s, ETCH_STR_LIT("utils/fmt.js"),
+                        ETCH_STR_LIT("export function fmt(x) { return '[' + x + ']'; }")),
+                    "register js module");
+        ok &= check(inlay_surface_register_module(s, ETCH_STR_LIT("ui/pill.jsx"),
+                        ETCH_STR_LIT("import { fmt } from '../utils/fmt';\nexport function Pill(p) { return <Badge>{fmt(p.text)}</Badge>; }")),
+                    "register jsx module with relative import");
+        static const char kEntry[] =
+            "import { Pill } from 'ui/pill';\n"
+            "export function render(state) { return <Box><Pill text={state.tag || 'ok'} /></Box>; }\n";
+        ok &= check(inlay_surface_set_state_json(s, ETCH_STR_LIT("{\"tag\":\"esm\"}")), "set esm state");
+        ok &= check(inlay_surface_set_script(s, {kEntry, uint32_t(sizeof(kEntry) - 1u), true}),
+                    "eval es module entry script");
+        uint32_t cnt = 0u;
+        const InlayUiNode* nodes = inlay_surface_nodes(s, &cnt);
+        bool saw_esm = false;
+        for (uint32_t i = 0u; i < cnt; ++i) {
+            if (nodes[i].text.chars && std::strstr(nodes[i].text.chars, "[esm]") != nullptr) saw_esm = true;
+        }
+        ok &= check(saw_esm, "esm jsx component rendered imported helper");
+        // Sandbox escape & unregistered module must fail safely
+        ok &= check(!inlay_surface_set_script(s, ETCH_STR_LIT("import x from '../../etc/passwd'; export function render(){return <Box/>;}")),
+                    "sandbox rejects path traversal import");
+        ok &= check(inlay_surface_unregister_module(s, ETCH_STR_LIT("ui/pill.jsx")), "unregister module");
+        ok &= check(!inlay_surface_set_script(s, {kEntry, uint32_t(sizeof(kEntry) - 1u), true}),
+                    "unregistered module fails cleanly");
+        inlay_surface_destroy(s);
+    }
+
+    // 3. Live zero-copy Terminal binding, declarative <Portal>, <Input autoGrow>, and .d.ts export
+    {
+        InlaySurface* s = inlay_surface_create(ctx, nullptr);
+        InlayPortalDesc pdesc = inlay_portal_desc_default();
+        pdesc.width = 200u;
+        pdesc.height = 120u;
+        InlayPortal* portal = inlay_portal_create(ctx, &pdesc);
+        ok &= check(s != nullptr && portal != nullptr, "create surface & portal");
+        if (!s || !portal) {
+            inlay_portal_destroy(portal);
+            inlay_surface_destroy(s);
+            return false;
+        }
+        LiveTermCtx tctx = {};
+        for (uint32_t i = 0u; i < 40u; ++i) {
+            tctx.cells[i] = etch_terminal_cell_default();
+            tctx.cells[i].codepoint = 'A' + (i % 26u);
+        }
+        ok &= check(inlay_surface_bind_terminal(s, ETCH_STR_LIT("pty0"), read_live_term, &tctx),
+                    "bind live terminal");
+        ok &= check(inlay_surface_bind_portal(s, ETCH_STR_LIT("preview"), portal),
+                    "bind declarative portal");
+        static const char kUi[] =
+            "function render(st) {\n"
+            "  return <Col width={420} height={360} gap={8}>\n"
+            "    <Terminal buffer='pty0' width={240} height={96} autoFit focusable cursorShape='block'\n"
+            "      onResize={(ev, s) => { s.termCols = ev.cols; s.termRows = ev.rows; }} />\n"
+            "    <Portal name='preview' width={200} height={120} cls='rounded-md' />\n"
+            "    <Input multiline autoGrow minHeight={40} maxHeight={140} value='line1\\nline2' />\n"
+            "  </Col>;\n"
+            "}\n";
+        ok &= check(inlay_surface_set_state_json(s, ETCH_STR_LIT("{\"termCols\":0,\"termRows\":0}")), "set ui state");
+        ok &= check(inlay_surface_set_script(s, {kUi, uint32_t(sizeof(kUi) - 1u), true}), "load live term/portal/autogrow");
+
+        EtchFrameDesc fd = etch_frame_desc_default();
+        fd.viewport_w = 480u;
+        fd.viewport_h = 400u;
+        InlaySurfaceViewDesc sv = inlay_surface_view_desc_default();
+        sv.id = etch_id("ade_surface_view");
+        sv.width_px = 420.f;
+        sv.height_px = 360.f;
+        for (int f = 0; f < 2; ++f) {
+            etch_begin_frame(ctx, &fd);
+            inlay_surface_view(s, &sv);
+            etch_end_frame(ctx);
+            ok &= check(inlay_portal_end_frame_sync(portal, true), "declarative portal syncs geometry");
+        }
+        ok &= check(tctx.reads >= 2u, "live terminal read_fn invoked directly each frame");
+        const EtchStr st = inlay_surface_state_json(s);
+        ok &= check(st.chars && std::strstr(st.chars, "\"termCols\":0") == nullptr,
+                    "terminal onResize reported visible columns");
+
+        char dts[16384] = {};
+        const uint32_t dlen = inlay_surface_export_dts(s, dts, uint32_t(sizeof(dts)));
+        ok &= check(dlen > 0u &&
+                    std::strstr(dts, "TerminalName = 'pty0'") != nullptr &&
+                    std::strstr(dts, "PortalName = 'preview'") != nullptr &&
+                    std::strstr(dts, "useReducer") != nullptr &&
+                    std::strstr(dts, "createContext") != nullptr &&
+                    std::strstr(dts, "autoGrow?: boolean") != nullptr,
+                    "export_dts covers new hooks, terminal, portal, autoGrow");
+
+        ok &= check(inlay_surface_bind_portal(s, ETCH_STR_LIT("preview"), nullptr), "unbind portal");
+        ok &= check(inlay_surface_bind_terminal(s, ETCH_STR_LIT("pty0"), nullptr, nullptr), "unbind terminal");
+        inlay_surface_destroy(s);
+        ok &= check(inlay_portal_destroy(portal), "destroy portal");
+    }
+    return ok;
+}
+
+static bool test_orca_round2_bridge(EtchContext* ctx) {
+    bool ok = true;
+    InlaySurfaceDesc r2_desc = inlay_surface_desc_default();
+    r2_desc.max_tick_ms = 50.f;
+    InlaySurface* s = inlay_surface_create(ctx, &r2_desc);
+    if (!s) return true; // Script engine disabled
+
+    // Bind a host EtchTextBuffer & live terminal for full CodeEditor + Terminal bridge verification
+    EtchTextBuffer* buf = etch_create_text_buffer(ETCH_STR_LIT("int a = 1;\nint b = 2;\nint c = 3;\n"), 0u);
+    LiveTermCtx tctx = {};
+    for (uint32_t i = 0u; i < 40u; ++i) {
+        tctx.cells[i] = etch_terminal_cell_default();
+        tctx.cells[i].codepoint = (i < 10u) ? ('a' + i) : ' ';
+    }
+    ok &= check(buf != nullptr, "create code editor buffer for round 2");
+    if (!buf) { inlay_surface_destroy(s); return false; }
+
+    ok &= check(inlay_surface_bind_text_buffer(s, ETCH_STR_LIT("diff.cpp"), buf), "bind text buffer");
+    ok &= check(inlay_surface_bind_terminal(s, ETCH_STR_LIT("term0"), read_live_term, &tctx), "bind terminal");
+
+    static const char kScript[] =
+        "function render(st) {\n"
+        "  const fm = fuzzyMatch('op', 'open_panel');\n"
+        "  clipboardWrite('orca_clip_ok');\n"
+        "  const clip = clipboardRead();\n"
+        "  pushFocusRestorePoint();\n"
+        "  popFocusRestorePoint();\n"
+        "  setUiZoom(1.25);\n"
+        "  const zm = getUiZoom();\n"
+        "  setUiZoom(1.0);\n"
+        "  return <Col id='r2_root' width={680} height={540} gap={6} globalKeys\n"
+        "    onKeyDown={(ev, s) => { s.lastKey = ev.key; }}\n"
+        "    onFileDrop={(ev, s) => { s.droppedCount = ev.files.length; }}>\n"
+        "    <Text>{'fm=' + (fm.matched ? fm.score : -1) + ',clip=' + clip + ',zm=' + zm.toFixed(2)}</Text>\n"
+        "    <Row gap={8}>\n"
+        "      <Box id='drag_src' width={80} height={28} draggable dragKind='tab' dragLabel='T1' dragData={{id:1}}><Text>Drag</Text></Box>\n"
+        "      <Box id='drop_dst' width={80} height={28} dropAccept='tab' onDrop={(ev, s) => { s.dropped = ev.label; }}><Text>Drop</Text></Box>\n"
+        "      <RadioGroup items={['A','B']} value={st.radio} direction='row' onChange={(v, s) => { s.radio = v; }} />\n"
+        "      <ToggleGroup items={['Bold','Italic']} values={['Bold']} multiple variant='outline' onChange={(v, s) => { s.toggles = v.length; }} />\n"
+        "    </Row>\n"
+        "    <Input value='hi @main.cpp' width={240}\n"
+        "      highlights={[{offset:3,length:9,color:'#38bdf8',bg:'rgba(56,189,248,0.2)',radius:4,atomic:true}]}\n"
+        "      ghostText=' ...' acceptGhostOnTab\n"
+        "      onPasteImage={(ok, s) => { s.pastedImg = ok; }}\n"
+        "      onCaret={(ev, s) => { s.caret = ev.cursor; }} />\n"
+        "    <CodeEditor buffer='diff.cpp' width={360} autoHeight showOverviewRuler stickyHeader='diff.cpp'\n"
+        "      inlineHighlights={[{line:0,startCol:4,endCol:5,bg:'#22c55e'}]}\n"
+        "      overviewMarkers={[{line:1,color:'#ef4444',lane:0}]}\n"
+        "      inlayHints={[{line:0,col:9,text:': i32'}]}\n"
+        "      lineDecorations={[{line:0,gutterTag:'+',rowBg:'rgba(34,197,94,0.12)'}]}\n"
+        "      folds={[{start:1,end:2,collapsed:false}]}\n"
+        "      viewZones={[{id:7,afterLine:0,height:32}]}\n"
+        "      onGutterRange={(ev, s) => { s.gStart = ev.startLine; }}>\n"
+        "      <ViewZone zoneId={7}><Text>Inline Diff Comment</Text></ViewZone>\n"
+        "    </CodeEditor>\n"
+        "    <Terminal buffer='term0' width={240} height={80} interactiveSelection\n"
+        "      searchMatches={[{row:0,startCol:0,endCol:3,active:true}]}\n"
+        "      onSelectionChange={(ev, s) => { s.termSel = ev.hasSelection; }}\n"
+        "      onWheel={(ev, s) => { s.termWheel = ev.deltaY; }} />\n"
+        "    <DockSpace width={360} height={90} defaultSplit='horizontal' defaultSplitRatio={0.5}>\n"
+        "      <DockPane paneId='left' title='Explorer' pinned dirty badgeColor='#22c55e'><Text>L</Text></DockPane>\n"
+        "      <DockPane paneId='right' title='Editor' splitSecond><Text>R</Text></DockPane>\n"
+        "    </DockSpace>\n"
+        "    <Row gap={8}>\n"
+        "      <HoverCard openDelayMs={0}><Text>HoverMe</Text><Text>CardBody</Text></HoverCard>\n"
+        "      <ColorPicker value='#3b82f6' onChange={(c, s) => { s.color = c; }} />\n"
+        "      <Chart variant='area' values={[10,25,18,40]} labels={['M','T','W','T']} chartHeight={64} />\n"
+        "    </Row>\n"
+        "    <Doc markdown='Streaming **bold' streamingRepair />\n"
+        "    <Sheet open={st.sheetOpen} edge='right' extent={240} onClose={(v, s) => { s.sheetOpen = v; }}><Text>Drawer</Text></Sheet>\n"
+        "    <Toast open title='Stacked' description='Msg' stackIndex={1} durationMs={60000} />\n"
+        "  </Col>;\n"
+        "}\n";
+
+    ok &= check(inlay_surface_set_state_json(s, ETCH_STR_LIT(
+        "{\"radio\":\"A\",\"toggles\":1,\"sheetOpen\":true,\"lastKey\":\"\",\"droppedCount\":0,\"color\":\"#3b82f6\"}")),
+        "set round 2 initial state");
+    ok &= check(inlay_surface_set_script(s, {kScript, uint32_t(sizeof(kScript) - 1u), true}),
+                "load round 2 bridge script");
+    if (inlay_surface_stats(s).has_error) {
+        const EtchStr err = inlay_surface_error(s);
+        std::fprintf(stderr, "round 2 surface error: %.*s\n", int(err.length), err.chars ? err.chars : "");
+    }
+    ok &= check(!inlay_surface_stats(s).has_error, "round 2 script has zero errors");
+
+    // Verify JS host globals output landed in rendered text node
+    bool saw_globals = false;
+    {
+        uint32_t cnt = 0u;
+        const InlayUiNode* nodes = inlay_surface_nodes(s, &cnt);
+        for (uint32_t i = 0u; i < cnt; ++i) {
+            if (nodes[i].kind == INLAY_UI_TEXT && nodes[i].text.chars &&
+                std::strstr(nodes[i].text.chars, "clip=orca_clip_ok,zm=1.25") != nullptr) {
+                saw_globals = true;
+            }
+        }
+    }
+    ok &= check(saw_globals, "fuzzyMatch + clipboard + uiZoom globals executed cleanly");
+
+    EtchFrameDesc fd = etch_frame_desc_default();
+    fd.viewport_w = 720u;
+    fd.viewport_h = 600u;
+    InlaySurfaceViewDesc sv = inlay_surface_view_desc_default();
+    sv.id = etch_id("r2_surface_view");
+    sv.width_px = 680.f;
+    sv.height_px = 540.f;
+
+    // Frame 1: initial layout + render of all Round 2 widgets
+    etch_begin_frame(ctx, &fd);
+    inlay_surface_view(s, &sv);
+    etch_end_frame(ctx);
+
+    // Frame 2: global onKeyDown (Enter) + OS file drop onto root via SDL drop events
+    const EtchRect rb = etch_element_bounds(etch_id("r2_root"));
+    {
+        SDL_Event ev = {};
+        ev.type = SDL_EVENT_DROP_BEGIN;
+        ev.drop.x = rb.x + 20.f;
+        ev.drop.y = rb.y + 20.f;
+        etch_process_event(ctx, &ev);
+        ev = {};
+        ev.type = SDL_EVENT_DROP_FILE;
+        ev.drop.x = rb.x + 20.f;
+        ev.drop.y = rb.y + 20.f;
+        ev.drop.data = "d:/repo/readme.md";
+        etch_process_event(ctx, &ev);
+        ev = {};
+        ev.type = SDL_EVENT_DROP_COMPLETE;
+        ev.drop.x = rb.x + 20.f;
+        ev.drop.y = rb.y + 20.f;
+        etch_process_event(ctx, &ev);
+    }
+    fd.key_pressed_code = 13u; // SDLK_RETURN
+    etch_begin_frame(ctx, &fd);
+    inlay_surface_view(s, &sv);
+    etch_end_frame(ctx);
+    fd.key_pressed_code = 0u;
+
+    const EtchStr st_json = inlay_surface_state_json(s);
+    ok &= check(st_json.chars && std::strstr(st_json.chars, "\"lastKey\":\"Enter\"") != nullptr,
+                "globalKeys onKeyDown fired Enter");
+    ok &= check(st_json.chars && std::strstr(st_json.chars, "\"droppedCount\":1") != nullptr,
+                "OS file drop delivered to onFileDrop");
+
+    // Verify .d.ts includes Round 2 declarations
+    char dts[24576] = {};
+    const uint32_t dlen = inlay_surface_export_dts(s, dts, uint32_t(sizeof(dts)));
+    ok &= check(dlen > 0u &&
+                std::strstr(dts, "fuzzyMatch(") != nullptr &&
+                std::strstr(dts, "setUiZoom(") != nullptr &&
+                std::strstr(dts, "inlineHighlights?:") != nullptr &&
+                std::strstr(dts, "dockSpace(") != nullptr &&
+                std::strstr(dts, "colorPicker(") != nullptr &&
+                std::strstr(dts, "chart(") != nullptr,
+                "export_dts documents Round 2 bridge");
+
+    // Multi-surface shared InlayModel smoke (2 surfaces bound to 1 host model)
+    InlayModel* shared_model = inlay_model_create([](uint32_t i, InlayModelRow* out, void*) -> bool {
+        out->row_id = uint64_t(i) + 1u;
+        out->label = ETCH_STR_LIT("SharedRow");
+        return true;
+    }, nullptr);
+    if (shared_model) {
+        inlay_model_bind_context(shared_model, ctx);
+        inlay_model_set_count(shared_model, 5u);
+        InlaySurface* s2 = inlay_surface_create(ctx, nullptr);
+        if (s2) {
+            ok &= check(inlay_surface_bind_model(s, ETCH_STR_LIT("m"), shared_model) &&
+                        inlay_surface_bind_model(s2, ETCH_STR_LIT("m"), shared_model),
+                        "bind shared InlayModel across 2 surfaces");
+            ok &= check(inlay_surface_set_script(s2, ETCH_STR_LIT(
+                "function render(){ return <VirtualList model='m' width={200} height={120} itemHeight={24} />; }")),
+                "second surface script using shared model");
+            InlaySurfaceViewDesc sv2 = inlay_surface_view_desc_default();
+            sv2.id = etch_id("r2_surface_2");
+            sv2.width_px = 200.f;
+            sv2.height_px = 120.f;
+            etch_begin_frame(ctx, &fd);
+            inlay_surface_view(s2, &sv2);
+            etch_end_frame(ctx);
+            inlay_surface_bind_model(s2, ETCH_STR_LIT("m"), nullptr);
+            inlay_surface_destroy(s2);
+        }
+        inlay_surface_bind_model(s, ETCH_STR_LIT("m"), nullptr);
+        inlay_model_destroy(shared_model);
+    }
+
+    // Unbind host resources cleanly before destroy
+    inlay_surface_bind_text_buffer(s, ETCH_STR_LIT("diff.cpp"), nullptr);
+    inlay_surface_bind_terminal(s, ETCH_STR_LIT("term0"), nullptr, nullptr);
+    etch_begin_frame(ctx, &fd);
+    etch_end_frame(ctx);
+    inlay_surface_destroy(s);
+    etch_destroy_text_buffer(buf);
+    return ok;
+}
+
+// ============================================================================
+// 8. Orca Round 3: JS Runtime, Stream/Console/Doc/Portal/Terminal/CodeEditor/Dock/DiffView
+// ============================================================================
+
+struct Round3ConsoleProbe {
+    uint32_t count;
+    uint32_t warn_count;
+    uint32_t error_count;
+    char last_msg[256];
+};
+
+void r3_console_cb(InlaySurface*, InlayConsoleLevel level, EtchStr msg, void* user) {
+    auto* p = static_cast<Round3ConsoleProbe*>(user);
+    if (!p) return;
+    ++p->count;
+    if (level == INLAY_CONSOLE_WARN) ++p->warn_count;
+    if (level == INLAY_CONSOLE_ERROR) ++p->error_count;
+    const uint32_t n = msg.length < 255u ? msg.length : 255u;
+    if (n && msg.chars) std::memcpy(p->last_msg, msg.chars, n);
+    p->last_msg[n] = '\0';
+}
+
+bool r3_read_term(InlayTerminalSnapshot* out, void* user) {
+    auto* cells = static_cast<EtchTerminalCell*>(user);
+    if (!out || !cells) return false;
+    out->columns = 20u;
+    out->rows = 4u;
+    out->cells = cells;
+    out->cell_count = 80u;
+    out->cursor_column = 4;
+    out->cursor_row = 0;
+    out->cursor_visible = true;
+    return true;
+}
+
+bool test_orca_round3_surface(EtchContext* ctx) {
+    bool ok = true;
+    InlaySurfaceDesc r3_desc = inlay_surface_desc_default();
+    r3_desc.max_tick_ms = 50.f;
+    InlaySurface* s = inlay_surface_create(ctx, &r3_desc);
+    if (!check(s != nullptr, "r3 surface create")) return false;
+
+    Round3ConsoleProbe cprobe = {};
+    inlay_surface_set_console_callback(s, r3_console_cb, &cprobe);
+
+    // Host stream bound to JS readStream('chat')
+    InlayStream* stream = inlay_stream_create();
+    if (!check(stream != nullptr, "r3 stream create")) { inlay_surface_destroy(s); return false; }
+    InlayStreamItem si = {};
+    si.id = 1u;
+    si.message_id = 1u;
+    si.role = INLAY_STREAM_ROLE_ASSISTANT;
+    si.kind = INLAY_STREAM_ITEM_MARKDOWN;
+    si.status = INLAY_STREAM_STATUS_RUNNING;
+    si.title = ETCH_STR_LIT("Agent");
+    si.body = ETCH_STR_LIT("Hello ");
+    inlay_stream_upsert(stream, &si);
+    ok &= check(inlay_surface_bind_stream(s, ETCH_STR_LIT("chat"), stream), "r3 bind stream");
+
+    // Host portal bound to <Portal name='p0' ... />
+    InlayPortalDesc pdesc = inlay_portal_desc_default();
+    pdesc.width = 320u;
+    pdesc.height = 180u;
+    InlayPortal* portal = inlay_portal_create(ctx, &pdesc);
+    ok &= check(portal != nullptr && inlay_surface_bind_portal(s, ETCH_STR_LIT("p0"), portal), "r3 bind portal");
+
+    // Host text buffer for <CodeEditor>
+    EtchTextBuffer* ed_buf = etch_create_text_buffer(ETCH_STR_LIT(
+        "export function greet(name: string): string {\n"
+        "  const msg = `Hello ${name}`;\n"
+        "  return msg;\n"
+        "}\n"), 0u);
+    ok &= check(ed_buf != nullptr && inlay_surface_bind_text_buffer(s, ETCH_STR_LIT("app.ts"), ed_buf),
+                "r3 bind text buffer");
+
+    // Host terminal snapshot
+    EtchTerminalCell tcells[80] = {};
+    const char* greeting = "orca$ ";
+    for (uint32_t i = 0u; i < 6u; ++i) {
+        tcells[i].codepoint = uint32_t(greeting[i]);
+        tcells[i].foreground = {ETCH_TERMINAL_ANSI16, 2u};
+        tcells[i].width = 1u;
+    }
+    ok &= check(inlay_surface_bind_terminal(s, ETCH_STR_LIT("term3"), r3_read_term, tcells), "r3 bind terminal");
+
+    // Host Doc hooks (custom highlighter probe)
+    struct HlProbe { uint32_t calls; } hl_probe = {};
+    inlay_surface_set_doc_hooks(
+        s,
+        [](EtchStr, EtchStr, uint32_t, InlayCodeHighlightToken*, uint32_t, void* u) -> uint32_t {
+            ++static_cast<HlProbe*>(u)->calls;
+            return 0u;
+        },
+        &hl_probe, nullptr, nullptr, nullptr);
+
+    const char* init_state =
+        "{\"rafTicks\":0,\"ivTicks\":0,\"ivId\":0,\"lastCmd\":\"\","
+        "\"portalTitle\":\"\",\"portalZoom\":0,\"portalMatches\":0,"
+        "\"docMatches\":0,\"streamBody\":\"\",\"dockSavedBefore\":\"\","
+        "\"dockSavedAfter\":\"\",\"paneCount\":2,\"measuredW\":0,"
+        "\"urlBlocked\":false,\"notified\":false,\"vtEnter\":\"\","
+        "\"sgrClick\":\"\",\"typedText\":\"\",\"keysSeen\":0,"
+        "\"cursorLine\":-1,\"initDone\":false}";
+    ok &= check(inlay_surface_set_state_json(s, EtchStr{init_state, uint32_t(std::strlen(init_state)), false}),
+                "r3 set initial state");
+
+    const char* script = R"JS(
+function onCommand(id, s) {
+  s.lastCmd = String(id);
+}
+
+function render(s) {
+  if (!s.initDone) {
+    s.initDone = true;
+    console.log('r3-boot', 42);
+    console.warn('r3-warn');
+    console.error('r3-err');
+    requestAnimationFrame(function(now) {
+      if (now >= 0) state.rafTicks += 1;
+    });
+    s.ivId = setInterval(function() {
+      state.ivTicks += 1;
+      if (state.ivTicks >= 1) clearInterval(state.ivId);
+    }, 1);
+    registerCommand({ id: 'cmd.r3.ping', title: 'R3 Ping', shortcut: 'Ctrl+Shift+P' });
+    dispatchCommand('cmd.r3.ping');
+    s.urlBlocked = (openUrl('javascript:alert(1)') === false);
+    s.notified = notifyDesktop('Orca R3', 'Ready', { silent: true });
+    s.vtEnter = encodeTerminalKey(13, 0, false);
+    s.sgrClick = encodeTerminalMouseSgr(1, 3, 2, 0, true, false);
+  }
+
+  const st = readStream('chat');
+  if (st && st.items && st.items.length > 0) {
+    s.streamBody = String(st.items[0].body || '');
+  }
+
+  const pal = [
+    '#11111b','#f38ba8','#a6e3a1','#f9e2af','#89b4fa','#cba6f7','#94e2d5','#cdd6f4',
+    '#585b70','#f38ba8','#a6e3a1','#f9e2af','#89b4fa','#cba6f7','#94e2d5','#ffffff'
+  ];
+
+  const panes = [
+    <DockPane key='left' paneId={101} title='Diff'>
+      <DiffView
+        id='r3_diff'
+        oldText={"const a = 1;\nconst b = 2;\nconst c = 3;\n"}
+        newText={"const a = 1;\nconst b = 42;\nconst c = 3;\nconst d = 4;\n"}
+        language='typescript'
+        filePath='src/app.ts'
+        mode='split'
+        wordDiff={true}
+        showOverviewRuler={true}
+        annotations={[{ line: 1, side: 'new', author: 'AI', body: 'Updated b to 42' }]}
+        width={420}
+        height={180}
+      />
+    </DockPane>,
+    <DockPane key='right' paneId={102} title='Editor'>
+      <CodeEditor
+        id='r3_ed'
+        buffer='app.ts'
+        language='typescript'
+        highlightBrackets={true}
+        showIndentGuides={true}
+        showDiagnosticTooltips={true}
+        onCursorChange={(ev, st2) => { st2.cursorLine = ev.line; }}
+        width={380}
+        height={160}
+      />
+    </DockPane>
+  ];
+  if (s.paneCount >= 3) {
+    panes.push(
+      <DockPane key='extra' paneId={103} title='Extra'>
+        <Text>Third pane</Text>
+      </DockPane>
+    );
+  }
+
+  return (
+    <Col
+      id='r3_root'
+      cls='p-2 gap-2'
+      width={900}
+      height={640}
+      globalKeys={true}
+      onKeyDown={(ev, st2) => { st2.keysSeen += 1; }}
+      onTextInput={(txt, st2) => { st2.typedText += String(txt || ''); }}
+    >
+      <DockSpace id='r3_dock' defaultSplit='horizontal' defaultSplitRatio={0.42} width={860} height={220}>
+        {panes}
+      </DockSpace>
+      <Row cls='gap-2'>
+        <Doc
+          id='r3_doc'
+          markdown={"# Orca R3\n\nPress <kbd>Ctrl</kbd>+<kbd>P</kbd> to search Orca.\n\n```ts\nconst x = 1;\n```\n"}
+          findQuery='Orca'
+          onFindResult={(ev, st2) => { st2.docMatches = ev.count; }}
+          width={280}
+          height={150}
+        />
+        <Portal
+          id='r3_portal'
+          name='p0'
+          html="<html><head><title>PortalR3</title></head><body>hello orca world</body></html>"
+          zoom={1.25}
+          findQuery='orca'
+          evalScript='1+1'
+          postMessage='{"hello":1}'
+          onStateChange={(ev, st2) => {
+            st2.portalTitle = String(ev.title || '');
+            st2.portalZoom = Number(ev.zoom || 0);
+            st2.portalMatches = Number((ev.find && ev.find.totalMatches) || 0);
+          }}
+          width={260}
+          height={150}
+        />
+        <Terminal
+          id='r3_term'
+          buffer='term3'
+          palette={pal}
+          captureInput={true}
+          bracketedPaste={true}
+          mouseReporting={true}
+          width={280}
+          height={150}
+        />
+      </Row>
+      <DiffView
+        id='r3_diff_uni'
+        oldText={"line1\nline2\nline3\nline4\nline5\nline6\nline7\n"}
+        newText={"line1\nline2\nline3\nline4_mod\nline5\nline6\nline7\n"}
+        mode='unified'
+        collapseUnchanged={true}
+        contextLines={1}
+        width={860}
+        height={120}
+      />
+    </Col>
+  );
+}
+
+function onEvent(name, payload, s) {
+  if (name === 'probe_imperative') {
+    const m = measureElement('r3_root');
+    s.measuredW = m ? m.w : 0;
+    s.dockSavedBefore = saveDockLayout('r3_dock');
+    focusElement('r3_term');
+    blurElement();
+    scrollTo('r3_doc', 0, 10);
+    scrollToBottom('r3_doc');
+    s.paneCount = 3;
+  } else if (name === 'probe_dock_after') {
+    s.dockSavedAfter = saveDockLayout('r3_dock');
+  }
+}
+)JS";
+
+    ok &= check(inlay_surface_set_script(s, EtchStr{script, uint32_t(std::strlen(script)), false}),
+                "r3 set script");
+    if (!ok) {
+        const EtchStr err = inlay_surface_error(s);
+        std::printf("r3 script error: %.*s\n", int(err.length), err.chars ? err.chars : "");
+    }
+
+    EtchFrameDesc fd = etch_frame_desc_default();
+    fd.viewport_w = 960;
+    fd.viewport_h = 700;
+    fd.dt_seconds = 1.f / 60.f;
+    InlaySurfaceViewDesc sv = inlay_surface_view_desc_default();
+    sv.id = etch_id("r3_surface");
+    sv.width_px = 900.f;
+    sv.height_px = 640.f;
+
+    // Frame 1: initial draw, sets up bounds, rAF/setInterval, command dispatch, Portal/Doc sync
+    etch_begin_frame(ctx, &fd);
+    inlay_surface_view(s, &sv);
+    etch_end_frame(ctx);
+
+    // Wait briefly so 1ms setInterval becomes due, then append to bound stream + dispatch text input
+    SDL_Delay(5);
+    inlay_stream_append_body(stream, 1u, ETCH_STR_LIT("Orca!"));
+    {
+        SDL_Event tev = {};
+        tev.type = SDL_EVENT_TEXT_INPUT;
+        tev.text.text = "abc";
+        etch_process_event(ctx, &tev);
+    }
+    fd.key_pressed_code = 13u; // Enter
+    etch_begin_frame(ctx, &fd);
+    inlay_surface_view(s, &sv);
+    etch_end_frame(ctx);
+    fd.key_pressed_code = 0u;
+
+    // Imperative helpers + incremental DockSpace reconciliation (2 -> 3 panes preserves split)
+    ok &= check(inlay_surface_dispatch(s, ETCH_STR_LIT("probe_imperative"), ETCH_STR_LIT("{}")),
+                "r3 dispatch probe_imperative");
+    etch_begin_frame(ctx, &fd);
+    inlay_surface_view(s, &sv);
+    etch_end_frame(ctx);
+
+    ok &= check(inlay_surface_dispatch(s, ETCH_STR_LIT("probe_dock_after"), ETCH_STR_LIT("{}")),
+                "r3 dispatch probe_dock_after");
+    etch_begin_frame(ctx, &fd);
+    inlay_surface_view(s, &sv);
+    etch_end_frame(ctx);
+
+    const EtchStr st = inlay_surface_state_json(s);
+    const char* sj = st.chars ? st.chars : "";
+    ok &= check(cprobe.count >= 3u && cprobe.warn_count == 1u && cprobe.error_count == 1u &&
+                std::strstr(cprobe.last_msg, "r3-err") != nullptr,
+                "r3 console callback captured log/warn/error");
+    ok &= check(std::strstr(sj, "\"rafTicks\":1") != nullptr, "r3 requestAnimationFrame fired");
+    ok &= check(std::strstr(sj, "\"ivTicks\":1") != nullptr, "r3 setInterval + clearInterval fired once");
+    ok &= check(std::strstr(sj, "\"lastCmd\":\"cmd.r3.ping\"") != nullptr,
+                "r3 registerCommand + dispatchCommand -> onCommand");
+    ok &= check(std::strstr(sj, "\"streamBody\":\"Hello Orca!\"") != nullptr,
+                "r3 readStream reactive auto-rebuild on stream append");
+    ok &= check(std::strstr(sj, "\"portalTitle\":\"PortalR3\"") != nullptr &&
+                std::strstr(sj, "\"portalZoom\":1.25") != nullptr &&
+                std::strstr(sj, "\"portalMatches\":1") != nullptr,
+                "r3 Portal declarative props + onStateChange + find match count");
+    ok &= check(std::strstr(sj, "\"docMatches\":2") != nullptr || std::strstr(sj, "\"docMatches\":1") != nullptr,
+                "r3 Doc findQuery + onFindResult");
+    ok &= check(hl_probe.calls >= 1u, "r3 host doc highlighter hook invoked");
+    ok &= check(std::strstr(sj, "\"urlBlocked\":true") != nullptr, "r3 openUrl rejects javascript: scheme");
+    ok &= check(std::strstr(sj, "\"notified\":true") != nullptr, "r3 notifyDesktop succeeded");
+    ok &= check(std::strstr(sj, "\"vtEnter\":\"\\r\"") != nullptr, "r3 encodeTerminalKey Enter -> CR");
+    ok &= check(std::strstr(sj, "\"sgrClick\":\"\\u001b[<0;4;3M\"") != nullptr, "r3 encodeTerminalMouseSgr");
+    ok &= check(std::strstr(sj, "\"typedText\":\"abc\"") != nullptr, "r3 onTextInput received text");
+    ok &= check(std::strstr(sj, "\"keysSeen\":1") != nullptr, "r3 onKeyDown received Enter");
+    ok &= check(std::strstr(sj, "\"measuredW\":900") != nullptr, "r3 measureElement returned layout width");
+    ok &= check(std::strstr(sj, "\"dockSavedBefore\":\"{\\\"") != nullptr &&
+                std::strstr(sj, "\"dockSavedAfter\":\"{\\\"") != nullptr &&
+                std::strstr(sj, "103") != nullptr,
+                "r3 saveDockLayout + incremental pane reconciliation");
+    if (!ok) {
+        std::printf("r3 state json: %s\n", sj);
+    }
+
+    // Verify .d.ts includes all Round 3 declarations
+    char dts[40960] = {};
+    const uint32_t dlen = inlay_surface_export_dts(s, dts, uint32_t(sizeof(dts)));
+    ok &= check(dlen > 0u && dlen < uint32_t(sizeof(dts)) &&
+                std::strstr(dts, "DiffViewProps") != nullptr &&
+                std::strstr(dts, "StreamName") != nullptr &&
+                std::strstr(dts, "setInterval(") != nullptr &&
+                std::strstr(dts, "requestAnimationFrame(") != nullptr &&
+                std::strstr(dts, "readStream(") != nullptr &&
+                std::strstr(dts, "registerCommand(") != nullptr &&
+                std::strstr(dts, "saveDockLayout(") != nullptr &&
+                std::strstr(dts, "encodeTerminalKey(") != nullptr,
+                "r3 export_dts documents all Round 3 bridges");
+
+    // Optional visual verification PNG showcase (gated by INLAY_CAPTURE_R3_PNG=1)
+    if (const char* cap_env = SDL_getenv("INLAY_CAPTURE_R3_PNG"); cap_env && cap_env[0] == '1') {
+        InlaySurface* vis = inlay_surface_create(ctx, nullptr);
+        if (vis) {
+            inlay_surface_bind_text_buffer(vis, ETCH_STR_LIT("app.ts"), ed_buf);
+            const char* vis_js = R"JS(
+function render() {
+  return (
+    <Col cls='p-4 gap-3 bg-canvas' width={1280} height={820}>
+      <Row cls='items-center justify-between'>
+        <Text cls='text-lg font-bold'>Orca Round 3 Native Workbench Showcase</Text>
+        <Badge variant='success'>Etch + Inlay C++20</Badge>
+      </Row>
+      <Row cls='gap-3' height={340}>
+        <Card cls='p-2' width={660} height={340}>
+          <DiffView
+            id='vis_diff'
+            oldText={"export function plan(tasks: Task[]) {\n  const out = [];\n  for (const t of tasks) {\n    if (t.enabled) out.push(t.name);\n  }\n  return out;\n}\n"}
+            newText={"export function plan(tasks: readonly Task[]): string[] {\n  const out: string[] = [];\n  for (const t of tasks) {\n    if (t.enabled && !t.archived) out.push(t.title);\n  }\n  return out.sort();\n}\n"}
+            language='typescript'
+            filePath='src/planner.ts'
+            mode='split'
+            wordDiff={true}
+            showOverviewRuler={true}
+            annotations={[{ line: 3, side: 'new', author: 'Reviewer', body: 'Nice archive guard + explicit return type.' }]}
+            width={640}
+            height={316}
+          />
+        </Card>
+        <Card cls='p-2' width={560} height={340}>
+          <CodeEditor
+            id='vis_ed'
+            buffer='app.ts'
+            language='typescript'
+            highlightBrackets={true}
+            showIndentGuides={true}
+            width={540}
+            height={316}
+          />
+        </Card>
+      </Row>
+      <Card cls='p-3' width={1232} height={390}>
+        <Doc
+          id='vis_doc'
+          markdown={"## Rich Markdown + New Mermaid Diagrams\n\nShortcut <kbd>Ctrl</kbd>+<kbd>D</kbd> adds multi-cursor; formula H<sub>2</sub>O, x<sup>2</sup>, <mark>highlighted</mark>, <del>deprecated</del>, <u>underlined</u>.\n\n```mermaid\npie title GPU Frame Budget\n\"Text & Glyphs\" : 45\n\"UI Quads\" : 35\n\"Diff & Diagrams\" : 20\n```\n\n```mermaid\ngantt\ntitle Orca Frontend Engine\nsection Core\nEtch :done, e1, 2026-01-01, 5d\nInlay :active, i1, after e1, 4d\n```\n"}
+          width={1200}
+          height={360}
+        />
+      </Card>
+    </Col>
+  );
+}
+)JS";
+            if (inlay_surface_set_script(vis, EtchStr{vis_js, uint32_t(std::strlen(vis_js)), false})) {
+                EtchFrameDesc vfd = etch_frame_desc_default();
+                vfd.viewport_w = 1280;
+                vfd.viewport_h = 820;
+                InlaySurfaceViewDesc vsv = inlay_surface_view_desc_default();
+                vsv.id = etch_id("r3_vis_surface");
+                vsv.width_px = 1280.f;
+                vsv.height_px = 820.f;
+                for (int f = 0; f < 2; ++f) {
+                    etch_begin_frame(ctx, &vfd);
+                    inlay_surface_view(vis, &vsv);
+                    etch_end_frame(ctx);
+                }
+                const char* out_path = SDL_getenv("INLAY_R3_PNG_PATH");
+                if (!out_path || !out_path[0]) out_path = "r3_showcase.png";
+                ok &= check(etch_render_headless_png(ctx, 1280u, 820u, out_path, etch_rgba8(15, 17, 23, 255)),
+                            "r3 render headless showcase PNG");
+            }
+            inlay_surface_bind_text_buffer(vis, ETCH_STR_LIT("app.ts"), nullptr);
+            inlay_surface_destroy(vis);
+        }
+    }
+
+    inlay_surface_set_console_callback(s, nullptr, nullptr);
+    inlay_surface_set_doc_hooks(s, nullptr, nullptr, nullptr, nullptr, nullptr);
+    inlay_surface_bind_stream(s, ETCH_STR_LIT("chat"), nullptr);
+    inlay_surface_bind_portal(s, ETCH_STR_LIT("p0"), nullptr);
+    inlay_surface_bind_text_buffer(s, ETCH_STR_LIT("app.ts"), nullptr);
+    inlay_surface_bind_terminal(s, ETCH_STR_LIT("term3"), nullptr, nullptr);
+    inlay_surface_destroy(s);
+    inlay_portal_destroy(portal);
+    inlay_stream_destroy(stream);
+    etch_destroy_text_buffer(ed_buf);
+    return ok;
+}
+
+// ============================================================================
+// 9. Orca Round 4: Convergence Pass (TS/TSX Erasure, Dynamic Limits, Web Globals,
+//    Host localStorage Hooks, DiffView/Minimap/Terminal/Doc Showcase)
+// ============================================================================
+
+struct R4HostKv {
+    char key[64];
+    char val[128];
+    bool has_val;
+    uint32_t sets;
+    uint32_t gets;
+    uint32_t removes;
+};
+
+static bool r4_kv_get(EtchStr key, char* out_buf, uint32_t cap, uint32_t* out_len, void* user) {
+    auto* kv = static_cast<R4HostKv*>(user);
+    if (!kv || !key.chars) return false;
+    ++kv->gets;
+    if (!kv->has_val || std::strlen(kv->key) != key.length || std::memcmp(kv->key, key.chars, key.length) != 0) {
+        return false;
+    }
+    const uint32_t n = uint32_t(std::strlen(kv->val));
+    if (out_len) *out_len = n;
+    if (out_buf && cap > 0u) {
+        const uint32_t cp = n < (cap - 1u) ? n : (cap - 1u);
+        if (cp > 0u) std::memcpy(out_buf, kv->val, cp);
+        out_buf[cp] = '\0';
+    }
+    return true;
+}
+
+static bool r4_kv_set(EtchStr key, EtchStr value, void* user) {
+    auto* kv = static_cast<R4HostKv*>(user);
+    if (!kv || !key.chars || key.length >= sizeof(kv->key) || value.length >= sizeof(kv->val)) return false;
+    ++kv->sets;
+    std::memcpy(kv->key, key.chars, key.length);
+    kv->key[key.length] = '\0';
+    if (value.length > 0u && value.chars) std::memcpy(kv->val, value.chars, value.length);
+    kv->val[value.length] = '\0';
+    kv->has_val = true;
+    return true;
+}
+
+static bool r4_kv_remove(EtchStr key, void* user) {
+    auto* kv = static_cast<R4HostKv*>(user);
+    if (!kv || !key.chars) return false;
+    ++kv->removes;
+    if (kv->has_val && std::strlen(kv->key) == key.length && std::memcmp(kv->key, key.chars, key.length) == 0) {
+        kv->has_val = false;
+        kv->key[0] = '\0';
+        kv->val[0] = '\0';
+    }
+    return true;
+}
+
+struct R4ActionProbe {
+    uint32_t hits;
+    int32_t last_n;
+};
+
+static void r4_action_cb(InlaySurface*, EtchStr payload_json, void* user) {
+    auto* p = static_cast<R4ActionProbe*>(user);
+    if (!p) return;
+    ++p->hits;
+    if (payload_json.chars && std::strstr(payload_json.chars, "39") != nullptr) {
+        p->last_n = 39;
+    }
+}
+
+struct R4TermBuf {
+    EtchTerminalCell cells[48u * 6u];
+    uint32_t cols;
+    uint32_t rows;
+};
+
+static bool r4_read_term(InlayTerminalSnapshot* out, void* user) {
+    auto* tb = static_cast<R4TermBuf*>(user);
+    if (!tb || !out) return false;
+    out->columns = tb->cols;
+    out->rows = tb->rows;
+    out->cells = tb->cells;
+    out->cell_count = size_t(tb->cols) * size_t(tb->rows);
+    out->cursor_column = 14;
+    out->cursor_row = 4;
+    out->cursor_shape = ETCH_TERMINAL_CURSOR_BAR;
+    out->cursor_visible = true;
+    out->revision = 1u;
+    return true;
+}
+
+static bool test_orca_round4_convergence(EtchContext* ctx) {
+    bool ok = true;
+
+    // 1. Native TypeScript / TSX Type Erasure + .ts/.tsx ESM module resolution
+    {
+        InlaySurface* s = inlay_surface_create(ctx, nullptr);
+        if (!s) return true; // Script engine disabled
+        ok &= check(inlay_surface_register_module(s, ETCH_STR_LIT("types.ts"), ETCH_STR_LIT(
+            "export interface Item { id: number; name: string; }\n"
+            "export type Label = string | number;\n"
+            "export declare const AMBIENT_ONLY: number;\n")),
+            "r4 register types.ts");
+        ok &= check(inlay_surface_register_module(s, ETCH_STR_LIT("helper.tsx"), ETCH_STR_LIT(
+            "import type { Item, Label } from './types';\n"
+            "export function fmt<T extends Item>(x: T, suffix?: string): string {\n"
+            "  const lbl: Label = (x.name as string) + (suffix ?? '');\n"
+            "  return String(lbl);\n"
+            "}\n")),
+            "r4 register helper.tsx");
+        static const char kTsxEntry[] =
+            "import { fmt } from 'helper';\n"
+            "import type { Item } from 'types';\n"
+            "interface LocalCfg { tag?: string; }\n"
+            "const meta = { tag: 'TSX' } as const satisfies Record<string, string>;\n"
+            "const dbl = (n: number): number => n * 2;\n"
+            "function CardItem(props: { item: Item }): any {\n"
+            "  const [count] = useState<number>(1);\n"
+            "  const cfg: LocalCfg = { tag: meta.tag };\n"
+            "  const nn: string = cfg.tag!;\n"
+            "  return <Badge>{fmt<Item>({ id: props.item.id, name: nn }, '!') + ':' + dbl(count)}</Badge>;\n"
+            "}\n"
+            "export function render(st: { id?: number }) {\n"
+            "  return <Box><CardItem item={{ id: st.id ?? 1, name: 'init' }} /></Box>;\n"
+            "}\n";
+        ok &= check(inlay_surface_set_state_json(s, ETCH_STR_LIT("{\"id\":7}")), "r4 tsx state");
+        const bool loaded = inlay_surface_set_script(s, {kTsxEntry, uint32_t(sizeof(kTsxEntry) - 1u), true});
+        if (!loaded) {
+            const EtchStr err = inlay_surface_error(s);
+            std::fprintf(stderr, "r4 tsx error: %.*s\n", int(err.length), err.chars ? err.chars : "");
+        }
+        ok &= check(loaded && !inlay_surface_stats(s).has_error, "r4 tsx entry compiles & runs cleanly");
+        uint32_t cnt = 0u;
+        const InlayUiNode* nodes = inlay_surface_nodes(s, &cnt);
+        bool saw_tsx = false;
+        for (uint32_t i = 0u; i < cnt; ++i) {
+            if (nodes[i].text.chars && std::strstr(nodes[i].text.chars, "TSX!:2") != nullptr) saw_tsx = true;
+        }
+        ok &= check(saw_tsx, "r4 tsx generic component rendered TSX!:2");
+        inlay_surface_destroy(s);
+    }
+
+    // 2. Configurable max_state_bytes (256 KiB), >32 actions (40), >64 commands (70),
+    //    standard JS globals, host localStorage hooks, <CodeEditor showMinimap>, <DiffView> production features
+    {
+        InlaySurfaceDesc desc = inlay_surface_desc_default();
+        desc.max_tick_ms = 50.f;
+        desc.max_state_bytes = 262144u;
+        InlaySurface* s = inlay_surface_create(ctx, &desc);
+        ok &= check(s != nullptr, "r4 create surface with 256 KiB state cap");
+        if (!s) return false;
+
+        R4ActionProbe act_probe = {};
+        for (uint32_t i = 0u; i < 40u; ++i) {
+            char aname[32];
+            const int n = std::snprintf(aname, sizeof(aname), "act_%u", i);
+            ok &= check(inlay_surface_bind_action(s, EtchStr{aname, uint32_t(n), false}, r4_action_cb, &act_probe),
+                        "r4 bind dynamic action");
+        }
+
+        // Build ~100 KiB initial state JSON (> old 64 KiB cap)
+        const size_t pad_len = 100000u;
+        auto* big_state = static_cast<char*>(SDL_malloc(pad_len + 512u));
+        ok &= check(big_state != nullptr, "r4 alloc big state");
+        if (!big_state) { inlay_surface_destroy(s); return false; }
+        int head = std::snprintf(big_state, 256u,
+            "{\"init\":false,\"lastCmd\":\"\",\"globalsOk\":false,\"mtOk\":false,\"memLsOk\":false,\"hostLsOk\":false,\"blob\":\"");
+        std::memset(big_state + head, 'x', pad_len);
+        const char tail[] = "\"}";
+        std::memcpy(big_state + head + pad_len, tail, sizeof(tail));
+        const uint32_t big_len = uint32_t(size_t(head) + pad_len + sizeof(tail) - 1u);
+        ok &= check(inlay_surface_set_state_json(s, EtchStr{big_state, big_len, false}),
+                    "r4 set 100 KiB state json");
+        SDL_free(big_state);
+
+        EtchTextBuffer* ed_buf = etch_create_text_buffer(ETCH_STR_LIT(
+            "/* Multiline\n   block comment */\nexport const v = 42;\n"), 0u);
+        ok &= check(ed_buf != nullptr && inlay_surface_bind_text_buffer(s, ETCH_STR_LIT("r4.ts"), ed_buf),
+                    "r4 bind text buffer");
+
+        static const char kR4Script[] = R"JS(
+function onCommand(id, s) {
+  s.lastCmd = String(id);
+}
+function onEvent(name, payload, s) {
+  if (name === 'check_mt_and_host_ls') {
+    s.mtOk = (globalThis.__r4_mt === 1);
+    localStorage.setItem('theme', 'obsidian');
+    const got = localStorage.getItem('theme');
+    localStorage.removeItem('theme');
+    const after = localStorage.getItem('theme');
+    s.hostLsOk = (got === 'obsidian' && after === null);
+  }
+}
+function render(s) {
+  if (!s.init) {
+    s.init = true;
+    for (let i = 0; i < 70; ++i) {
+      registerCommand({ id: 'cmd.r4.' + i, title: 'Cmd ' + i });
+    }
+    dispatchCommand('cmd.r4.69');
+    action('act_39', { n: 39 });
+
+    // Standard Web/JS globals verification
+    const t0 = performance.now();
+    const u1 = crypto.randomUUID();
+    const u2 = crypto.randomUUID();
+    const uuidOk = (u1.length === 36 && u1[14] === '4' && u1 !== u2);
+    const b64Ok = (atob(btoa('Orca-Inlay!')) === 'Orca-Inlay!');
+    const orig = { a: [1, 2], d: new Date(1700000000000), m: new Map([['k', 7]]), st: new Set([3]) };
+    orig.self = orig;
+    const cloned = structuredClone(orig);
+    const cloneOk = (cloned !== orig && cloned.self === cloned && cloned.a[1] === 2 &&
+                     cloned.d.getTime() === 1700000000000 && cloned.m.get('k') === 7 && cloned.st.has(3));
+    const enc = new TextEncoder();
+    const dec = new TextDecoder();
+    const utf8Ok = (dec.decode(enc.encode('你好🚀Orca')) === '你好🚀Orca');
+    const url = new URL('/api/v1?a=1&b=two#top', 'https://orca.dev');
+    url.searchParams.set('c', '3');
+    const urlOk = (url.origin === 'https://orca.dev' && url.pathname === '/api/v1' &&
+                   url.hash === '#top' && url.searchParams.get('b') === 'two' &&
+                   url.href.indexOf('c=3') >= 0);
+    s.globalsOk = (t0 >= 0 && uuidOk && b64Ok && cloneOk && utf8Ok && urlOk);
+
+    // In-memory localStorage fallback before host hooks are attached
+    localStorage.setItem('k1', 'v1');
+    const lv = localStorage.getItem('k1');
+    const llen = localStorage.length;
+    localStorage.removeItem('k1');
+    s.memLsOk = (lv === 'v1' && llen >= 1 && localStorage.getItem('k1') === null);
+
+    queueMicrotask(() => { globalThis.__r4_mt = 1; });
+  }
+  return (
+    <Col id='r4_root' width={820} height={540} gap={8}>
+      <CodeEditor id='r4_ed' buffer='r4.ts' language='typescript' showMinimap={true} width={780} height={140} />
+      <DiffView
+        id='r4_diff'
+        oldText={"line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\n"}
+        newText={"line1\nline2_mod\nline3\nline4\nline5\nline6\nline7_mod\nline8\n"}
+        mode='split'
+        filePath='src/engine.ts'
+        collapseUnchanged={true}
+        contextLines={1}
+        editable={true}
+        hunkActions={[{ id: 'accept', label: 'Accept' }, { id: 'reject', label: 'Reject' }]}
+        onHunkAction={(ev, st2) => { st2.lastHunkAct = ev.actionId; }}
+        onChange={(txt, st2) => { st2.editedLen = txt.length; }}
+        width={780}
+        height={180}
+      />
+      <Doc
+        id='r4_doc'
+        markdown={"```mermaid\ngitGraph\ncommit id: \"c0\"\nbranch ui\ncheckout ui\ncommit id: \"c1\"\ncheckout main\nmerge ui\n```\n"}
+        onDiagramNodeClick={(ev, st2) => { st2.clickedNode = ev.nodeId; }}
+        width={780}
+        height={180}
+      />
+    </Col>
+  );
+}
+)JS";
+
+        const bool r4_loaded = inlay_surface_set_script(s, EtchStr{kR4Script, uint32_t(std::strlen(kR4Script)), false});
+        if (!r4_loaded) {
+            const EtchStr err = inlay_surface_error(s);
+            std::fprintf(stderr, "r4 script error: %.*s\n", int(err.length), err.chars ? err.chars : "");
+        }
+        ok &= check(r4_loaded && !inlay_surface_stats(s).has_error, "r4 convergence script loaded");
+
+        EtchFrameDesc fd = etch_frame_desc_default();
+        fd.viewport_w = 860u;
+        fd.viewport_h = 580u;
+        InlaySurfaceViewDesc sv = inlay_surface_view_desc_default();
+        sv.id = etch_id("r4_surface");
+        sv.width_px = 820.f;
+        sv.height_px = 540.f;
+        etch_begin_frame(ctx, &fd);
+        inlay_surface_view(s, &sv);
+        etch_end_frame(ctx);
+
+        // Attach host localStorage hooks & verify microtask + host storage callbacks
+        R4HostKv kv = {};
+        inlay_surface_set_storage_hooks(s, r4_kv_get, r4_kv_set, r4_kv_remove, &kv);
+        ok &= check(inlay_surface_dispatch(s, ETCH_STR_LIT("check_mt_and_host_ls"), ETCH_STR_LIT("{}")),
+                    "r4 dispatch microtask & host localStorage check");
+        etch_begin_frame(ctx, &fd);
+        inlay_surface_view(s, &sv);
+        etch_end_frame(ctx);
+
+        const EtchStr st = inlay_surface_state_json(s);
+        const char* sj = st.chars ? st.chars : "";
+        ok &= check(st.length > 100000u, "r4 100 KiB state preserved without 64 KiB truncation");
+        ok &= check(act_probe.hits >= 1u && act_probe.last_n == 39, "r4 40th dynamic action fired");
+        ok &= check(std::strstr(sj, "\"lastCmd\":\"cmd.r4.69\"") != nullptr, "r4 70th dynamic command fired");
+        ok &= check(std::strstr(sj, "\"globalsOk\":true") != nullptr,
+                    "r4 performance/crypto/atob/btoa/structuredClone/TextEncoder/URL globals passed");
+        ok &= check(std::strstr(sj, "\"mtOk\":true") != nullptr, "r4 queueMicrotask executed");
+        ok &= check(std::strstr(sj, "\"memLsOk\":true") != nullptr, "r4 in-memory localStorage fallback passed");
+        ok &= check(std::strstr(sj, "\"hostLsOk\":true") != nullptr &&
+                    kv.sets >= 1u && kv.gets >= 2u && kv.removes >= 1u,
+                    "r4 host C localStorage hooks invoked cleanly");
+
+        char dts[49152] = {};
+        const uint32_t dlen = inlay_surface_export_dts(s, dts, uint32_t(sizeof(dts)));
+        ok &= check(dlen > 0u && dlen < uint32_t(sizeof(dts)) &&
+                    std::strstr(dts, "showMinimap?: boolean") != nullptr &&
+                    std::strstr(dts, "hunkActions?:") != nullptr &&
+                    std::strstr(dts, "onDiagramNodeClick?:") != nullptr &&
+                    std::strstr(dts, "structuredClone") != nullptr &&
+                    std::strstr(dts, "URLSearchParams") != nullptr &&
+                    std::strstr(dts, "localStorage") != nullptr,
+                    "r4 export_dts covers all Round 4 APIs & globals");
+
+        inlay_surface_set_storage_hooks(s, nullptr, nullptr, nullptr, nullptr);
+        inlay_surface_bind_text_buffer(s, ETCH_STR_LIT("r4.ts"), nullptr);
+        inlay_surface_destroy(s);
+        etch_destroy_text_buffer(ed_buf);
+    }
+
+    // 3. Optional Round 4 Headless Showcase PNG (gated by INLAY_R4_PNG_PATH)
+    if (const char* png_path = SDL_getenv("INLAY_R4_PNG_PATH"); png_path && png_path[0]) {
+        InlaySurfaceDesc vdesc = inlay_surface_desc_default();
+        vdesc.max_tick_ms = 50.f;
+        InlaySurface* vis = inlay_surface_create(ctx, &vdesc);
+        EtchTextBuffer* ed_buf = etch_create_text_buffer(ETCH_STR_LIT(
+            "/*\n"
+            " * Etch Stateful Multiline Syntax Lexer\n"
+            " * + Clickable Minimap + Sticky Scroll\n"
+            " */\n"
+            "export interface AgentRun {\n"
+            "  readonly id: string;\n"
+            "  tokensPerSec: number;\n"
+            "}\n"
+            "export function score(r: AgentRun): number {\n"
+            "  const factor = 1.25;\n"
+            "  return Math.round(r.tokensPerSec * factor);\n"
+            "}\n"
+            "export const STATUS = `ready:${score({ id: 'r4', tokensPerSec: 120 })}`;\n"), 0u);
+        R4TermBuf tb = {};
+        tb.cols = 48u;
+        tb.rows = 6u;
+        for (uint32_t i = 0u; i < tb.cols * tb.rows; ++i) {
+            tb.cells[i] = etch_terminal_cell_default();
+            tb.cells[i].codepoint = ' ';
+        }
+        auto put_term_row = [&](uint32_t row, const uint32_t* cps, uint32_t count, EtchTerminalColor fg, EtchTerminalColor bg) {
+            for (uint32_t c = 0u; c < count && c < tb.cols; ++c) {
+                auto& cell = tb.cells[row * tb.cols + c];
+                cell.codepoint = cps[c];
+                cell.foreground = fg;
+                cell.background = bg;
+                cell.width = 1u;
+            }
+        };
+        auto put_term_ascii = [&](uint32_t row, uint32_t col, const char* txt, EtchTerminalColor fg, EtchTerminalColor bg, bool bold = false) {
+            for (uint32_t i = 0u; txt[i] && (col + i) < tb.cols; ++i) {
+                auto& cell = tb.cells[row * tb.cols + col + i];
+                cell.codepoint = uint8_t(txt[i]);
+                cell.foreground = fg;
+                cell.background = bg;
+                cell.bold = bold;
+                cell.width = 1u;
+            }
+        };
+        const EtchTerminalColor fg_def = {ETCH_TERMINAL_DEFAULT, 0u};
+        const EtchTerminalColor bg_def = {ETCH_TERMINAL_DEFAULT, 0u};
+        const EtchTerminalColor bg_blue = {ETCH_TERMINAL_TRUE_COLOR, 0x1d4ed8u};
+        const EtchTerminalColor fg_blue = {ETCH_TERMINAL_TRUE_COLOR, 0x1d4ed8u};
+        const EtchTerminalColor bg_teal = {ETCH_TERMINAL_TRUE_COLOR, 0x0f766eu};
+        const EtchTerminalColor fg_teal = {ETCH_TERMINAL_TRUE_COLOR, 0x0f766eu};
+        const EtchTerminalColor fg_white = {ETCH_TERMINAL_TRUE_COLOR, 0xf8fafcu};
+        const EtchTerminalColor fg_green = {ETCH_TERMINAL_TRUE_COLOR, 0x34d399u};
+        const EtchTerminalColor fg_cyan = {ETCH_TERMINAL_TRUE_COLOR, 0x38bdf8u};
+        // Row 0: Powerline prompt with U+E0B0 hard right arrows
+        put_term_ascii(0u, 0u, " orca ", fg_white, bg_blue, true);
+        const uint32_t pl0[1] = { 0xE0B0u };
+        put_term_row(0u, pl0, 0u, fg_def, bg_def); // keep helper used cleanly
+        tb.cells[0u * tb.cols + 6u].codepoint = 0xE0B0u;
+        tb.cells[0u * tb.cols + 6u].foreground = fg_blue;
+        tb.cells[0u * tb.cols + 6u].background = bg_teal;
+        put_term_ascii(0u, 7u, " main ", fg_white, bg_teal, true);
+        tb.cells[0u * tb.cols + 13u].codepoint = 0xE0B0u;
+        tb.cells[0u * tb.cols + 13u].foreground = fg_teal;
+        tb.cells[0u * tb.cols + 13u].background = bg_def;
+        put_term_ascii(0u, 15u, "ctest --all-backends", fg_def, bg_def);
+        // Row 1: Braille GPU utilization sparkline (U+2800..U+28FF)
+        put_term_ascii(1u, 0u, "GPU FPS ", fg_green, bg_def, true);
+        const uint32_t braille[12] = { 0x2840u, 0x28C0u, 0x28E4u, 0x28F6u, 0x28FFu, 0x28FFu, 0x28F6u, 0x28FEu, 0x28FFu, 0x28FFu, 0x28E4u, 0x28FFu };
+        for (uint32_t bi = 0u; bi < 12u; ++bi) {
+            auto& cell = tb.cells[1u * tb.cols + 8u + bi];
+            cell.codepoint = braille[bi];
+            cell.foreground = fg_green;
+            cell.width = 1u;
+        }
+        put_term_ascii(1u, 21u, " 120.0 fps (VK+D3D12)", fg_def, bg_def);
+        // Row 2: Auto-detected clickable URL
+        put_term_ascii(2u, 0u, "Docs: https://inlay.dev/orca/convergence", fg_cyan, bg_def);
+        // Row 3: Pass summary
+        put_term_ascii(3u, 0u, "PASS: 22/22 suites zero warnings (/W4 /WX)", fg_green, bg_def, true);
+        put_term_ascii(4u, 0u, "orca@native $ ", fg_cyan, bg_def, true);
+
+        if (vis && ed_buf) {
+            inlay_surface_bind_text_buffer(vis, ETCH_STR_LIT("showcase.ts"), ed_buf);
+            inlay_surface_bind_terminal(vis, ETCH_STR_LIT("term_r4"), r4_read_term, &tb);
+            static const char kVisTsx[] = R"JS(
+interface BannerProps { label: string; }
+function Banner(p: BannerProps) {
+  return <Badge variant='success'>{p.label}</Badge>;
+}
+function render() {
+  return (
+    <Col cls='p-4 gap-3 bg-canvas' width={1280} height={880}>
+      <Row cls='items-center justify-between'>
+        <Text cls='text-lg font-bold'>Orca Round 4 Convergence — Etch + Inlay Native Stack</Text>
+        <Banner label='TSX + Minimap + Diff + Braille/Powerline + Mermaid' />
+      </Row>
+      <Row cls='gap-3' height={320}>
+        <Card cls='p-2' width={680} height={320}>
+          <DiffView
+            id='r4_vis_diff'
+            oldText={"const cfg = {\n  fps: 60,\n  stateCap: 65536,\n  minimap: false,\n  rtl: false,\n};\n"}
+            newText={"const cfg = {\n  fps: 120,\n  stateCap: 262144,\n  minimap: true,\n  rtl: true,\n};\n"}
+            language='typescript'
+            filePath='src/config.ts'
+            mode='split'
+            wordDiff={true}
+            showOverviewRuler={true}
+            hunkActions={[{ id: 'accept', label: 'Accept' }, { id: 'reject', label: 'Reject' }]}
+            annotations={[{ line: 2, side: 'new', author: 'Orca', body: 'Configurable state cap + real line numbers & hunk controls.' }]}
+            width={660}
+            height={296}
+          />
+        </Card>
+        <Card cls='p-2' width={556} height={320}>
+          <CodeEditor
+            id='r4_vis_ed'
+            buffer='showcase.ts'
+            language='typescript'
+            showMinimap={true}
+            highlightBrackets={true}
+            showIndentGuides={true}
+            width={536}
+            height={296}
+          />
+        </Card>
+      </Row>
+      <Row cls='gap-3' height={476}>
+        <Card cls='p-2' width={440} height={476}>
+          <Col cls='gap-2'>
+            <Text cls='text-sm font-bold'>Native Terminal (Powerline + Braille + Auto-URL)</Text>
+            <Terminal id='r4_vis_term' buffer='term_r4' width={420} height={150} />
+            <Doc
+              id='r4_vis_doc_left'
+              markdown={"### Nested HTML, Table & RTL\n\n<b><i>Bold+Italic</i></b> & <a href=\"https://inlay.dev\"><kbd>Ctrl+K</kbd></a>\n\n<table><tr><th>Engine</th><th>Status</th></tr><tr><td>Etch</td><td>12/12 PASS</td></tr><tr><td>Inlay</td><td>10/10 PASS</td></tr></table>\n\nمرحبا بالعالم — RTL auto-align\n"}
+              width={420}
+              height={280}
+            />
+          </Col>
+        </Card>
+        <Card cls='p-2' width={796} height={476}>
+          <Doc
+            id='r4_vis_doc_right'
+            markdown={"### Mermaid Round 4: gitGraph + mindmap + timeline\n\n```mermaid\ngitGraph\ncommit id: \"v0.13\"\nbranch orca\ncheckout orca\ncommit id: \"TSX\"\ncommit id: \"Diff\"\ncheckout main\nmerge orca\n```\n\n```mermaid\nmindmap\n  root((Orca Native))\n    Etch\n      Minimap\n      Braille\n    Inlay\n      TSX\n      Mermaid\n```\n\n```mermaid\ntimeline\n  title Convergence\n  section Shipping\n    R1-R3 : Core + Widgets\n    R4 : Production Ready\n```\n"}
+            width={776}
+            height={452}
+          />
+        </Card>
+      </Row>
+    </Col>
+  );
+}
+)JS";
+            const bool vis_ok = inlay_surface_set_script(vis, EtchStr{kVisTsx, uint32_t(std::strlen(kVisTsx)), false});
+            if (!vis_ok) {
+                const EtchStr err = inlay_surface_error(vis);
+                std::fprintf(stderr, "r4 showcase error: %.*s\n", int(err.length), err.chars ? err.chars : "");
+            }
+            ok &= check(vis_ok, "r4 showcase TSX compiled");
+            if (vis_ok) {
+                EtchFrameDesc vfd = etch_frame_desc_default();
+                vfd.viewport_w = 1280u;
+                vfd.viewport_h = 880u;
+                InlaySurfaceViewDesc vsv = inlay_surface_view_desc_default();
+                vsv.id = etch_id("r4_vis_surface");
+                vsv.width_px = 1280.f;
+                vsv.height_px = 880.f;
+                for (int f = 0; f < 2; ++f) {
+                    etch_begin_frame(ctx, &vfd);
+                    inlay_surface_view(vis, &vsv);
+                    etch_end_frame(ctx);
+                }
+                ok &= check(etch_render_headless_png(ctx, 1280u, 880u, png_path, etch_rgba8(15, 17, 23, 255)),
+                            "r4 render headless showcase PNG");
+            }
+            inlay_surface_bind_terminal(vis, ETCH_STR_LIT("term_r4"), nullptr, nullptr);
+            inlay_surface_bind_text_buffer(vis, ETCH_STR_LIT("showcase.ts"), nullptr);
+        }
+        inlay_surface_destroy(vis);
+        etch_destroy_text_buffer(ed_buf);
+    }
+
+    return ok;
+}
+
 } // namespace
 
 int main() {
@@ -1013,6 +2335,10 @@ int main() {
     ok &= test_genui(ctx);
     ok &= test_tokens();
     ok &= test_inbox_drain_to_surface(ctx);
+    ok &= test_ade_surface_upgrades(ctx);
+    ok &= test_orca_round2_bridge(ctx);
+    ok &= test_orca_round3_surface(ctx);
+    ok &= test_orca_round4_convergence(ctx);
 
     etch_destroy_context(ctx);
     std::puts(ok ? "Workbench features PASS" : "Workbench features FAIL");

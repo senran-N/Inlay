@@ -226,6 +226,46 @@ bool styled_surface_controls(EtchContext *ctx, const InlaySurfaceDesc &desc) {
     inlay_surface_destroy(surface);
     return ok;
 }
+uint32_t find_surface_eid(const InlayUiNode *nodes, uint32_t count, uint32_t view_id,
+                          const char *name);
+bool custom_widget_surface_props(EtchContext *ctx, const InlaySurfaceDesc &desc) {
+    auto *surface = inlay_surface_create(ctx, &desc);
+    if (!surface)
+        return false;
+    bool ok = check(inlay_surface_set_script(surface, ETCH_STR_LIT(
+        "function render(s){return h('box',{id:'root',axis:'column',width:320,height:200,gap:8,windowDragPassthrough:true},"
+        "h('toggle',{id:'sw',label:'Compact',checked:!!s.on,width:24,height:16,trackRadius:4,thumbRadius:2,thumbPadding:2,borderWidth:0.5,onChange:'flip'}),"
+        "h('toggle',{id:'sw_bare',checked:true,width:24,height:16,trackRadius:4,thumbRadius:2,thumbPadding:2,borderWidth:0.5}),"
+        "h('input',{id:'inp',value:s.msg||'',multiline:true,submitOnEnter:true,width:240,height:64}),"
+        "h('split',{id:'sp',ratio:0.4,dividerSize:1,dividerHit:6,showGrip:false,width:280,height:80},"
+        "h('text',{text:'L'}),h('text',{text:'R'})));}"
+        "function onEvent(n,v,s){if(n==='flip')s.on=v;}")),
+        "custom widget surface props script");
+    InlaySurfaceViewDesc view = inlay_surface_view_desc_default();
+    view.id = etch_id("custom-widget-props");
+    view.width_px = 360;
+    view.height_px = 240;
+    auto frame = etch_frame_desc_default();
+    frame.viewport_w = 360;
+    frame.viewport_h = 240;
+    const uint64_t ticks0 = inlay_surface_stats(surface).js_ticks;
+    etch_begin_frame(ctx, &frame);
+    inlay_surface_view(surface, &view);
+    etch_end_frame(ctx);
+    etch_begin_frame(ctx, &frame);
+    inlay_surface_view(surface, &view);
+    etch_end_frame(ctx);
+    ok &= check(inlay_surface_stats(surface).js_ticks == ticks0,
+                "custom widget props stay zero-tick idle");
+    ok &= check(etch_frame_prim_count(ctx) > 0, "custom widget props emit GPU primitives");
+    uint32_t sw_cnt = 0u;
+    const auto *sw_nodes = inlay_surface_nodes(surface, &sw_cnt);
+    const EtchRect sw_b = etch_element_bounds(find_surface_eid(sw_nodes, sw_cnt, view.id, "sw_bare"));
+    ok &= check(sw_b.w >= 23.5f && sw_b.w <= 25.0f && sw_b.h >= 15.5f && sw_b.h <= 17.0f,
+                "toggle width/height props size track to 24x16");
+    inlay_surface_destroy(surface);
+    return ok;
+}
 bool expanded_surface_primitives(EtchContext *ctx, const InlaySurfaceDesc &desc) {
     auto *surface = inlay_surface_create(ctx, &desc);
     if (!surface)
@@ -4148,6 +4188,7 @@ int main(int argc, char **argv) {
     ok &= test_scoped_hooks_cls_cache_and_dark(context, functional_desc);
     ok &= test_i2_audit_features(context, functional_desc);
     ok &= test_wave2_track_i2(context, functional_desc, argc > 1 ? argv[1] : nullptr);
+    ok &= custom_widget_surface_props(context, functional_desc);
     inlay_surface_destroy(surface);
     etch_destroy_context(context);
     std::puts(ok ? "Sandbox reactive/HMR PASS" : "Sandbox reactive/HMR FAIL");

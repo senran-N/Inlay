@@ -112,6 +112,11 @@ typedef struct InlayDocStyle {
  EtchColor table_bg;
  EtchColor table_zebra_bg;
  EtchColor table_header_color;
+ float code_border_width;  /* 0 = default 1.0f */
+ float code_radius_px;     /* 0 = default theme.radius_panel_px */
+ float quote_border_width; /* 0 = default 2.5f */
+ float table_border_width; /* 0 = default 1.0f */
+ bool quote_no_bg;         /* Omit default blockquote card background (transparent). */
 } InlayDocStyle;
 typedef struct InlayImageResult {
  struct SDL_GPUTexture* texture;
@@ -136,6 +141,18 @@ typedef void (*InlayCustomFenceRenderFn)(uint32_t block_index,uint32_t row_id,
 typedef void (*InlayCodeHeaderFn)(uint32_t block_index,uint32_t row_id,
                                   EtchStr language,EtchStr full_code,
                                   void* user_data);
+typedef struct InlayCodeHighlightToken {
+ uint32_t start_byte;
+ uint32_t length_bytes;
+ EtchColor color;
+ uint16_t font_id; /* 0 or ETCH_INVALID_FONT = default mono font */
+} InlayCodeHighlightToken;
+/* Optional per-line syntax highlighter for Markdown code blocks.
+   Fill up to max_tokens non-overlapping tokens sorted by start_byte and return count.
+   Return 0 to fall back to Inlay's built-in highlighter. Must not mutate the document. */
+typedef uint32_t (*InlayCodeHighlightFn)(EtchStr language,EtchStr line,uint32_t line_index,
+                                         InlayCodeHighlightToken* out_tokens,uint32_t max_tokens,
+                                         void* user_data);
 typedef struct InlayDocViewDesc {
  uint32_t struct_size;
  uint32_t id;
@@ -160,6 +177,9 @@ typedef struct InlayDocViewDesc {
  InlayCodeHeaderFn diagram_header_fn;
  void* diagram_header_user_data;
  uint32_t image_epoch; /* Bump to reflow image sizes after async texture loads complete. */
+ InlayCodeHighlightFn code_highlight_fn;
+ void* code_highlight_user_data;
+ bool streaming_repair; /* Auto-close trailing incomplete inline Markdown (`**`, `` ` ``, `$`, `[label](...`) during live AI streaming. */
 } InlayDocViewDesc;
 typedef struct InlayDocResult {
  EtchStr clicked_link;
@@ -170,6 +190,7 @@ typedef struct InlayDocResult {
  EtchRect clicked_bounds;
  uint32_t clicked_block_index;
  uint16_t clicked_mods;
+ EtchStr clicked_diagram_node;
 } InlayDocResult;
 typedef struct InlayDocSelection {
  uint32_t anchor;
@@ -220,6 +241,8 @@ typedef struct InlayDiagramDesc {
  uint16_t bold_font_id;
  InlayDiagramDiagnosticFn diagnostic;
  void* diagnostic_user_data;
+ uint32_t max_nodes; /* 0 = default 256 (clamped to 2048). */
+ uint32_t max_edges; /* 0 = default 1024 (clamped to 8192). */
 } InlayDiagramDesc;
 typedef struct InlayDiagramNode {EtchStr id,label;EtchRect bounds;uint32_t rank;} InlayDiagramNode;
 typedef struct InlayDiagramEdge {uint32_t from,to;bool reversed,dashed;EtchStr label;} InlayDiagramEdge;
@@ -281,6 +304,8 @@ INLAY_API float inlay_doc_measure_height(InlayDoc*,uint32_t view_id,float width_
 INLAY_API bool inlay_doc_view_is_at_bottom(uint32_t view_id);
 INLAY_API void inlay_doc_view_scroll_to_bottom(uint32_t view_id,bool stop_momentum);
 INLAY_API InlayDocSelection inlay_doc_view_selection(const InlayDoc* doc,uint32_t view_id);
+/* Computes screen-space bounding rect of visible selected text (e.g. for floating selection toolbars). */
+INLAY_API bool inlay_doc_view_selection_rect(const InlayDoc* doc,uint32_t view_id,EtchRect* out_rect);
 /* Search the current rendered view's plain text, starting at a byte offset.
    Returns an inactive selection when the view is stale or there is no match. */
 INLAY_API InlayDocSelection inlay_doc_view_find_text(const InlayDoc*,uint32_t view_id,EtchStr query,uint32_t from_byte);
@@ -310,12 +335,15 @@ INLAY_API uint32_t inlay_doc_view_find_all(const InlayDoc* doc,uint32_t view_id,
 INLAY_API void inlay_doc_diagram_cache_stats(const InlayDoc* doc,uint32_t* out_entries,uint64_t* out_hits,uint64_t* out_misses);
 
 typedef struct InlaySurface InlaySurface;
+typedef struct InlayPortal InlayPortal;
+typedef struct InlayStream InlayStream;
 typedef struct InlaySurfaceDesc {
  uint32_t struct_size;
  size_t memory_limit_bytes,max_stack_bytes;
  float max_tick_ms;
  uint32_t max_nodes,max_text_bytes;
- bool disable_jsx; /* When false (default), scripts with JSX syntax auto-transpile cleanly. */
+ bool disable_jsx; /* When false (default), scripts with JSX/TSX syntax auto-transpile cleanly. */
+ uint32_t max_state_bytes; /* 0 = default 65536 (clamped to 1024..4194304). */
 } InlaySurfaceDesc;
 typedef enum InlayUiKind {
  INLAY_UI_BOX, INLAY_UI_TEXT, INLAY_UI_BUTTON, INLAY_UI_INPUT, INLAY_UI_TOGGLE,
@@ -325,7 +353,11 @@ typedef enum InlayUiKind {
  INLAY_UI_MATH, INLAY_UI_DIAGRAM, INLAY_UI_SLOT,
  INLAY_UI_DOC, INLAY_UI_TERMINAL, INLAY_UI_VIRTUAL_LIST, INLAY_UI_TABLE,
  INLAY_UI_TREE, INLAY_UI_TREE_ITEM, INLAY_UI_MENU, INLAY_UI_CONTEXT_MENU,
- INLAY_UI_AVATAR, INLAY_UI_TOAST, INLAY_UI_ACCORDION, INLAY_UI_SKELETON, INLAY_UI_CODE_EDITOR, INLAY_UI_FORM
+ INLAY_UI_AVATAR, INLAY_UI_TOAST, INLAY_UI_ACCORDION, INLAY_UI_SKELETON, INLAY_UI_CODE_EDITOR, INLAY_UI_FORM,
+ INLAY_UI_PORTAL,
+ INLAY_UI_DOCK_SPACE, INLAY_UI_DOCK_PANE, INLAY_UI_SHEET, INLAY_UI_HOVER_CARD,
+ INLAY_UI_RADIO_GROUP, INLAY_UI_TOGGLE_GROUP, INLAY_UI_COLOR_PICKER, INLAY_UI_CHART, INLAY_UI_VIEW_ZONE,
+ INLAY_UI_DIFF_VIEW
 } InlayUiKind;
 typedef struct InlayUiNode {InlayUiKind kind;uint32_t id,first_child,next_sibling;EtchStr text;} InlayUiNode;
 typedef struct InlaySurfaceViewDesc {
@@ -443,6 +475,56 @@ INLAY_API bool inlay_surface_bind_document(InlaySurface*,EtchStr name,InlayDoc*)
    without the editor before freeing the buffer, so its native selection and accessibility snapshots expire.
    The buffer retains text and undo history across script and view rebuilds. */
 INLAY_API bool inlay_surface_bind_text_buffer(InlaySurface*,EtchStr name,EtchTextBuffer*);
+/* Live zero-copy host terminal grid snapshot (e.g., backed by PTY / libghostty-vt).
+   Returned cell and inline-image spans must stay valid through inlay_surface_view(). */
+typedef struct InlayTerminalSnapshot {
+ uint32_t struct_size;
+ const EtchTerminalCell* cells;
+ size_t cell_count;
+ uint32_t columns,rows,first_row;
+ int32_t cursor_column,cursor_row;
+ EtchTerminalCursorShape cursor_shape;
+ bool cursor_visible;
+ int32_t selection_start_col,selection_start_row;
+ int32_t selection_end_col,selection_end_row;
+ bool selection_block;
+ EtchColor selection_color;
+ uint32_t hovered_hyperlink_id;
+ const EtchTerminalInlineImage* inline_images;
+ uint32_t inline_image_count;
+ uint64_t revision;
+} InlayTerminalSnapshot;
+typedef bool (*InlayTerminalReadFn)(InlayTerminalSnapshot* out_snapshot,void* user_data);
+INLAY_API InlayTerminalSnapshot inlay_terminal_snapshot_default(void);
+/* Bind a live host-owned terminal cell source for <Terminal buffer="name" />. Pass NULL to unbind. */
+INLAY_API bool inlay_surface_bind_terminal(InlaySurface*,EtchStr name,InlayTerminalReadFn read_fn,void* user_data);
+/* Bind a host-owned InlayPortal from the same Etch context for <Portal name="..." />. Pass NULL to unbind. */
+INLAY_API bool inlay_surface_bind_portal(InlaySurface*,EtchStr name,InlayPortal* portal);
+/* Bind a host-owned InlayStream for zero-serialization JS readStream(name, sinceCursor?). Pass NULL to unbind. */
+INLAY_API bool inlay_surface_bind_stream(InlaySurface*,EtchStr name,InlayStream* stream);
+typedef enum InlayConsoleLevel {
+ INLAY_CONSOLE_DEBUG = 0,
+ INLAY_CONSOLE_INFO = 1,
+ INLAY_CONSOLE_WARN = 2,
+ INLAY_CONSOLE_ERROR = 3
+} InlayConsoleLevel;
+typedef void (*InlayConsoleFn)(InlaySurface*,InlayConsoleLevel level,EtchStr message,void* user_data);
+INLAY_API void inlay_surface_set_console_callback(InlaySurface*,InlayConsoleFn fn,void* user_data);
+/* Optional host key-value persistence backend for JS localStorage. Falls back to in-memory storage when NULL. */
+typedef bool (*InlayStorageGetFn)(EtchStr key,char* out_buf,uint32_t cap,uint32_t* out_len,void* user_data);
+typedef bool (*InlayStorageSetFn)(EtchStr key,EtchStr value,void* user_data);
+typedef bool (*InlayStorageRemoveFn)(EtchStr key,void* user_data);
+INLAY_API void inlay_surface_set_storage_hooks(InlaySurface*,InlayStorageGetFn get_fn,
+ InlayStorageSetFn set_fn,InlayStorageRemoveFn remove_fn,void* user_data);
+/* Optional host syntax tokenizer for <CodeEditor> and <DiffView> (overrides built-in language tokenizer). */
+INLAY_API void inlay_surface_set_code_tokenizer(InlaySurface*,EtchSyntaxTokenizeFn fn,void* user_data);
+/* Optional host hooks for <Doc> code highlighting and custom fenced blocks. */
+INLAY_API void inlay_surface_set_doc_hooks(InlaySurface*,InlayCodeHighlightFn highlight_fn,void* highlight_user_data,
+ InlayCustomFenceEstimateFn fence_estimate_fn,InlayCustomFenceRenderFn fence_render_fn,void* fence_user_data);
+/* Register or replace an in-memory sandboxed ES module available to import statements in surface scripts.
+   JSX auto-transpiles unless disable_jsx is set. No host filesystem access is ever performed. */
+INLAY_API bool inlay_surface_register_module(InlaySurface*,EtchStr module_name,EtchStr source_utf8);
+INLAY_API bool inlay_surface_unregister_module(InlaySurface*,EtchStr module_name);
 INLAY_API bool inlay_surface_set_image_resolver(InlaySurface*,InlayImageResolverFn,void* user_data);
 INLAY_API bool inlay_surface_dispatch(InlaySurface*,EtchStr name,EtchStr payload_json);
 INLAY_API bool inlay_surface_enable_hmr(InlaySurface*,const char* script_path);
@@ -490,7 +572,6 @@ INLAY_API void inlay_inbox_destroy(InlayInbox*);
 INLAY_API uint32_t inlay_inbox_drain_to_surface(InlayInbox*,InlaySurface*,uint32_t max_messages);
 
 /* Structured AI conversation & tool-result stream with stable 64-bit IDs and resumable cursor. */
-typedef struct InlayStream InlayStream;
 typedef enum InlayStreamRole {
  INLAY_STREAM_ROLE_USER = 0,
  INLAY_STREAM_ROLE_ASSISTANT = 1,
@@ -581,7 +662,6 @@ INLAY_API bool inlay_image_loader_resolve(EtchStr src,InlayImageResult* out,void
 /* Windowless portal. Backends own returned pixel spans until the next callback;
    all callbacks run synchronously on the host UI thread. Context outlives portal.
    Backend callbacks must not destroy or reenter the portal. */
-typedef struct InlayPortal InlayPortal;
 typedef enum InlayPortalMode {INLAY_PORTAL_MODE_TEXTURE,INLAY_PORTAL_MODE_UNDERLAY} InlayPortalMode;
 typedef struct InlayPortalDirtyRect {
  uint32_t x,y,width,height,row_pitch_bytes;
@@ -656,6 +736,17 @@ typedef enum InlayPortalNavDecision {
 typedef InlayPortalNavDecision (*InlayPortalNavFn)(InlayPortal*,EtchStr url,bool is_new_window,void* user_data);
 typedef void (*InlayPortalMessageFn)(InlayPortal*,EtchStr message_json,void* user_data);
 typedef bool (*InlayPortalPermissionFn)(InlayPortal*,EtchStr origin,EtchStr permission_kind,void* user_data);
+typedef struct InlayPortalState {
+ uint32_t struct_size;
+ bool is_loading;
+ bool can_go_back;
+ bool can_go_forward;
+ float zoom_factor;
+ EtchStr title;
+ EtchStr url;
+ EtchStr favicon_url;
+} InlayPortalState;
+typedef void (*InlayPortalStateChangeFn)(InlayPortal*,const InlayPortalState* state,void* user_data);
 typedef struct InlayPortalPolicy {
  uint32_t struct_size;
  EtchStr allowed_origins_csv; /* Empty allows all origins; otherwise comma-separated scheme://host[:port]. */
@@ -665,8 +756,24 @@ typedef struct InlayPortalPolicy {
  InlayPortalMessageFn on_message;
  InlayPortalPermissionFn on_permission;
  void* user_data;
+ InlayPortalStateChangeFn on_state_change;
 } InlayPortalPolicy;
 INLAY_API InlayPortalPolicy inlay_portal_policy_default(void);
+INLAY_API InlayPortalState inlay_portal_state_default(void);
+INLAY_API bool inlay_portal_state(const InlayPortal*,InlayPortalState* out_state);
+INLAY_API bool inlay_portal_set_zoom(InlayPortal*,float zoom_factor);
+INLAY_API bool inlay_portal_find_in_page(InlayPortal*,EtchStr query,bool forward,bool match_case);
+INLAY_API bool inlay_portal_stop_find(InlayPortal*);
+typedef struct InlayPortalFindResult {
+ uint32_t struct_size;
+ bool active;
+ uint32_t active_match;
+ uint32_t total_matches;
+} InlayPortalFindResult;
+INLAY_API InlayPortalFindResult inlay_portal_find_result_default(void);
+INLAY_API bool inlay_portal_find_status(const InlayPortal*,InlayPortalFindResult* out_result);
+/* button: 1 = left, 2 = middle, 3 = right */
+INLAY_API bool inlay_portal_inject_mouse_button(InlayPortal*,EtchVec2 screen_pos,uint8_t button,bool down);
 INLAY_API void inlay_portal_set_policy(InlayPortal*,const InlayPortalPolicy* policy);
 INLAY_API bool inlay_portal_post_message(InlayPortal*,EtchStr message_json);
 /* Returns front queued message byte length without consuming it (0 if empty). */
@@ -682,6 +789,14 @@ INLAY_API bool inlay_portal_can_go_back(const InlayPortal*);
 INLAY_API bool inlay_portal_can_go_forward(const InlayPortal*);
 INLAY_API EtchStr inlay_portal_current_url(const InlayPortal*);
 INLAY_API bool inlay_portal_end_frame_sync(InlayPortal*,bool host_input_enabled);
+/* Execute JavaScript in the portal page (WebView2 ExecuteScript; validated/tracked on mock). */
+INLAY_API bool inlay_portal_eval_script(InlayPortal*,EtchStr script_utf8);
+/* Register an init script run before page scripts on every new document creation. */
+INLAY_API bool inlay_portal_add_init_script(InlayPortal*,EtchStr script_utf8);
+/* Open developer tools when supported by the active portal backend (WebView2; tracked on mock). */
+INLAY_API bool inlay_portal_open_devtools(InlayPortal*);
+/* Capture RGBA8 preview pixels (width * height * 4 bytes) from the portal (OSR / mock texture preview). */
+INLAY_API bool inlay_portal_capture_preview_rgba(InlayPortal*,uint8_t* out_rgba,uint32_t width,uint32_t height);
 /* Optional Windows native UNDERLAY backend. The host supplies a dedicated HWND
    BELOW its alpha-composited Etch surface, with the same client origin, and owns
    message pumping, native keyboard and IME dispatch. Create and destroy the
@@ -699,6 +814,23 @@ typedef struct InlayPortalWebView2Options {
 } InlayPortalWebView2Options;
 INLAY_API InlayPortalWebView2Options inlay_portal_webview2_options_default(void);
 INLAY_API const InlayPortalBackendVTable* inlay_portal_webview2_backend(void);
+typedef struct InlayPortalMacOSOptions {
+ uint32_t struct_size;
+ void* parent_nsview;
+ const char* user_data_path;
+ bool transparent_background;
+} InlayPortalMacOSOptions;
+INLAY_API InlayPortalMacOSOptions inlay_portal_macos_options_default(void);
+INLAY_API const InlayPortalBackendVTable* inlay_portal_macos_backend(void);
+typedef struct InlayPortalGtkOptions {
+ uint32_t struct_size;
+ void* parent_gtk_widget;
+ const char* user_data_path;
+ bool transparent_background;
+} InlayPortalGtkOptions;
+INLAY_API InlayPortalGtkOptions inlay_portal_gtk_options_default(void);
+INLAY_API const InlayPortalBackendVTable* inlay_portal_gtk_backend(void);
+INLAY_API const InlayPortalBackendVTable* inlay_portal_native_backend(void);
 #ifdef __cplusplus
 }
 #endif

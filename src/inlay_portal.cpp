@@ -10,14 +10,35 @@ struct InlayPortalHostHooks {
                                          bool is_new_window) noexcept;
   void (*on_web_message)(void *ctx, EtchStr msg) noexcept;
   bool (*on_perm_check)(void *ctx, EtchStr origin, EtchStr perm_kind) noexcept;
+  void (*on_title_changed)(void *ctx, EtchStr title) noexcept;
+  void (*on_loading_changed)(void *ctx, bool is_loading) noexcept;
+  void (*on_source_changed)(void *ctx, EtchStr url) noexcept;
+  void (*on_favicon_changed)(void *ctx, EtchStr favicon_url) noexcept;
   void *ctx;
 };
 #endif
 
 bool inlay_portal_webview2_post_message(void *backend, EtchStr msg) noexcept;
 bool inlay_portal_webview2_nav_action(void *backend, int action) noexcept;
+bool inlay_portal_webview2_eval_script(void *backend, EtchStr script) noexcept;
+bool inlay_portal_webview2_add_init_script(void *backend, EtchStr script) noexcept;
+bool inlay_portal_webview2_open_devtools(void *backend) noexcept;
+bool inlay_portal_webview2_set_zoom(void *backend, float zoom_factor) noexcept;
+bool inlay_portal_webview2_inject_mouse_button(void *backend, EtchVec2 local_pos, uint8_t button, bool down) noexcept;
 void inlay_portal_webview2_set_hooks(void *backend,
                                      const InlayPortalHostHooks *hooks) noexcept;
+bool inlay_portal_macos_nav_action(void *backend, int action) noexcept;
+bool inlay_portal_macos_eval_script(void *backend, EtchStr script) noexcept;
+bool inlay_portal_macos_add_init_script(void *backend, EtchStr script) noexcept;
+bool inlay_portal_macos_set_zoom(void *backend, float zoom_factor) noexcept;
+bool inlay_portal_macos_open_devtools(void *backend) noexcept;
+void inlay_portal_macos_set_hooks(void *backend, const InlayPortalHostHooks *hooks) noexcept;
+bool inlay_portal_gtk_nav_action(void *backend, int action) noexcept;
+bool inlay_portal_gtk_eval_script(void *backend, EtchStr script) noexcept;
+bool inlay_portal_gtk_add_init_script(void *backend, EtchStr script) noexcept;
+bool inlay_portal_gtk_set_zoom(void *backend, float zoom_factor) noexcept;
+bool inlay_portal_gtk_open_devtools(void *backend) noexcept;
+void inlay_portal_gtk_set_hooks(void *backend, const InlayPortalHostHooks *hooks) noexcept;
 
 struct PortalMsg {
   char *data;
@@ -40,11 +61,22 @@ struct InlayPortal {
   bool has_geometry;
   bool pending_draw;
   bool host_input_enabled, geom_visible, focused, captured, pointer_down;
-  bool is_webview2, dispatching_message;
+  bool is_webview2, is_macos, is_gtk, dispatching_message, is_loading, dispatching_state;
+  float zoom_factor;
+  bool find_active;
+  uint32_t find_active_match, find_total_matches;
   InlayPortalStats stats;
   InlayPortalPolicy policy;
   char *allowed_origins;
   uint32_t allowed_origins_len;
+  char *title;
+  uint32_t title_len;
+  char *favicon_url;
+  uint32_t favicon_url_len;
+  char *find_query;
+  uint32_t find_query_len;
+  char *html_body;
+  uint32_t html_body_len;
   char **history;
   uint32_t history_count, history_cap;
   int32_t history_index;
@@ -57,6 +89,8 @@ struct MockPortal {
   unsigned char *pixels;
   bool full_dirty, button_dirty, down, selected;
   uint32_t phase;
+  uint32_t eval_count, init_script_count, find_count;
+  bool devtools_open, find_active;
   EtchRect bounds, visible;
 };
 void paint(MockPortal *m, uint32_t x, uint32_t y, uint32_t w,
@@ -479,6 +513,142 @@ bool portal_hook_perm_check(void *ctx, EtchStr origin,
     return false;
   return perm_fn(p, origin, perm_kind, p->policy.user_data);
 }
+void set_owned_str(char **dst, uint32_t *dst_len, EtchStr src) noexcept {
+  if (!src.chars || src.length == 0u) {
+    std::free(*dst);
+    *dst = nullptr;
+    *dst_len = 0u;
+    return;
+  }
+  const uint32_t clamped = src.length > 4096u ? 4096u : src.length;
+  auto *copy = static_cast<char *>(std::malloc(size_t(clamped) + 1u));
+  if (!copy)
+    return;
+  std::memcpy(copy, src.chars, clamped);
+  copy[clamped] = '\0';
+  std::free(*dst);
+  *dst = copy;
+  *dst_len = clamped;
+}
+void derive_favicon_from_url(InlayPortal *p, EtchStr url) noexcept {
+  OriginParts parts = {};
+  if (extract_origin(url.chars, url.length, &parts, false) &&
+      (ascii_ieq(parts.scheme, parts.scheme_len, "http", 4u) ||
+       ascii_ieq(parts.scheme, parts.scheme_len, "https", 5u))) {
+    const uint32_t need = parts.scheme_len + 3u + parts.host_len +
+                          (parts.port_len ? (1u + parts.port_len) : 0u) + 12u;
+    auto *buf = static_cast<char *>(std::malloc(size_t(need) + 1u));
+    if (buf) {
+      uint32_t wp = 0u;
+      std::memcpy(buf + wp, parts.scheme, parts.scheme_len); wp += parts.scheme_len;
+      std::memcpy(buf + wp, "://", 3u); wp += 3u;
+      std::memcpy(buf + wp, parts.host, parts.host_len); wp += parts.host_len;
+      if (parts.port_len) {
+        buf[wp++] = ':';
+        std::memcpy(buf + wp, parts.port, parts.port_len); wp += parts.port_len;
+      }
+      std::memcpy(buf + wp, "/favicon.ico", 12u); wp += 12u;
+      buf[wp] = '\0';
+      std::free(p->favicon_url);
+      p->favicon_url = buf;
+      p->favicon_url_len = wp;
+      return;
+    }
+  }
+  set_owned_str(&p->favicon_url, &p->favicon_url_len, {});
+}
+void extract_html_title(InlayPortal *p, EtchStr html) noexcept {
+  if (!html.chars || html.length < 15u)
+    return;
+  for (uint32_t i = 0u; i + 7u <= html.length; ++i) {
+    if (html.chars[i] == '<' && ascii_ieq(html.chars + i + 1u, 5u, "title", 5u)) {
+      uint32_t gt = i + 6u;
+      while (gt < html.length && html.chars[gt] != '>') ++gt;
+      if (gt >= html.length) break;
+      const uint32_t ts = gt + 1u;
+      for (uint32_t j = ts; j + 8u <= html.length; ++j) {
+        if (html.chars[j] == '<' && html.chars[j + 1u] == '/' &&
+            ascii_ieq(html.chars + j + 2u, 5u, "title", 5u) && html.chars[j + 7u] == '>') {
+          set_owned_str(&p->title, &p->title_len, {html.chars + ts, j - ts, false});
+          return;
+        }
+      }
+      break;
+    }
+  }
+}
+void fill_portal_state(const InlayPortal *p, InlayPortalState *out) noexcept {
+  *out = inlay_portal_state_default();
+  if (!p)
+    return;
+  out->is_loading = p->is_loading;
+  out->can_go_back = p->history_index > 0;
+  out->can_go_forward = p->history_index >= 0 &&
+                        static_cast<uint32_t>(p->history_index) + 1u < p->history_count;
+  out->zoom_factor = p->zoom_factor > 0.f ? p->zoom_factor : 1.0f;
+  out->title = p->title ? EtchStr{p->title, p->title_len, false} : EtchStr{};
+  out->url = inlay_portal_current_url(p);
+  out->favicon_url = p->favicon_url ? EtchStr{p->favicon_url, p->favicon_url_len, false} : EtchStr{};
+}
+void notify_state_change(InlayPortal *p) noexcept {
+  if (!p || p->dispatching_state || !p->policy.on_state_change)
+    return;
+  InlayPortalState st = {};
+  fill_portal_state(p, &st);
+  p->dispatching_state = true;
+  p->policy.on_state_change(p, &st, p->policy.user_data);
+  p->dispatching_state = false;
+}
+void portal_hook_title_changed(void *ctx, EtchStr title) noexcept {
+  auto *p = static_cast<InlayPortal *>(ctx);
+  set_owned_str(&p->title, &p->title_len, title);
+  notify_state_change(p);
+}
+void portal_hook_loading_changed(void *ctx, bool is_loading) noexcept {
+  auto *p = static_cast<InlayPortal *>(ctx);
+  p->is_loading = is_loading;
+  notify_state_change(p);
+}
+void portal_hook_source_changed(void *ctx, EtchStr url) noexcept {
+  auto *p = static_cast<InlayPortal *>(ctx);
+  if (!valid_portal_str(url))
+    return;
+  const EtchStr cur = inlay_portal_current_url(p);
+  if (cur.length != url.length || (cur.length > 0u && std::memcmp(cur.chars, url.chars, cur.length) != 0)) {
+    push_history(p, url);
+  }
+  derive_favicon_from_url(p, url);
+  notify_state_change(p);
+}
+void portal_hook_favicon_changed(void *ctx, EtchStr favicon_url) noexcept {
+  auto *p = static_cast<InlayPortal *>(ctx);
+  if (!p) return;
+  if (favicon_url.chars && favicon_url.length > 0u) {
+    set_owned_str(&p->favicon_url, &p->favicon_url_len, favicon_url);
+    notify_state_change(p);
+  }
+}
+void portal_hook_web_message_dispatch(void *ctx, EtchStr msg) noexcept {
+  auto *p = static_cast<InlayPortal *>(ctx);
+  if (!p || !valid_portal_str(msg)) return;
+  static constexpr char kFindPrefix[] = "__inlay_find__:";
+  constexpr uint32_t kFindPrefixLen = sizeof(kFindPrefix) - 1u;
+  if (msg.length > kFindPrefixLen && std::memcmp(msg.chars, kFindPrefix, kFindPrefixLen) == 0) {
+    uint32_t act = 0u, tot = 0u;
+    const char *s = msg.chars + kFindPrefixLen;
+    const char *end = msg.chars + msg.length;
+    while (s < end && *s >= '0' && *s <= '9') { act = act * 10u + uint32_t(*s - '0'); ++s; }
+    if (s < end && *s == '/') {
+      ++s;
+      while (s < end && *s >= '0' && *s <= '9') { tot = tot * 10u + uint32_t(*s - '0'); ++s; }
+    }
+    p->find_active = (tot > 0u);
+    p->find_active_match = act;
+    p->find_total_matches = tot;
+    return;
+  }
+  portal_hook_web_message(ctx, msg);
+}
 } // namespace
 extern "C" {
 INLAY_API const InlayPortalBackendVTable *inlay_portal_mock_backend(void) {
@@ -491,13 +661,17 @@ INLAY_API InlayPortal *inlay_portal_create(EtchContext *ctx,
     return nullptr;
   const auto *api = d.backend ? d.backend : &mock_api;
   const auto *wv2 = inlay_portal_webview2_backend();
+  const auto *macb = inlay_portal_macos_backend();
+  const auto *gtkb = inlay_portal_gtk_backend();
   const bool is_wv2 = wv2 != nullptr && api == wv2;
+  const bool is_mac = macb != nullptr && api == macb;
+  const bool is_gtk = gtkb != nullptr && api == gtkb;
   if (!ctx || !valid_size(d.width, d.height) ||
       (d.mode != INLAY_PORTAL_MODE_TEXTURE &&
        d.mode != INLAY_PORTAL_MODE_UNDERLAY) ||
       !api->create || !api->destroy || !api->resize || !api->poll_dirty_rects ||
       !api->ack_dirty_rects ||
-      (is_wv2 && d.mode != INLAY_PORTAL_MODE_UNDERLAY))
+      ((is_wv2 || is_mac || is_gtk) && d.mode != INLAY_PORTAL_MODE_UNDERLAY))
     return nullptr;
   auto *p = static_cast<InlayPortal *>(std::calloc(1, sizeof(InlayPortal)));
   if (!p)
@@ -505,6 +679,9 @@ INLAY_API InlayPortal *inlay_portal_create(EtchContext *ctx,
   p->context = ctx;
   p->host_input_enabled = true;
   p->is_webview2 = is_wv2;
+  p->is_macos = is_mac;
+  p->is_gtk = is_gtk;
+  p->zoom_factor = 1.0f;
   p->policy = inlay_portal_policy_default();
   p->history_index = -1;
   p->api = *api;
@@ -524,14 +701,20 @@ INLAY_API InlayPortal *inlay_portal_create(EtchContext *ctx,
       return nullptr;
     }
   }
-  if (p->is_webview2) {
+  if (p->is_webview2 || p->is_macos || p->is_gtk) {
     const InlayPortalHostHooks hooks = {
         portal_hook_nav_check,
-        portal_hook_web_message,
+        portal_hook_web_message_dispatch,
         portal_hook_perm_check,
+        portal_hook_title_changed,
+        portal_hook_loading_changed,
+        portal_hook_source_changed,
+        portal_hook_favicon_changed,
         p,
     };
-    inlay_portal_webview2_set_hooks(p->backend, &hooks);
+    if (p->is_webview2) inlay_portal_webview2_set_hooks(p->backend, &hooks);
+    else if (p->is_macos) inlay_portal_macos_set_hooks(p->backend, &hooks);
+    else if (p->is_gtk) inlay_portal_gtk_set_hooks(p->backend, &hooks);
   }
   return p;
 }
@@ -542,9 +725,17 @@ INLAY_API bool inlay_portal_destroy(InlayPortal *p) {
     return false;
   if (p->is_webview2)
     inlay_portal_webview2_set_hooks(p->backend, nullptr);
+  else if (p->is_macos)
+    inlay_portal_macos_set_hooks(p->backend, nullptr);
+  else if (p->is_gtk)
+    inlay_portal_gtk_set_hooks(p->backend, nullptr);
   p->api.destroy(p->backend);
   etch_destroy_loaded_texture(p->context, &p->texture);
   std::free(p->allowed_origins);
+  std::free(p->title);
+  std::free(p->favicon_url);
+  std::free(p->find_query);
+  std::free(p->html_body);
   for (uint32_t i = 0; i < p->history_count; ++i)
     std::free(p->history[i]);
   std::free(p->history);
@@ -567,10 +758,67 @@ INLAY_API bool inlay_portal_load_url(InlayPortal *p, EtchStr s) {
   if (!p->api.load_url(p->backend, s))
     return false;
   push_history(p, s);
+  derive_favicon_from_url(p, s);
+  set_owned_str(&p->html_body, &p->html_body_len, {});
+  if (!p->is_webview2) {
+    set_owned_str(&p->title, &p->title_len, s);
+    p->is_loading = false;
+  } else {
+    p->is_loading = true;
+  }
+  notify_state_change(p);
   return true;
 }
 INLAY_API bool inlay_portal_load_html(InlayPortal *p, EtchStr s) {
-  return p && s.chars && p->api.load_html && p->api.load_html(p->backend, s);
+  if (!p || !s.chars || !p->api.load_html || !p->api.load_html(p->backend, s))
+    return false;
+  extract_html_title(p, s);
+  // Extract visible body text (stripping <title>/<script>/<style> blocks and tags) for mock find-in-page.
+  {
+    const uint32_t cap = s.length < 131072u ? s.length : 131072u;
+    char *plain = static_cast<char *>(std::malloc(size_t(cap) + 1u));
+    if (plain) {
+      uint32_t out_n = 0u;
+      bool in_tag = false;
+      bool skip_block = false;
+      const char *skip_end_tag = nullptr;
+      uint32_t skip_end_len = 0u;
+      for (uint32_t i = 0u; i < cap; ++i) {
+        if (skip_block) {
+          if (s.chars[i] == '<' && i + 1u < cap && s.chars[i + 1u] == '/' &&
+              i + 2u + skip_end_len <= cap &&
+              ascii_ieq(s.chars + i + 2u, skip_end_len, skip_end_tag, skip_end_len)) {
+            uint32_t k = i + 2u + skip_end_len;
+            while (k < cap && s.chars[k] != '>') ++k;
+            if (k < cap) { i = k; skip_block = false; }
+          }
+          continue;
+        }
+        if (s.chars[i] == '<') {
+          in_tag = true;
+          const uint32_t ts = i + 1u;
+          uint32_t te = ts;
+          while (te < cap && is_ascii_alpha(s.chars[te])) ++te;
+          const uint32_t tlen = te - ts;
+          if (ascii_ieq(s.chars + ts, tlen, "script", 6u)) { skip_block = true; skip_end_tag = "script"; skip_end_len = 6u; }
+          else if (ascii_ieq(s.chars + ts, tlen, "style", 5u)) { skip_block = true; skip_end_tag = "style"; skip_end_len = 5u; }
+          else if (ascii_ieq(s.chars + ts, tlen, "title", 5u)) { skip_block = true; skip_end_tag = "title"; skip_end_len = 5u; }
+          continue;
+        }
+        if (in_tag) {
+          if (s.chars[i] == '>') in_tag = false;
+          continue;
+        }
+        plain[out_n++] = s.chars[i];
+      }
+      plain[out_n] = '\0';
+      set_owned_str(&p->html_body, &p->html_body_len, {plain, out_n, false});
+      std::free(plain);
+    }
+  }
+  p->is_loading = p->is_webview2;
+  notify_state_change(p);
+  return true;
 }
 INLAY_API bool inlay_portal_resize(InlayPortal *p, uint32_t w, uint32_t h) {
   if (!p || p->pending_draw || !valid_size(w, h))
@@ -856,6 +1104,7 @@ INLAY_API bool inlay_portal_go_back(InlayPortal *p) {
     if (!inlay_portal_webview2_nav_action(p->backend, 0))
       return false;
     p->history_index = target;
+    notify_state_change(p);
     return true;
   }
   const char *url = p->history[target];
@@ -863,6 +1112,9 @@ INLAY_API bool inlay_portal_go_back(InlayPortal *p) {
   if (!p->api.load_url || !p->api.load_url(p->backend, s))
     return false;
   p->history_index = target;
+  derive_favicon_from_url(p, s);
+  set_owned_str(&p->title, &p->title_len, s);
+  notify_state_change(p);
   return true;
 }
 INLAY_API bool inlay_portal_go_forward(InlayPortal *p) {
@@ -873,6 +1125,7 @@ INLAY_API bool inlay_portal_go_forward(InlayPortal *p) {
     if (!inlay_portal_webview2_nav_action(p->backend, 1))
       return false;
     p->history_index = target;
+    notify_state_change(p);
     return true;
   }
   const char *url = p->history[target];
@@ -880,6 +1133,9 @@ INLAY_API bool inlay_portal_go_forward(InlayPortal *p) {
   if (!p->api.load_url || !p->api.load_url(p->backend, s))
     return false;
   p->history_index = target;
+  derive_favicon_from_url(p, s);
+  set_owned_str(&p->title, &p->title_len, s);
+  notify_state_change(p);
   return true;
 }
 INLAY_API bool inlay_portal_reload(InlayPortal *p) {
@@ -911,4 +1167,221 @@ INLAY_API bool inlay_portal_end_frame_sync(InlayPortal *p,
   inlay_portal_frame_submitted(p);
   return synced;
 }
+INLAY_API bool inlay_portal_eval_script(InlayPortal *p, EtchStr script_utf8) {
+  if (!p || !valid_portal_str(script_utf8))
+    return false;
+  if (p->is_webview2)
+    return inlay_portal_webview2_eval_script(p->backend, script_utf8);
+  if (p->is_macos)
+    return inlay_portal_macos_eval_script(p->backend, script_utf8);
+  if (p->is_gtk)
+    return inlay_portal_gtk_eval_script(p->backend, script_utf8);
+  if (p->api.create == mock_create) {
+    auto *m = static_cast<MockPortal *>(p->backend);
+    ++m->eval_count;
+    return true;
+  }
+  return false;
+}
+INLAY_API bool inlay_portal_add_init_script(InlayPortal *p, EtchStr script_utf8) {
+  if (!p || !valid_portal_str(script_utf8))
+    return false;
+  if (p->is_webview2)
+    return inlay_portal_webview2_add_init_script(p->backend, script_utf8);
+  if (p->is_macos)
+    return inlay_portal_macos_add_init_script(p->backend, script_utf8);
+  if (p->is_gtk)
+    return inlay_portal_gtk_add_init_script(p->backend, script_utf8);
+  if (p->api.create == mock_create) {
+    auto *m = static_cast<MockPortal *>(p->backend);
+    ++m->init_script_count;
+    return true;
+  }
+  return false;
+}
+INLAY_API bool inlay_portal_open_devtools(InlayPortal *p) {
+  if (!p)
+    return false;
+  if (p->is_webview2)
+    return inlay_portal_webview2_open_devtools(p->backend);
+  if (p->is_macos)
+    return inlay_portal_macos_open_devtools(p->backend);
+  if (p->is_gtk)
+    return inlay_portal_gtk_open_devtools(p->backend);
+  if (p->api.create == mock_create) {
+    auto *m = static_cast<MockPortal *>(p->backend);
+    m->devtools_open = true;
+    return true;
+  }
+  return false;
+}
+INLAY_API bool inlay_portal_capture_preview_rgba(InlayPortal *p, uint8_t *out_rgba,
+                                                 uint32_t width, uint32_t height) {
+  if (!p || !out_rgba || width == 0u || height == 0u || width > 4096u || height > 4096u)
+    return false;
+  if (p->api.create == mock_create) {
+    auto *m = static_cast<MockPortal *>(p->backend);
+    if (!m || !m->pixels || m->width == 0u || m->height == 0u) return false;
+    for (uint32_t y = 0u; y < height; ++y) {
+      const uint32_t sy = (y * m->height) / height;
+      const unsigned char *src_row = m->pixels + size_t(sy) * size_t(m->width) * 4u;
+      uint8_t *dst_row = out_rgba + size_t(y) * size_t(width) * 4u;
+      for (uint32_t x = 0u; x < width; ++x) {
+        const uint32_t sx = (x * m->width) / width;
+        std::memcpy(dst_row + size_t(x) * 4u, src_row + size_t(sx) * 4u, 4u);
+      }
+    }
+    return true;
+  }
+  return false;
+}
+INLAY_API bool inlay_portal_state(const InlayPortal *p, InlayPortalState *out_state) {
+  if (!p || !out_state)
+    return false;
+  fill_portal_state(p, out_state);
+  return true;
+}
+INLAY_API bool inlay_portal_set_zoom(InlayPortal *p, float zoom_factor) {
+  if (!p || !std::isfinite(zoom_factor) || zoom_factor <= 0.0f)
+    return false;
+  const float clamped = zoom_factor < 0.25f ? 0.25f : (zoom_factor > 5.0f ? 5.0f : zoom_factor);
+  if (p->is_webview2 && !inlay_portal_webview2_set_zoom(p->backend, clamped))
+    return false;
+  if (p->is_macos && !inlay_portal_macos_set_zoom(p->backend, clamped))
+    return false;
+  if (p->is_gtk && !inlay_portal_gtk_set_zoom(p->backend, clamped))
+    return false;
+  p->zoom_factor = clamped;
+  notify_state_change(p);
+  return true;
+}
+INLAY_API bool inlay_portal_find_in_page(InlayPortal *p, EtchStr query,
+                                         bool forward, bool match_case) {
+  if (!p || !valid_portal_str(query) || query.length > 1024u)
+    return false;
+  const bool same_q = p->find_query && p->find_query_len == query.length &&
+      std::memcmp(p->find_query, query.chars, query.length) == 0;
+  set_owned_str(&p->find_query, &p->find_query_len, query);
+  if (p->is_webview2 || p->is_macos || p->is_gtk) {
+    char script[4096];
+    uint32_t wp = 0u;
+    auto put = [&](const char *lit) {
+      const size_t n = std::strlen(lit);
+      if (wp + n < sizeof(script) - 1u) { std::memcpy(script + wp, lit, n); wp += uint32_t(n); }
+    };
+    put("(()=>{const q=\"");
+    for (uint32_t i = 0u; i < query.length && wp + 8u < sizeof(script) - 512u; ++i) {
+      const char ch = query.chars[i];
+      if (ch == '"' || ch == '\\') { script[wp++] = '\\'; script[wp++] = ch; }
+      else if (ch == '\n') { script[wp++] = '\\'; script[wp++] = 'n'; }
+      else if (ch == '\r') { script[wp++] = '\\'; script[wp++] = 'r'; }
+      else if (static_cast<unsigned char>(ch) >= 0x20u) { script[wp++] = ch; }
+    }
+    put(match_case ? "\",mc=true" : "\",mc=false");
+    put(forward ? ",fwd=true;" : ",fwd=false;");
+    put("const txt=document.body?(document.body.innerText||''):'';"
+        "const hay=mc?txt:txt.toLowerCase(),ndl=mc?q:q.toLowerCase();"
+        "let tot=0,idx=0;if(ndl.length){while((idx=hay.indexOf(ndl,idx))!==-1){tot++;idx+=ndl.length;}}"
+        "window.__inlayFindIdx=tot?(((window.__inlayFindIdx||0)+(fwd?1:-1)+tot)%tot):0;"
+        "if(window.find)window.find(q,mc,!fwd,true,false,false,false);"
+        "const msg='__inlay_find__:'+(tot?(window.__inlayFindIdx+1):0)+'/'+tot;"
+        "if(window.chrome&&window.chrome.webview)window.chrome.webview.postMessage(msg);"
+        "else if(window.webkit&&window.webkit.messageHandlers&&window.webkit.messageHandlers.inlay)"
+        "window.webkit.messageHandlers.inlay.postMessage(msg);})();");
+    script[wp] = '\0';
+    p->find_active = true;
+    return inlay_portal_eval_script(p, {script, wp, false});
+  }
+  if (p->api.create == mock_create) {
+    auto *m = static_cast<MockPortal *>(p->backend);
+    ++m->find_count;
+    m->find_active = true;
+    // Count occurrences against loaded HTML plain body text (or mock title/URL when no HTML loaded)
+    const char *hay = (p->html_body && p->html_body_len > 0u) ? p->html_body : p->title;
+    const uint32_t hay_len = (p->html_body && p->html_body_len > 0u) ? p->html_body_len : p->title_len;
+    uint32_t tot = 0u;
+    if (hay && hay_len >= query.length) {
+      for (uint32_t i = 0u; i + query.length <= hay_len; ++i) {
+        bool eq = true;
+        for (uint32_t k = 0u; k < query.length; ++k) {
+          const char a = match_case ? hay[i + k] : ascii_lower(hay[i + k]);
+          const char b = match_case ? query.chars[k] : ascii_lower(query.chars[k]);
+          if (a != b) { eq = false; break; }
+        }
+        if (eq) { ++tot; i += query.length - 1u; }
+      }
+    }
+    if (tot == 0u && (!p->html_body || p->html_body_len == 0u)) tot = 1u;
+    p->find_active = true;
+    p->find_total_matches = tot;
+    if (tot == 0u) {
+      p->find_active_match = 0u;
+    } else if (!same_q || p->find_active_match == 0u || p->find_active_match > tot) {
+      p->find_active_match = forward ? 1u : tot;
+    } else if (forward) {
+      p->find_active_match = (p->find_active_match % tot) + 1u;
+    } else {
+      p->find_active_match = (p->find_active_match == 1u) ? tot : (p->find_active_match - 1u);
+    }
+    return true;
+  }
+  return false;
+}
+INLAY_API bool inlay_portal_stop_find(InlayPortal *p) {
+  if (!p)
+    return false;
+  set_owned_str(&p->find_query, &p->find_query_len, {});
+  p->find_active = false;
+  p->find_active_match = 0u;
+  p->find_total_matches = 0u;
+  if (p->is_webview2 || p->is_macos || p->is_gtk) {
+    return inlay_portal_eval_script(
+        p, ETCH_STR_LIT("window.__inlayFindIdx=0;if(window.getSelection)window.getSelection().removeAllRanges();"));
+  }
+  if (p->api.create == mock_create) {
+    auto *m = static_cast<MockPortal *>(p->backend);
+    m->find_active = false;
+    return true;
+  }
+  return false;
+}
+INLAY_API bool inlay_portal_find_status(const InlayPortal *p, InlayPortalFindResult *out_result) {
+  if (!p || !out_result)
+    return false;
+  *out_result = inlay_portal_find_result_default();
+  out_result->active = p->find_active;
+  out_result->active_match = p->find_active_match;
+  out_result->total_matches = p->find_total_matches;
+  return true;
+}
+INLAY_API bool inlay_portal_inject_mouse_button(InlayPortal *p, EtchVec2 screen_pos,
+                                                uint8_t button, bool down) {
+  if (!portal_accepts_input(p) || button < 1u || button > 3u)
+    return false;
+  if (button == 1u)
+    return inlay_portal_inject_pointer(p, screen_pos, down);
+  const EtchRect &v = p->geometry.visible_bounds;
+  const bool inside = screen_pos.x >= v.x && screen_pos.x < v.x + v.w &&
+                      screen_pos.y >= v.y && screen_pos.y < v.y + v.h;
+  if (!inside) return false;
+  EtchVec2 local = {};
+  if (!etch_screen_to_element_local(p->id, screen_pos, &local))
+    return false;
+  if (p->view_width <= 0.f || p->view_height <= 0.f) return false;
+  const EtchVec2 scaled = {local.x * (float(p->width) / p->view_width),
+                           local.y * (float(p->height) / p->view_height)};
+  if (down) p->focused = true;
+  if (p->is_webview2)
+    return inlay_portal_webview2_inject_mouse_button(p->backend, scaled, button, down);
+  return true;
+}
+INLAY_API const InlayPortalBackendVTable *inlay_portal_native_backend(void) {
+  if (const auto *wv2 = inlay_portal_webview2_backend()) return wv2;
+  if (const auto *mac = inlay_portal_macos_backend()) return mac;
+  if (const auto *gtk = inlay_portal_gtk_backend()) return gtk;
+  return nullptr;
+}
+}
+EtchContext *inlay_portal_context(const InlayPortal *p) noexcept {
+  return p ? p->context : nullptr;
 }

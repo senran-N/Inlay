@@ -171,7 +171,9 @@ enum InlayInlineStyle : uint32_t {
  InlayInlineCode=1u<<0, InlayInlineLink=1u<<1, InlayInlineMath=1u<<2,
  InlayInlineBold=1u<<3, InlayInlineEmphasis=1u<<4, InlayInlineStrike=1u<<5,
  InlayInlineHighlight=1u<<6, InlayInlineFootnote=1u<<7, InlayInlineImage=1u<<8,
- InlayInlineUrlInPool=1u<<9
+ InlayInlineUrlInPool=1u<<9,
+ InlayInlineKbd=1u<<10, InlayInlineSub=1u<<11, InlayInlineSup=1u<<12,
+ InlayInlineUnderline=1u<<13, InlayInlineBreak=1u<<14
 };
 
 struct InlayInline {uint32_t offset,length,url_offset,url_length,flags;};
@@ -223,6 +225,7 @@ struct InlayMeasure {
  bool* code_wrap;
  float* code_scroll_x;
  bool* diagram_full_scale;
+ float* diagram_zoom;
  uint64_t* copied_until_ms;
  uint32_t open_capacity;
  InlayTableCols* table_cols;
@@ -276,8 +279,30 @@ const InlayRefDef* inlay_doc_find_ref_def(const InlayDoc* doc,const char* label,
 void inlay_doc_parse_pending(InlayDoc* doc) noexcept;
 
 enum InlayDiagramShape : uint8_t {
- InlayShapeRect=0, InlayShapeRound=1, InlayShapeDiamond=2, InlayShapeCircle=3
+ InlayShapeRect=0, InlayShapeRound=1, InlayShapeDiamond=2, InlayShapeCircle=3,
+ InlayShapeStateStart=4, InlayShapeStateEnd=5, InlayShapeClassBox=6,
+ InlayShapePieSlice=7, InlayShapeGanttTask=8,
+ InlayShapeGitCommit=9, InlayShapeMindmapNode=10, InlayShapeTimelineCard=11
 };
+enum InlayDiagramKind : uint8_t {
+ InlayDiagramFlowchart=0, InlayDiagramSequence=1, InlayDiagramState=2,
+ InlayDiagramClass=3, InlayDiagramEr=4, InlayDiagramPie=5, InlayDiagramGantt=6,
+ InlayDiagramGitGraph=7, InlayDiagramMindmap=8, InlayDiagramTimeline=9
+};
+struct InlayDiagramPieSlice {
+ EtchStr label;
+ float value;
+ float start_rad;
+ float sweep_rad;
+ uint8_t color_index;
+};
+struct InlayDiagramGanttBar {
+ EtchStr section;
+ EtchRect bar_bounds;
+ uint8_t status; // 0=normal, 1=done, 2=active, 3=crit
+ bool section_first;
+};
+EtchContext* inlay_portal_context(const InlayPortal* p) noexcept;
 enum InlayDiagramEdgeStyle : uint8_t {
  InlayEdgeStyleNone=0u,
  InlayEdgeStyleNoArrow=1u<<0,
@@ -303,6 +328,15 @@ struct InlayDiagramMeta {
  const EtchVec2* waypoints;
  uint32_t waypoint_count;
  bool reversed_dir;
+ InlayDiagramKind diagram_kind;
+ EtchStr title;
+ EtchVec2 pie_center;
+ float pie_radius;
+ const InlayDiagramPieSlice* pie_slices;
+ uint32_t pie_slice_count;
+ const InlayDiagramGanttBar* gantt_bars;
+ uint32_t gantt_bar_count;
+ float gantt_label_width;
 };
 struct InlayMathPrepared {
  const void* root;

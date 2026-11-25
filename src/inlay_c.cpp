@@ -128,6 +128,7 @@ INLAY_API InlaySurfaceDesc inlay_surface_desc_default(void) {
  d.max_nodes = 4096u;
  d.max_text_bytes = 65536u;
  d.disable_jsx = false;
+ d.max_state_bytes = 65536u;
  return d;
 }
 
@@ -162,6 +163,24 @@ INLAY_API InlayPortalWebView2Options inlay_portal_webview2_options_default(void)
  return o;
 }
 
+INLAY_API InlayPortalMacOSOptions inlay_portal_macos_options_default(void) {
+ InlayPortalMacOSOptions o = {};
+ o.struct_size = uint32_t(sizeof(InlayPortalMacOSOptions));
+ return o;
+}
+
+INLAY_API InlayPortalGtkOptions inlay_portal_gtk_options_default(void) {
+ InlayPortalGtkOptions o = {};
+ o.struct_size = uint32_t(sizeof(InlayPortalGtkOptions));
+ return o;
+}
+
+INLAY_API InlayPortalFindResult inlay_portal_find_result_default(void) {
+ InlayPortalFindResult r = {};
+ r.struct_size = uint32_t(sizeof(InlayPortalFindResult));
+ return r;
+}
+
 INLAY_API InlayActionPolicy inlay_action_policy_default(void) {
  InlayActionPolicy p = {};
  p.struct_size = uint32_t(sizeof(InlayActionPolicy));
@@ -181,5 +200,26 @@ INLAY_API InlayPortalPolicy inlay_portal_policy_default(void) {
  InlayPortalPolicy p = {};
  p.struct_size = uint32_t(sizeof(InlayPortalPolicy));
  return p;
+}
+
+INLAY_API InlayPortalState inlay_portal_state_default(void) {
+ InlayPortalState s = {};
+ s.struct_size = uint32_t(sizeof(InlayPortalState));
+ s.zoom_factor = 1.0f;
+ return s;
+}
+
+INLAY_API InlayTerminalSnapshot inlay_terminal_snapshot_default(void) {
+ InlayTerminalSnapshot s = {};
+ s.struct_size = uint32_t(sizeof(InlayTerminalSnapshot));
+ s.cursor_column = -1;
+ s.cursor_row = -1;
+ s.cursor_shape = ETCH_TERMINAL_CURSOR_UNDERLINE;
+ s.cursor_visible = true;
+ s.selection_start_col = -1;
+ s.selection_start_row = -1;
+ s.selection_end_col = -1;
+ s.selection_end_row = -1;
+ return s;
 }
 }

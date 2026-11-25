@@ -442,6 +442,115 @@ int main(int argc, char **argv) {
                      (inlay_portal_has_focus(sp) == allow_input);
       }
       policy_ok &= inlay_portal_resize(sp, 200, 120);
+      // Portal scripting & DevTools bridge checks (valid & invalid input guards).
+      policy_ok &= inlay_portal_eval_script(sp, ETCH_STR_LIT("window.__ok = 1;"));
+      policy_ok &= inlay_portal_add_init_script(sp, ETCH_STR_LIT("window.__bridge = true;"));
+      policy_ok &= inlay_portal_open_devtools(sp);
+      policy_ok &= !inlay_portal_eval_script(sp, ETCH_STR_LIT(""));
+      policy_ok &= !inlay_portal_add_init_script(nullptr, ETCH_STR_LIT("1"));
+      policy_ok &= !inlay_portal_open_devtools(nullptr);
+
+      // Round 2: Portal state metadata, on_state_change callback, zoom factor, and find-in-page.
+      {
+        struct StateProbe {
+          uint32_t calls;
+          float last_zoom;
+          char last_title[128];
+          char last_favicon[128];
+        } sprobe = {};
+        InlayPortalPolicy spol = inlay_portal_policy_default();
+        spol.user_data = &sprobe;
+        spol.on_state_change = [](InlayPortal *, const InlayPortalState *st, void *u) {
+          auto *pr = static_cast<StateProbe *>(u);
+          ++pr->calls;
+          pr->last_zoom = st->zoom_factor;
+          const uint32_t tn = st->title.length < 127u ? st->title.length : 127u;
+          if (tn && st->title.chars) std::memcpy(pr->last_title, st->title.chars, tn);
+          pr->last_title[tn] = '\0';
+          const uint32_t fn = st->favicon_url.length < 127u ? st->favicon_url.length : 127u;
+          if (fn && st->favicon_url.chars) std::memcpy(pr->last_favicon, st->favicon_url.chars, fn);
+          pr->last_favicon[fn] = '\0';
+        };
+        inlay_portal_set_policy(sp, &spol);
+        policy_ok &= inlay_portal_load_url(sp, ETCH_STR_LIT("https://preview.orca.dev:3000/app"));
+        policy_ok &= sprobe.calls >= 1u &&
+                     std::strcmp(sprobe.last_favicon, "https://preview.orca.dev:3000/favicon.ico") == 0;
+        policy_ok &= inlay_portal_load_html(sp, ETCH_STR_LIT("<html><head><title>Orca Local</title></head><body>hi</body></html>"));
+        policy_ok &= std::strcmp(sprobe.last_title, "Orca Local") == 0;
+        InlayPortalState st = inlay_portal_state_default();
+        policy_ok &= st.struct_size == sizeof(InlayPortalState) && std::fabs(st.zoom_factor - 1.0f) < 1e-4f;
+        policy_ok &= inlay_portal_set_zoom(sp, 1.5f) && inlay_portal_state(sp, &st) &&
+                     std::fabs(st.zoom_factor - 1.5f) < 1e-4f && str_eq(st.title, "Orca Local");
+        policy_ok &= inlay_portal_set_zoom(sp, 99.0f) && inlay_portal_state(sp, &st) &&
+                     std::fabs(st.zoom_factor - 5.0f) < 1e-4f;
+        policy_ok &= !inlay_portal_set_zoom(sp, 0.0f) && !inlay_portal_set_zoom(sp, -1.0f);
+        policy_ok &= inlay_portal_find_in_page(sp, ETCH_STR_LIT("hello"), true, false);
+        policy_ok &= !inlay_portal_find_in_page(sp, ETCH_STR_LIT(""), true, false);
+        policy_ok &= inlay_portal_stop_find(sp) && !inlay_portal_stop_find(nullptr);
+
+        // Round 3: Match-counted find_status, right/middle mouse injection, cross-platform backend options
+        policy_ok &= inlay_portal_load_html(
+            sp, ETCH_STR_LIT("<html><head><title>Find3</title></head><body>orca Orca ORCA</body></html>"));
+        InlayPortalFindResult fr = inlay_portal_find_result_default();
+        policy_ok &= fr.struct_size == sizeof(InlayPortalFindResult) && !fr.active;
+        policy_ok &= inlay_portal_find_in_page(sp, ETCH_STR_LIT("orca"), true, false);
+        policy_ok &= inlay_portal_find_status(sp, &fr) && fr.active &&
+                     fr.total_matches == 3u && fr.active_match == 1u;
+        policy_ok &= inlay_portal_find_in_page(sp, ETCH_STR_LIT("orca"), true, false);
+        policy_ok &= inlay_portal_find_status(sp, &fr) && fr.active_match == 2u;
+        policy_ok &= inlay_portal_find_in_page(sp, ETCH_STR_LIT("orca"), false, false);
+        policy_ok &= inlay_portal_find_status(sp, &fr) && fr.active_match == 1u;
+        policy_ok &= inlay_portal_find_in_page(sp, ETCH_STR_LIT("Orca"), true, true);
+        policy_ok &= inlay_portal_find_status(sp, &fr) && fr.total_matches == 1u && fr.active_match == 1u;
+        policy_ok &= inlay_portal_stop_find(sp) && inlay_portal_find_status(sp, &fr) && !fr.active;
+        policy_ok &= !inlay_portal_find_status(nullptr, &fr) && !inlay_portal_find_status(sp, nullptr);
+
+        // Mouse button injection (left=1, middle=2, right=3) + invalid button guard
+        etch_begin_frame(ctx, &fd);
+        {
+          auto box = etch_box_desc_default();
+          box.width = etch_sizing_fixed(400);
+          box.height = etch_sizing_fixed(300);
+          etch_begin_box(&box);
+          InlayPortalViewDesc sv2 = inlay_portal_view_desc_default();
+          sv2.id = etch_id("portal-r3-mouse");
+          sv2.width = 240;
+          sv2.height = 140;
+          inlay_portal_view(sp, &sv2);
+          etch_end_box();
+        }
+        etch_end_frame(ctx);
+        policy_ok &= inlay_portal_end_frame_sync(sp, true);
+        const auto sb2 = etch_element_bounds(etch_id("portal-r3-mouse"));
+        const EtchVec2 mid2 = {sb2.x + sb2.w * 0.5f, sb2.y + sb2.h * 0.5f};
+        policy_ok &= inlay_portal_inject_mouse_button(sp, mid2, 3u, true);
+        policy_ok &= inlay_portal_inject_mouse_button(sp, mid2, 3u, false);
+        policy_ok &= inlay_portal_inject_mouse_button(sp, mid2, 2u, true);
+        policy_ok &= inlay_portal_inject_mouse_button(sp, mid2, 2u, false);
+        policy_ok &= !inlay_portal_inject_mouse_button(sp, mid2, 0u, true);
+        policy_ok &= !inlay_portal_inject_mouse_button(sp, mid2, 9u, true);
+        policy_ok &= !inlay_portal_inject_mouse_button(nullptr, mid2, 1u, true);
+
+        // Round 4: RGBA preview capture (OSR/mock resampling + argument validation)
+        uint8_t preview_rgba[64u * 32u * 4u] = {};
+        const bool cap_ok = inlay_portal_capture_preview_rgba(sp, preview_rgba, 64u, 32u);
+        bool any_alpha = false;
+        for (size_t pi = 3u; pi < sizeof(preview_rgba); pi += 4u) {
+          if (preview_rgba[pi] > 0u) { any_alpha = true; break; }
+        }
+        policy_ok &= cap_ok && any_alpha;
+        policy_ok &= !inlay_portal_capture_preview_rgba(nullptr, preview_rgba, 64u, 32u);
+        policy_ok &= !inlay_portal_capture_preview_rgba(sp, nullptr, 64u, 32u);
+        policy_ok &= !inlay_portal_capture_preview_rgba(sp, preview_rgba, 0u, 32u);
+        policy_ok &= !inlay_portal_capture_preview_rgba(sp, preview_rgba, 64u, 0u);
+
+        // Cross-platform native backend descriptors
+        const InlayPortalMacOSOptions mac_opt = inlay_portal_macos_options_default();
+        const InlayPortalGtkOptions gtk_opt = inlay_portal_gtk_options_default();
+        policy_ok &= mac_opt.struct_size == sizeof(InlayPortalMacOSOptions) &&
+                     gtk_opt.struct_size == sizeof(InlayPortalGtkOptions);
+        (void)inlay_portal_native_backend();
+      }
       policy_ok &= inlay_portal_destroy(sp);
     }
   }

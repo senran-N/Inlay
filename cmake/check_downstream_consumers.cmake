@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 set(work "${BINARY}/_consumer_check")
+file(REMOVE_RECURSE "${work}")
 file(MAKE_DIRECTORY "${work}")
 function(run)
  execute_process(COMMAND ${ARGV} RESULT_VARIABLE result)

@@ -931,6 +931,132 @@ int md_leave_block(MD_BLOCKTYPE type, void*, void* userdata) {
      ex.img_src_len = img_src_len;
     }
    }
+   // Promote block HTML <table>...</table> into a synthetic Markdown pipe table so it inherits table layout & HTML export.
+   if (type == MD_BLOCK_HTML && node.kind != InlayAstImage && c - a >= 15u && src[a] == '<' &&
+       ci_eq(src + a + 1u, 5u, "table") && (is_ws_ch(src[a + 6u]) || src[a + 6u] == '>')) {
+    char* tbuf = nullptr;
+    uint32_t tlen = 0u, tcap = 0u;
+    auto push_ch = [&](char ch) noexcept -> bool {
+     if (!inlay_grow_pod(tbuf, tcap, tlen + 2u, 256u, 512u * 1024u)) return false;
+     tbuf[tlen++] = ch;
+     tbuf[tlen] = '\0';
+     return true;
+    };
+    auto push_lit = [&](const char* lit) noexcept -> bool {
+     const uint32_t ln = static_cast<uint32_t>(std::strlen(lit));
+     if (!inlay_grow_pod(tbuf, tcap, tlen + ln + 1u, 256u, 512u * 1024u)) return false;
+     std::memcpy(tbuf + tlen, lit, ln);
+     tlen += ln;
+     tbuf[tlen] = '\0';
+     return true;
+    };
+    uint32_t p = a;
+    uint32_t row_count = 0u;
+    uint32_t header_cols = 0u;
+    while (p < c) {
+     // Find next <tr ...>
+     uint32_t tr_start = UINT32_MAX;
+     while (p + 3u < c) {
+      if (src[p] == '<' && ci_eq(src + p + 1u, 2u, "tr") && (is_ws_ch(src[p + 3u]) || src[p + 3u] == '>')) {
+       uint32_t gt = p + 3u;
+       while (gt < c && src[gt] != '>') ++gt;
+       if (gt < c) { tr_start = gt + 1u; p = tr_start; break; }
+      }
+      ++p;
+     }
+     if (tr_start == UINT32_MAX) break;
+     // Find matching </tr> (or next <tr / </table)
+     uint32_t tr_end = c;
+     for (uint32_t q = tr_start; q + 4u < c; ++q) {
+      if (src[q] == '<' && src[q + 1u] == '/' && ci_eq(src + q + 2u, 2u, "tr") && (src[q + 4u] == '>' || is_ws_ch(src[q + 4u]))) {
+       tr_end = q;
+       break;
+      }
+     }
+     // Extract <th> / <td> cells within [tr_start, tr_end)
+     uint32_t cell_count = 0u;
+     uint32_t cp = tr_start;
+     uint32_t row_start_len = tlen;
+     while (cp < tr_end) {
+      uint32_t cs = UINT32_MAX;
+      bool is_th = false;
+      while (cp + 3u < tr_end) {
+       if (src[cp] == '<' && (ci_eq(src + cp + 1u, 2u, "th") || ci_eq(src + cp + 1u, 2u, "td")) &&
+           (is_ws_ch(src[cp + 3u]) || src[cp + 3u] == '>')) {
+        is_th = ci_eq(src + cp + 1u, 2u, "th");
+        uint32_t gt = cp + 3u;
+        while (gt < tr_end && src[gt] != '>') ++gt;
+        if (gt < tr_end) { cs = gt + 1u; cp = cs; break; }
+       }
+       ++cp;
+      }
+      if (cs == UINT32_MAX) break;
+      uint32_t ce = tr_end;
+      const char* close_tag = is_th ? "th" : "td";
+      for (uint32_t q = cs; q + 4u < tr_end; ++q) {
+       if (src[q] == '<' && src[q + 1u] == '/' && ci_eq(src + q + 2u, 2u, close_tag) &&
+           (src[q + 4u] == '>' || is_ws_ch(src[q + 4u]))) {
+        ce = q;
+        break;
+       }
+      }
+      if (cell_count == 0u) {
+       if (row_count > 0u) push_ch('\n');
+       push_lit("| ");
+      } else {
+       push_lit(" | ");
+      }
+      // Strip inner HTML tags, collapse whitespace, decode common entities, escape '|'
+      bool prev_sp = true;
+      for (uint32_t k = cs; k < ce; ) {
+       if (src[k] == '<') {
+        while (k < ce && src[k] != '>') ++k;
+        if (k < ce) ++k;
+        continue;
+       }
+       if (src[k] == '&') {
+        if (k + 4u <= ce && ci_eq(src + k, 4u, "&lt;")) { push_ch('<'); prev_sp = false; k += 4u; continue; }
+        if (k + 4u <= ce && ci_eq(src + k, 4u, "&gt;")) { push_ch('>'); prev_sp = false; k += 4u; continue; }
+        if (k + 5u <= ce && ci_eq(src + k, 5u, "&amp;")) { push_ch('&'); prev_sp = false; k += 5u; continue; }
+        if (k + 6u <= ce && ci_eq(src + k, 6u, "&quot;")) { push_ch('"'); prev_sp = false; k += 6u; continue; }
+        if (k + 6u <= ce && ci_eq(src + k, 6u, "&nbsp;")) { if (!prev_sp) { push_ch(' '); prev_sp = true; } k += 6u; continue; }
+       }
+       if (is_ws_ch(src[k])) {
+        if (!prev_sp) { push_ch(' '); prev_sp = true; }
+        ++k;
+        continue;
+       }
+       if (src[k] == '|') { push_lit("\\|"); prev_sp = false; ++k; continue; }
+       push_ch(src[k++]);
+       prev_sp = false;
+      }
+      while (tlen > row_start_len && tbuf[tlen - 1u] == ' ') --tlen;
+      tbuf[tlen] = '\0';
+      ++cell_count;
+      cp = (ce < tr_end) ? (ce + 5u) : tr_end;
+     }
+     if (cell_count > 0u) {
+      push_lit(" |");
+      if (row_count == 0u) {
+       header_cols = cell_count;
+       push_lit("\n|");
+       for (uint32_t ci = 0u; ci < header_cols; ++ci) push_lit(" --- |");
+      }
+      ++row_count;
+     }
+     p = (tr_end < c) ? (tr_end + 5u) : c;
+    }
+    if (row_count > 0u && tbuf && tlen > 0u) {
+     const uint32_t po = append_ast_text(b->doc, tbuf, tlen);
+     if (po != UINT32_MAX) {
+      node.kind = InlayAstTable;
+      ex.synthetic = true;
+      ex.pool_off = po;
+      ex.pool_len = tlen;
+     }
+    }
+    SDL_free(tbuf);
+   }
   }
   if (after > b->scan_cursor) b->scan_cursor = after;
   propagate_range_up(b, ls, after);
@@ -1259,9 +1385,17 @@ void project_ast_node(MdBuilder* b, int32_t idx, bool in_complex_li, int32_t li_
 
   case InlayAstTable: {
    InlayBlock blk = make_base(INLAY_TABLE);
-   blk.content_offset = ex.content_off;
-   blk.content_length = ex.content_len;
    InlayBlockMeta meta = {idx, 0, 0, 0, 0};
+   if (ex.synthetic) {
+    blk.flags |= INLAY_BLOCK_FLAG_SYNTHETIC;
+    blk.content_offset = 0;
+    blk.content_length = ex.pool_len;
+    meta.pool_offset = ex.pool_off;
+    meta.pool_length = ex.pool_len;
+   } else {
+    blk.content_offset = ex.content_off;
+    blk.content_length = ex.content_len;
+   }
    emit_block(d, blk, meta);
    break;
   }
@@ -1779,6 +1913,7 @@ INLAY_API void inlay_doc_destroy(InlayDoc* d) {
   SDL_free(view.code_wrap);
   SDL_free(view.code_scroll_x);
   SDL_free(view.diagram_full_scale);
+  SDL_free(view.diagram_zoom);
   SDL_free(view.copied_until_ms);
   SDL_free(view.details);
   SDL_free(view.table_cols);

@@ -1832,11 +1832,11 @@ int main(int argc,char** argv) {
     probe.offsets[i] <= source.length && probe.lengths[i] <= source.length - probe.offsets[i] &&
     str_equal({source.chars + probe.offsets[i], probe.lengths[i], false}, directives[i]);
   }
-  diagnostics_ok &= !inlay_diagram_layout(ETCH_STR_LIT("gantt\n"), &desc).valid;
+  diagnostics_ok &= !inlay_diagram_layout(ETCH_STR_LIT("journey\n"), &desc).valid;
   diagnostics_ok &= !inlay_diagram_layout(ETCH_STR_LIT("graph XX\n"), &desc).valid;
   diagnostics_ok &= !inlay_diagram_layout(ETCH_STR_LIT("sequenceDiagram\nparticipant ["), &desc).valid;
   diagnostics_ok &= probe.count == 6u && probe.kinds[3] == INLAY_DIAGRAM_UNSUPPORTED_KIND &&
-   probe.offsets[3] == 0u && probe.lengths[3] == 5u && probe.kinds[4] == INLAY_DIAGRAM_INVALID_DIRECTION &&
+   probe.offsets[3] == 0u && probe.lengths[3] == 7u && probe.kinds[4] == INLAY_DIAGRAM_INVALID_DIRECTION &&
    probe.offsets[4] == 6u && probe.lengths[4] == 2u && probe.kinds[5] == INLAY_DIAGRAM_INVALID_SYNTAX;
   if (!diagnostics_ok) std::fprintf(stderr, "Mermaid diagnostic classification or source spans failed\n");
   ok &= diagnostics_ok;
@@ -2401,11 +2401,447 @@ int main(int argc,char** argv) {
    etch_end_frame(ctx);
   }
 
+  // C06: Pluggable code_highlight_fn + Mermaid stateDiagram-v2 & configurable node/edge capacity
+  bool i3_hl_state = true;
+  {
+   struct CustomHlCtx { uint32_t calls; uint32_t last_line; };
+   CustomHlCtx hl_ctx = {0u, 999u};
+   const auto custom_hl = [](EtchStr lang, EtchStr line, uint32_t line_idx,
+                             InlayCodeHighlightToken* out, uint32_t max_toks, void* user) -> uint32_t {
+    auto* c = static_cast<CustomHlCtx*>(user);
+    ++c->calls;
+    c->last_line = line_idx;
+    if (lang.length == 4u && std::memcmp(lang.chars, "rust", 4u) == 0 && line.length >= 2u && max_toks >= 1u) {
+     out[0] = {0u, 2u, etch_rgba8(245, 158, 11, 255), 0u};
+     return 1u;
+    }
+    return 0u;
+   };
+   InlayDoc* d3 = inlay_doc_create(ctx, nullptr);
+   i3_hl_state &= d3 && inlay_doc_set_utf8(d3, ETCH_STR_LIT("```rust\nfn main() {}\nlet x = 42;\n```\n"));
+   if (d3) {
+    InlayDocViewDesc v3 = inlay_doc_view_desc_default();
+    v3.id = etch_id("i3-custom-hl");
+    v3.width_px = 420.f;
+    v3.height_px = 0.f;
+    v3.code_highlight_fn = custom_hl;
+    v3.code_highlight_user_data = &hl_ctx;
+    etch_begin_frame(ctx, &fr);
+    const InlayDocResult r3 = inlay_doc_view(d3, &v3);
+    // stateDiagram-v2 with composite state, start/end markers, and transition labels
+    static const char kStateDiag[] =
+        "stateDiagram-v2\n"
+        "  direction LR\n"
+        "  [*] --> Idle\n"
+        "  state \"Executing Tool\" as Active {\n"
+        "    Plan --> Run : dispatch\n"
+        "  }\n"
+        "  Idle --> Plan : prompt\n"
+        "  Run --> [*] : complete\n";
+    InlayDiagramDesc sd = inlay_diagram_desc_default();
+    const InlayDiagramResult sres = inlay_diagram_view({kStateDiag, uint32_t(sizeof(kStateDiag) - 1u), true}, &sd);
+    char ssvg[8192] = {};
+    const uint32_t ssvg_len = inlay_diagram_export_svg({kStateDiag, uint32_t(sizeof(kStateDiag) - 1u), true}, &sd, ssvg, uint32_t(sizeof(ssvg)));
+    // Configurable max_nodes > default 256 (300 nodes chain)
+    char big_src[6144];
+    uint32_t bp = uint32_t(std::snprintf(big_src, sizeof(big_src), "flowchart LR\n"));
+    for (uint32_t ni = 0u; ni < 299u && bp + 24u < sizeof(big_src); ++ni) {
+     bp += uint32_t(std::snprintf(big_src + bp, sizeof(big_src) - bp, "N%u-->N%u\n", ni, ni + 1u));
+    }
+    InlayDiagramDesc def_cap = inlay_diagram_desc_default();
+    InlayDiagramDesc big_cap = inlay_diagram_desc_default();
+    big_cap.max_nodes = 512u;
+    big_cap.max_edges = 1024u;
+    const InlayDiagramResult r_def = inlay_diagram_layout({big_src, bp, false}, &def_cap);
+    const InlayDiagramResult r_big = inlay_diagram_layout({big_src, bp, false}, &big_cap);
+    etch_end_frame(ctx);
+    i3_hl_state &= r3.measured_height_px > 0.f && hl_ctx.calls == 2u && hl_ctx.last_line == 1u;
+    i3_hl_state &= sres.valid && sres.horizontal && sres.node_count == 5u && sres.edge_count == 4u &&
+                   ssvg_len > 0u && std::strstr(ssvg, "<circle") != nullptr;
+    i3_hl_state &= !r_def.valid && r_big.valid && r_big.node_count == 300u && r_big.edge_count == 299u;
+    inlay_doc_destroy(d3);
+   }
+  }
+
+  // C07: Streaming unclosed inline auto-repair, CJK emphasis & autolink boundary, and selection_rect
+  bool i3_r2 = true;
+  {
+   InlayDoc* d4 = inlay_doc_create(ctx, nullptr);
+   i3_r2 &= d4 != nullptr;
+   if (d4) {
+    // 1. Streaming repair on incomplete bold / code / link / math
+    const auto stream_md = ETCH_STR_LIT("Alpha **unclosed bold");
+    i3_r2 &= inlay_doc_set_utf8(d4, stream_md);
+    InlayDocViewDesc v4 = inlay_doc_view_desc_default();
+    v4.id = etch_id("i3-r2-stream");
+    v4.width_px = 420.f;
+    v4.height_px = 0.f;
+    v4.streaming_repair = true;
+    etch_begin_frame(ctx, &fr);
+    inlay_doc_view(d4, &v4);
+    etch_end_frame(ctx);
+    const InlayMeasure* m4 = nullptr;
+    for (uint32_t vi = 0u; vi < d4->view_count; ++vi) if (d4->views[vi].id == v4.id) m4 = &d4->views[vi];
+    bool saw_repaired_bold = false;
+    if (m4) {
+     for (uint32_t ti = 0u; ti < m4->token_count; ++ti) {
+      const auto& t = m4->tokens[ti];
+      const EtchStr txt = {stream_md.chars + t.offset, t.length, false};
+      if ((t.flags & InlayInlineBold) && str_equal(txt, ETCH_STR_LIT("unclosed bold"))) saw_repaired_bold = true;
+     }
+    }
+    i3_r2 &= saw_repaired_bold;
+
+    // Incomplete code & partial link repair
+    const auto stream_md2 = ETCH_STR_LIT("See [Orca](https://github.com/stably");
+    i3_r2 &= inlay_doc_set_utf8(d4, stream_md2);
+    etch_begin_frame(ctx, &fr);
+    inlay_doc_view(d4, &v4);
+    etch_end_frame(ctx);
+    bool saw_repaired_link = false;
+    if (m4) {
+     for (uint32_t ti = 0u; ti < m4->token_count; ++ti) {
+      const auto& t = m4->tokens[ti];
+      const EtchStr txt = {stream_md2.chars + t.offset, t.length, false};
+      if ((t.flags & InlayInlineLink) && str_equal(txt, ETCH_STR_LIT("Orca"))) saw_repaired_link = true;
+     }
+    }
+    i3_r2 &= saw_repaired_link;
+
+    // Toggle streaming_repair off -> strict CommonMark literal fallback (Orca is NOT a Markdown link)
+    v4.streaming_repair = false;
+    etch_begin_frame(ctx, &fr);
+    inlay_doc_view(d4, &v4);
+    etch_end_frame(ctx);
+    bool saw_link_strict = false;
+    if (m4) {
+     for (uint32_t ti = 0u; ti < m4->token_count; ++ti) {
+      const auto& t = m4->tokens[ti];
+      const EtchStr txt = {stream_md2.chars + t.offset, t.length, false};
+      if ((t.flags & InlayInlineLink) && str_equal(txt, ETCH_STR_LIT("Orca"))) saw_link_strict = true;
+     }
+    }
+    i3_r2 &= !saw_link_strict;
+
+    // 2. CJK emphasis + CJK autolink punctuation boundary + selection_rect
+    const auto cjk_md = ETCH_STR_LIT("**中文（括号）**后和*斜体*，访问 https://orca.dev，打开应用");
+    i3_r2 &= inlay_doc_set_utf8(d4, cjk_md);
+    etch_begin_frame(ctx, &fr);
+    inlay_doc_view(d4, &v4);
+    etch_end_frame(ctx);
+    bool cjk_bold = false, cjk_em = false, cjk_url = false;
+    if (m4) {
+     for (uint32_t ti = 0u; ti < m4->token_count; ++ti) {
+      const auto& t = m4->tokens[ti];
+      const EtchStr txt = {cjk_md.chars + t.offset, t.length, false};
+      if ((t.flags & InlayInlineBold) && str_equal(txt, ETCH_STR_LIT("中文（括号）"))) cjk_bold = true;
+      if ((t.flags & InlayInlineEmphasis) && str_equal(txt, ETCH_STR_LIT("斜体"))) cjk_em = true;
+      if ((t.flags & InlayInlineLink) && str_equal(txt, ETCH_STR_LIT("https://orca.dev"))) cjk_url = true;
+     }
+    }
+    i3_r2 &= cjk_bold && cjk_em && cjk_url;
+
+    // 3. selection_rect screen bounding box
+    inlay_doc_view_select_all(d4, v4.id);
+    etch_begin_frame(ctx, &fr);
+    inlay_doc_view(d4, &v4);
+    etch_end_frame(ctx);
+    EtchRect sel_rc = {}, cleared_rc = {};
+    i3_r2 &= inlay_doc_view_selection_rect(d4, v4.id, &sel_rc) && sel_rc.w > 10.f && sel_rc.h > 8.f;
+    inlay_doc_view_clear_selection(d4, v4.id);
+    const bool cleared_ok = !inlay_doc_view_selection_rect(d4, v4.id, &cleared_rc);
+    i3_r2 &= cleared_ok;
+    if (!i3_r2) {
+     std::fprintf(stderr, "i3_r2 diag: bold=%d link=%d strict=%d cjk=(%d,%d,%d) sel=(%.1f,%.1f) clr=%d vis_segs=%u\n",
+                  saw_repaired_bold, saw_repaired_link, !saw_link_strict, cjk_bold, cjk_em, cjk_url,
+                  sel_rc.w, sel_rc.h, cleared_ok, m4 ? m4->vis_seg_count : 0u);
+    }
+
+    inlay_doc_destroy(d4);
+   }
+  }
+
+  // Round 3: Inline HTML tags + Mermaid classDiagram / erDiagram / pie / gantt
+  bool i3_r3 = true;
+  {
+   InlayDoc* d5 = inlay_doc_create(ctx, nullptr);
+   i3_r3 &= d5 != nullptr;
+   if (d5) {
+    const auto html_md = ETCH_STR_LIT(
+        "Press <kbd>Ctrl</kbd>+<kbd>K</kbd><br>Water H<sub>2</sub>O and x<sup>2</sup> "
+        "<mark>hi</mark> <u>under</u> <del>old</del> <b>bold</b> <i>em</i> <code>fn()</code> "
+        "<img src=\"logo.png\" alt=\"Logo\">");
+    i3_r3 &= inlay_doc_set_utf8(d5, html_md);
+    EtchFrameDesc fr5 = etch_frame_desc_default();
+    fr5.viewport_w = 640; fr5.viewport_h = 480;
+    InlayDocViewDesc v5 = inlay_doc_view_desc_default();
+    v5.id = etch_id("i3-r3-html");
+    v5.width_px = 560.f;
+    v5.height_px = 0.f;
+    etch_begin_frame(ctx, &fr5);
+    const InlayDocResult r5 = inlay_doc_view(d5, &v5);
+    etch_end_frame(ctx);
+    i3_r3 &= r5.measured_height_px > 20.f;
+
+    const InlayMeasure* m5 = nullptr;
+    for (uint32_t vi = 0u; vi < d5->view_count; ++vi) {
+     if (d5->views[vi].id == v5.id) { m5 = &d5->views[vi]; break; }
+    }
+    uint32_t seen_flags = 0u;
+    if (m5) {
+     for (uint32_t ti = 0u; ti < m5->token_count; ++ti) seen_flags |= m5->tokens[ti].flags;
+    }
+    const uint32_t want_flags = InlayInlineKbd | InlayInlineBreak | InlayInlineSub | InlayInlineSup |
+                                InlayInlineHighlight | InlayInlineUnderline | InlayInlineStrike |
+                                InlayInlineBold | InlayInlineEmphasis | InlayInlineCode | InlayInlineImage;
+    const bool flags_ok = (seen_flags & want_flags) == want_flags;
+    i3_r3 &= flags_ok;
+
+    // Mermaid Round 3 diagram types: classDiagram, erDiagram, pie, gantt
+    const InlayDiagramDesc dd = inlay_diagram_desc_default();
+    char svg_buf[16384] = {};
+
+    const auto cls_src = ETCH_STR_LIT(
+        "classDiagram\n"
+        "class Animal {\n  +String name\n  +speak()\n}\n"
+        "class Dog {\n  +bark()\n}\n"
+        "Animal <|-- Dog\n");
+    const auto er_src = ETCH_STR_LIT(
+        "erDiagram\n"
+        "CUSTOMER ||--o{ ORDER : places\n"
+        "ORDER ||--|{ LINE_ITEM : contains\n");
+    const auto pie_src = ETCH_STR_LIT(
+        "pie title Compute Budget\n"
+        "\"GPU\" : 60\n"
+        "\"Layout\" : 25\n"
+        "\"JS\" : 15\n");
+    const auto gantt_src = ETCH_STR_LIT(
+        "gantt\n"
+        "title Release Plan\n"
+        "section Core\n"
+        "Etch :done, e1, 2026-01-01, 5d\n"
+        "Inlay :active, i1, after e1, 4d\n"
+        "section Polish\n"
+        "QA :crit, q1, after i1, 2d\n");
+
+    etch_begin_frame(ctx, &fr5);
+    const InlayDiagramResult cls_r = inlay_diagram_layout(cls_src, &dd);
+    const InlayDiagramResult er_r = inlay_diagram_layout(er_src, &dd);
+    const InlayDiagramResult pie_r = inlay_diagram_layout(pie_src, &dd);
+    const InlayDiagramResult gantt_r = inlay_diagram_layout(gantt_src, &dd);
+    etch_end_frame(ctx);
+
+    const uint32_t cls_svg = inlay_diagram_export_svg(cls_src, &dd, svg_buf, uint32_t(sizeof(svg_buf)));
+    const bool cls_ok = cls_r.valid && cls_r.node_count >= 2u && cls_r.edge_count >= 1u &&
+                        cls_r.width > 40.f && cls_r.height > 40.f &&
+                        cls_svg > 0u && std::strstr(svg_buf, "<svg") && std::strstr(svg_buf, "Animal");
+
+    const uint32_t er_svg = inlay_diagram_export_svg(er_src, &dd, svg_buf, uint32_t(sizeof(svg_buf)));
+    const bool er_ok = er_r.valid && er_r.node_count >= 3u && er_r.edge_count >= 2u &&
+                       er_r.width > 40.f && er_r.height > 40.f &&
+                       er_svg > 0u && std::strstr(svg_buf, "<svg") && std::strstr(svg_buf, "CUSTOMER");
+
+    const uint32_t pie_svg = inlay_diagram_export_svg(pie_src, &dd, svg_buf, uint32_t(sizeof(svg_buf)));
+    const bool pie_ok = pie_r.valid && pie_r.width > 80.f && pie_r.height > 80.f &&
+                        pie_svg > 0u && std::strstr(svg_buf, "<svg") && std::strstr(svg_buf, "<path") &&
+                        std::strstr(svg_buf, "GPU");
+
+    const uint32_t gantt_svg = inlay_diagram_export_svg(gantt_src, &dd, svg_buf, uint32_t(sizeof(svg_buf)));
+    const bool gantt_ok = gantt_r.valid && gantt_r.width > 120.f && gantt_r.height > 60.f &&
+                          gantt_svg > 0u && std::strstr(svg_buf, "<svg") && std::strstr(svg_buf, "<rect") &&
+                          std::strstr(svg_buf, "Etch");
+
+    // Also render all 4 diagrams fenced inside InlayDoc on GPU path
+    const auto fenced_md = ETCH_STR_LIT(
+        "```mermaid\nclassDiagram\nclass A\nclass B\nA <|-- B\n```\n\n"
+        "```mermaid\nerDiagram\nUSER ||--o{ SESSION : has\n```\n\n"
+        "```mermaid\npie title Share\n\"Alpha\" : 70\n\"Beta\" : 30\n```\n\n"
+        "```mermaid\ngantt\ntitle Track\nsection S1\nT1 :2026-01-01, 3d\nT2 :after T1, 2d\n```\n");
+    i3_r3 &= inlay_doc_set_utf8(d5, fenced_md);
+    etch_begin_frame(ctx, &fr5);
+    const InlayDocResult rd5 = inlay_doc_view(d5, &v5);
+    etch_end_frame(ctx);
+    const bool doc_diag_ok = rd5.measured_height_px > 200.f && inlay_doc_block_count(d5) == 4u;
+
+    i3_r3 &= cls_ok && er_ok && pie_ok && gantt_ok && doc_diag_ok;
+    if (!i3_r3) {
+     std::fprintf(stderr, "i3_r3 diag: flags=0x%x/0x%x cls=%d er=%d pie=%d gantt=%d doc_diag=%d\n",
+                  seen_flags, want_flags, cls_ok, er_ok, pie_ok, gantt_ok, doc_diag_ok);
+    }
+    inlay_doc_destroy(d5);
+   }
+  }
+
+  // Round 4: nested inline HTML, HTML <table>, RTL paragraphs, gitGraph/mindmap/timeline, diagram node click
+  bool i3_r4 = true;
+  {
+   InlayDoc* d6 = inlay_doc_create(ctx, nullptr);
+   i3_r4 &= d6 != nullptr;
+   if (d6) {
+    const auto r4_md = ETCH_STR_LIT(
+        "Nested <b><i>bold-italic</i></b> and <a href=\"https://inlay.dev\"><kbd>Ctrl+K</kbd></a>.\n\n"
+        "<table><tr><th>Metric</th><th>Value</th></tr><tr><td>FPS</td><td>120</td></tr></table>\n\n"
+        "مرحبا بالعالم — native RTL paragraph.\n\n"
+        "שלום עולם — Hebrew RTL paragraph.\n");
+    i3_r4 &= inlay_doc_set_utf8(d6, r4_md);
+    EtchFrameDesc fr6 = etch_frame_desc_default();
+    fr6.viewport_w = 640; fr6.viewport_h = 520;
+    InlayDocViewDesc v6 = inlay_doc_view_desc_default();
+    v6.id = etch_id("i3-r4-doc");
+    v6.width_px = 560.f;
+    v6.height_px = 0.f;
+    etch_begin_frame(ctx, &fr6);
+    const InlayDocResult r6 = inlay_doc_view(d6, &v6);
+    etch_end_frame(ctx);
+
+    const InlayMeasure* m6 = nullptr;
+    for (uint32_t vi = 0u; vi < d6->view_count; ++vi) {
+     if (d6->views[vi].id == v6.id) { m6 = &d6->views[vi]; break; }
+    }
+    bool has_nested_bi = false, has_nested_link_kbd = false;
+    if (m6) {
+     for (uint32_t ti = 0u; ti < m6->token_count; ++ti) {
+      const uint32_t fl = m6->tokens[ti].flags;
+      if ((fl & (InlayInlineBold | InlayInlineEmphasis)) == (InlayInlineBold | InlayInlineEmphasis)) {
+       has_nested_bi = true;
+      }
+      if ((fl & (InlayInlineLink | InlayInlineKbd)) == (InlayInlineLink | InlayInlineKbd) &&
+          m6->tokens[ti].url_length == 17u &&
+          m6->tokens[ti].url_offset + m6->tokens[ti].url_length <= d6->source_size &&
+          std::memcmp(d6->source + m6->tokens[ti].url_offset, "https://inlay.dev", 17u) == 0) {
+       has_nested_link_kbd = true;
+      }
+     }
+    }
+    bool has_table_blk = false;
+    for (uint32_t bi = 0u; bi < inlay_doc_block_count(d6); ++bi) {
+     const InlayBlock* blk = inlay_doc_block(d6, bi);
+     if (blk && blk->kind == INLAY_TABLE) has_table_blk = true;
+    }
+    char html_out[4096] = {};
+    const uint32_t hlen = inlay_doc_export_html(d6, html_out, uint32_t(sizeof(html_out)));
+    const bool html_tbl_ok = has_table_blk && hlen > 0u &&
+                             std::strstr(html_out, "<table") != nullptr &&
+                             std::strstr(html_out, "FPS") != nullptr &&
+                             std::strstr(html_out, "120") != nullptr &&
+                             r6.measured_height_px > 80.f;
+
+    // Mermaid Round 4 diagram types: gitGraph, mindmap, timeline
+    const InlayDiagramDesc dd = inlay_diagram_desc_default();
+    char svg_buf[16384] = {};
+    const auto git_src = ETCH_STR_LIT(
+        "gitGraph\n"
+        "commit id: \"init\"\n"
+        "branch feat\n"
+        "checkout feat\n"
+        "commit id: \"ui\"\n"
+        "checkout main\n"
+        "merge feat\n");
+    const auto mm_src = ETCH_STR_LIT(
+        "mindmap\n"
+        "  root((Orca))\n"
+        "    Etch\n"
+        "      Vulkan\n"
+        "      D3D12\n"
+        "    Inlay\n"
+        "      TSX\n");
+    const auto tl_src = ETCH_STR_LIT(
+        "timeline\n"
+        "  title Roadmap\n"
+        "  section Foundation\n"
+        "    R1 : Core\n"
+        "    R2 : Bridge\n"
+        "  section Polish\n"
+        "    R4 : Convergence\n");
+
+    etch_begin_frame(ctx, &fr6);
+    const InlayDiagramResult git_r = inlay_diagram_layout(git_src, &dd);
+    const InlayDiagramResult mm_r = inlay_diagram_layout(mm_src, &dd);
+    const InlayDiagramResult tl_r = inlay_diagram_layout(tl_src, &dd);
+    etch_end_frame(ctx);
+
+    const uint32_t git_svg = inlay_diagram_export_svg(git_src, &dd, svg_buf, uint32_t(sizeof(svg_buf)));
+    const bool git_ok = git_r.valid && git_r.node_count >= 3u && git_r.edge_count >= 2u &&
+                        git_r.width > 80.f && git_r.height > 40.f &&
+                        git_svg > 0u && std::strstr(svg_buf, "<svg") && std::strstr(svg_buf, "init");
+
+    const uint32_t mm_svg = inlay_diagram_export_svg(mm_src, &dd, svg_buf, uint32_t(sizeof(svg_buf)));
+    const bool mm_ok = mm_r.valid && mm_r.node_count >= 5u && mm_r.edge_count >= 4u &&
+                       mm_r.width > 80.f && mm_r.height > 60.f &&
+                       mm_svg > 0u && std::strstr(svg_buf, "<svg") && std::strstr(svg_buf, "Orca");
+
+    const uint32_t tl_svg = inlay_diagram_export_svg(tl_src, &dd, svg_buf, uint32_t(sizeof(svg_buf)));
+    const bool tl_ok = tl_r.valid && tl_r.node_count >= 3u &&
+                       tl_r.width > 80.f && tl_r.height > 50.f &&
+                       tl_svg > 0u && std::strstr(svg_buf, "<svg") && std::strstr(svg_buf, "Convergence");
+
+    // Fenced rendering + cache hit verification + interactive node click hit-testing
+    const auto diag_md = ETCH_STR_LIT(
+        "```mermaid\nflowchart LR\nRootNode[ClickTarget] --> LeafNode[End]\n```\n\n"
+        "```mermaid\ngitGraph\ncommit id: \"c1\"\nbranch dev\ncheckout dev\ncommit id: \"c2\"\ncheckout main\nmerge dev\n```\n\n"
+        "```mermaid\nmindmap\n  root((Hub))\n    A\n    B\n```\n\n"
+        "```mermaid\ntimeline\n  title Ship\n  2026 : Launch\n```\n");
+    i3_r4 &= inlay_doc_set_utf8(d6, diag_md);
+    InlayDocViewDesc v6d = inlay_doc_view_desc_default();
+    v6d.id = etch_id("i3-r4-diags");
+    v6d.width_px = 560.f;
+    v6d.height_px = 0.f;
+    etch_begin_frame(ctx, &fr6);
+    const InlayDocResult rd6a = inlay_doc_view(d6, &v6d);
+    etch_end_frame(ctx);
+    uint64_t hits_before = 0u, misses_before = 0u;
+    inlay_doc_diagram_cache_stats(d6, nullptr, &hits_before, &misses_before);
+    etch_begin_frame(ctx, &fr6);
+    const InlayDocResult rd6b = inlay_doc_view(d6, &v6d);
+    etch_end_frame(ctx);
+    uint64_t hits_after = 0u, misses_after = 0u;
+    inlay_doc_diagram_cache_stats(d6, nullptr, &hits_after, &misses_after);
+    const bool r4_cache_ok = rd6a.measured_height_px > 200.f && rd6b.measured_height_px > 200.f &&
+                             hits_after > hits_before && misses_after == misses_before;
+
+    // Click probe on the first diagram's RootNode (dbox is centered horizontally inside v6d)
+    bool click_node_ok = false;
+    EtchRect dbox_rect = {};
+    for (uint32_t vi = 0u; vi < d6->view_count; ++vi) {
+     if (d6->views[vi].id == v6d.id && d6->views[vi].vis_row_count > 0u) {
+      dbox_rect = etch_element_bounds(etch_id_index(d6->views[vi].vis_row_ids[0], 7));
+      break;
+     }
+    }
+    if (dbox_rect.w > 20.f && dbox_rect.h > 10.f) {
+     const EtchVec2 pt = { dbox_rect.x + 36.f, dbox_rect.y + dbox_rect.h * 0.45f };
+     EtchFrameDesc fp = fr6;
+     fp.pointer_pos = pt; fp.pointer_down = true;
+     etch_begin_frame(ctx, &fp);
+     (void)inlay_doc_view(d6, &v6d);
+     etch_end_frame(ctx);
+     EtchFrameDesc fr_rel = fr6;
+     fr_rel.pointer_pos = pt; fr_rel.pointer_down = false;
+     etch_begin_frame(ctx, &fr_rel);
+     const InlayDocResult rc = inlay_doc_view(d6, &v6d);
+     etch_end_frame(ctx);
+     if (rc.clicked_diagram_node.chars && rc.clicked_diagram_node.length > 0u &&
+         std::strstr(rc.clicked_diagram_node.chars, "RootNode") != nullptr) {
+      click_node_ok = true;
+     }
+    }
+
+    i3_r4 &= has_nested_bi && has_nested_link_kbd && html_tbl_ok &&
+             git_ok && mm_ok && tl_ok && r4_cache_ok && click_node_ok;
+    if (!i3_r4) {
+     std::fprintf(stderr, "i3_r4 diag: bi=%d lk=%d tbl=%d git=%d mm=%d tl=%d cache=%d click=%d\n",
+                  has_nested_bi, has_nested_link_kbd, html_tbl_ok,
+                  git_ok, mm_ok, tl_ok, r4_cache_ok, click_node_ok);
+    }
+    inlay_doc_destroy(d6);
+   }
+  }
+
   i3 &= i3_cache && i3_a11y && i3_html && i3_dsvg && i3_msvg && i3_loader &&
-        i3_fence && i3_outline_find_html && i3_mathml && i3_scroll_a11y;
-  if(!i3)std::fprintf(stderr,"Track I3 failed: cache=%d a11y=%d html=%d dsvg=%d msvg=%d loader=%d fence=%d outline_find_html=%d mathml=%d scroll_a11y=%d\n",
+        i3_fence && i3_outline_find_html && i3_mathml && i3_scroll_a11y && i3_hl_state && i3_r2 && i3_r3 && i3_r4;
+  if(!i3)std::fprintf(stderr,"Track I3 failed: cache=%d a11y=%d html=%d dsvg=%d msvg=%d loader=%d fence=%d outline_find_html=%d mathml=%d scroll_a11y=%d hl_state=%d r2=%d r3=%d r4=%d\n",
                       i3_cache,i3_a11y,i3_html,i3_dsvg,i3_msvg,i3_loader,
-                      i3_fence,i3_outline_find_html,i3_mathml,i3_scroll_a11y);
+                      i3_fence,i3_outline_find_html,i3_mathml,i3_scroll_a11y,i3_hl_state,i3_r2,i3_r3,i3_r4);
   ok &= i3;
  }
 

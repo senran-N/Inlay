@@ -36,7 +36,27 @@ if(BUILD_SHARED_LIBS)
 endif()
 target_include_directories(inlay PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 target_link_libraries(inlay PUBLIC $<BUILD_INTERFACE:Etch::etch> $<INSTALL_INTERFACE:Etch::etch>)
-target_sources(inlay PRIVATE src/inlay_ui.cpp src/inlay_portal.cpp src/inlay_portal_webview2.cpp)
+target_sources(inlay PRIVATE src/inlay_ui.cpp src/inlay_portal.cpp src/inlay_portal_webview2.cpp src/inlay_portal_gtk.cpp)
+option(INLAY_ENABLE_PORTAL_MACOS "Enable macOS native WKWebView underlay" OFF)
+option(INLAY_ENABLE_PORTAL_GTK "Enable Linux native WebKitGTK underlay" OFF)
+if(APPLE AND INLAY_ENABLE_PORTAL_MACOS)
+ enable_language(OBJCXX)
+ target_sources(inlay PRIVATE src/inlay_portal_macos.mm)
+ target_link_libraries(inlay PRIVATE "-framework Cocoa" "-framework WebKit")
+ target_compile_definitions(inlay PRIVATE INLAY_ENABLE_PORTAL_MACOS=1)
+else()
+ target_sources(inlay PRIVATE src/inlay_portal_macos_stub.cpp)
+ target_compile_definitions(inlay PRIVATE INLAY_ENABLE_PORTAL_MACOS=0)
+endif()
+if(UNIX AND NOT APPLE AND INLAY_ENABLE_PORTAL_GTK)
+ find_package(PkgConfig REQUIRED)
+ pkg_check_modules(INLAY_WEBKITGTK REQUIRED webkitgtk-6.0)
+ target_include_directories(inlay SYSTEM PRIVATE ${INLAY_WEBKITGTK_INCLUDE_DIRS})
+ target_link_libraries(inlay PRIVATE ${INLAY_WEBKITGTK_LIBRARIES})
+ target_compile_definitions(inlay PRIVATE INLAY_ENABLE_PORTAL_GTK=1)
+else()
+ target_compile_definitions(inlay PRIVATE INLAY_ENABLE_PORTAL_GTK=0)
+endif()
 set(_inlay_header_deps
  "${CMAKE_CURRENT_SOURCE_DIR}/include/inlay/inlay_c.h"
  "${CMAKE_CURRENT_SOURCE_DIR}/include/inlay/inlay.h"
@@ -57,6 +77,10 @@ set_source_files_properties(
 set_source_files_properties(
  src/inlay_ui.cpp
  PROPERTIES OBJECT_DEPENDS "${_inlay_ui_header_deps}")
+set_source_files_properties(
+ tests/doc_tests.cpp tests/ui_tests.cpp tests/consumer.c tests/portal_tests.cpp
+ tests/workbench_features_tests.cpp examples/inlay_document.cpp examples/cromma_workbench_demo.cpp
+ PROPERTIES OBJECT_DEPENDS "${_inlay_header_deps}")
 add_library(inlay_md4c OBJECT third_party/md4c/md4c.c)
 set_target_properties(inlay_md4c PROPERTIES C_STANDARD 99 C_STANDARD_REQUIRED ON POSITION_INDEPENDENT_CODE ON)
 target_include_directories(inlay_md4c PRIVATE third_party/md4c)

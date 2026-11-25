@@ -641,11 +641,20 @@ InlayDiagramResult diagram_layout_core(EtchStr source, const InlayDiagramDesc* i
         break;
     }
     const uint32_t header = g.pos;
-    while (g.pos < source.length && word(source.chars[g.pos])) ++g.pos;
+    while (g.pos < source.length && (word(source.chars[g.pos]) || source.chars[g.pos] == '-')) ++g.pos;
     const EtchStr kind = { source.chars + header, g.pos - header, false };
     const bool sequence = equal(kind, ETCH_STR_LIT("sequenceDiagram"));
+    const bool state_diag = equal(kind, ETCH_STR_LIT("stateDiagram-v2")) || equal(kind, ETCH_STR_LIT("stateDiagram"));
+    const bool class_diag = equal(kind, ETCH_STR_LIT("classDiagram")) || equal(kind, ETCH_STR_LIT("classDiagram-v2"));
+    const bool er_diag = equal(kind, ETCH_STR_LIT("erDiagram"));
+    const bool pie_diag = equal(kind, ETCH_STR_LIT("pie"));
+    const bool gantt_diag = equal(kind, ETCH_STR_LIT("gantt"));
+    const bool git_diag = equal(kind, ETCH_STR_LIT("gitGraph"));
+    const bool mindmap_diag = equal(kind, ETCH_STR_LIT("mindmap"));
+    const bool timeline_diag = equal(kind, ETCH_STR_LIT("timeline"));
 
-    if (!sequence) {
+    if (!sequence && !state_diag && !class_diag && !er_diag && !pie_diag && !gantt_diag &&
+        !git_diag && !mindmap_diag && !timeline_diag) {
         if (!equal(kind, ETCH_STR_LIT("flowchart")) && !equal(kind, ETCH_STR_LIT("graph"))) {
             diagnostic(INLAY_DIAGRAM_UNSUPPORTED_KIND, header, kind.length);
             return {};
@@ -666,15 +675,787 @@ InlayDiagramResult diagram_layout_core(EtchStr source, const InlayDiagramDesc* i
         g.reverse_dir = is_rl || is_bt;
     }
 
-    constexpr uint32_t kNodeCap = 256;
-    constexpr uint32_t kEdgeCap = 1024;
+    // ---- Mermaid pie chart ----
+    if (pie_diag) {
+        bool show_data = false;
+        EtchStr title = {};
+        // Optional "showData" or "title ..." on same line after "pie"
+        spaces(&g);
+        if (starts(g, ETCH_STR_LIT("showData"))) {
+            show_data = true;
+            g.pos += 8u;
+            spaces(&g);
+        }
+        if (starts(g, ETCH_STR_LIT("title")) && g.pos + 5u < source.length &&
+            (source.chars[g.pos + 5u] == ' ' || source.chars[g.pos + 5u] == '\t'))
+        {
+            g.pos += 5u;
+            const uint32_t ts = g.pos;
+            while (g.pos < source.length && source.chars[g.pos] != '\n') ++g.pos;
+            title = trim_slice(source, ts, g.pos);
+        }
+        constexpr uint32_t kMaxSlices = 32u;
+        auto* slices = static_cast<InlayDiagramPieSlice*>(env.alloc(kMaxSlices * sizeof(InlayDiagramPieSlice), alignof(InlayDiagramPieSlice)));
+        auto* pnodes = static_cast<InlayDiagramNode*>(env.alloc(kMaxSlices * sizeof(InlayDiagramNode), alignof(InlayDiagramNode)));
+        auto* pshapes = static_cast<InlayDiagramShape*>(env.alloc(kMaxSlices * sizeof(InlayDiagramShape), alignof(InlayDiagramShape)));
+        if (!slices || !pnodes || !pshapes) return {};
+        uint32_t slice_count = 0u;
+        float total_val = 0.0f;
+        while (g.pos < source.length) {
+            spaces(&g);
+            if (g.pos >= source.length) break;
+            if (source.chars[g.pos] == '\n' || source.chars[g.pos] == ';') { ++g.pos; continue; }
+            if (starts(g, ETCH_STR_LIT("%%"))) { while (g.pos < source.length && source.chars[g.pos] != '\n') ++g.pos; continue; }
+            if (starts(g, ETCH_STR_LIT("title")) && g.pos + 5u < source.length &&
+                (source.chars[g.pos + 5u] == ' ' || source.chars[g.pos + 5u] == '\t'))
+            {
+                g.pos += 5u;
+                const uint32_t ts = g.pos;
+                while (g.pos < source.length && source.chars[g.pos] != '\n') ++g.pos;
+                title = trim_slice(source, ts, g.pos);
+                continue;
+            }
+            if (starts(g, ETCH_STR_LIT("showData"))) {
+                show_data = true;
+                while (g.pos < source.length && source.chars[g.pos] != '\n') ++g.pos;
+                continue;
+            }
+            if (source.chars[g.pos] != '"') {
+                while (g.pos < source.length && source.chars[g.pos] != '\n') ++g.pos;
+                continue;
+            }
+            ++g.pos;
+            const uint32_t ls = g.pos;
+            while (g.pos < source.length && source.chars[g.pos] != '"' && source.chars[g.pos] != '\n') ++g.pos;
+            if (g.pos >= source.length || source.chars[g.pos] != '"') return syntax_failure(ls);
+            const EtchStr lbl = { source.chars + ls, g.pos - ls, false };
+            ++g.pos;
+            spaces(&g);
+            if (g.pos >= source.length || source.chars[g.pos] != ':') return syntax_failure(g.pos);
+            ++g.pos;
+            spaces(&g);
+            const uint32_t vs = g.pos;
+            while (g.pos < source.length && source.chars[g.pos] != '\n' && source.chars[g.pos] != ';') ++g.pos;
+            const EtchStr vstr = trim_slice(source, vs, g.pos);
+            char num_buf[48] = {};
+            const uint32_t vn = vstr.length < 47u ? vstr.length : 47u;
+            if (vn > 0u) std::memcpy(num_buf, vstr.chars, vn);
+            num_buf[vn] = '\0';
+            char* endp = nullptr;
+            const float val = std::strtof(num_buf, &endp);
+            if (endp == num_buf || !std::isfinite(val) || val < 0.0f) return syntax_failure(vs);
+            if (slice_count < kMaxSlices) {
+                slices[slice_count] = { lbl, val, 0.0f, 0.0f, uint8_t(slice_count % 8u) };
+                pnodes[slice_count] = { lbl, lbl, {}, 0u };
+                pshapes[slice_count] = InlayShapePieSlice;
+                total_val += val;
+                ++slice_count;
+            }
+        }
+        if (slice_count == 0u || total_val <= 0.0f) return syntax_failure(g.pos);
+        constexpr float kTwoPi = 6.28318530718f;
+        float cur_ang = -1.57079632679f;
+        for (uint32_t i = 0u; i < slice_count; ++i) {
+            const float sweep = kTwoPi * (slices[i].value / total_val);
+            slices[i].start_rad = cur_ang;
+            slices[i].sweep_rad = sweep;
+            cur_ang += sweep;
+            if (show_data) {
+                char tmp[128] = {};
+                const float pct = (slices[i].value / total_val) * 100.0f;
+                const int n = std::snprintf(tmp, sizeof(tmp), "%.*s (%.1f, %.0f%%)",
+                    int(slices[i].label.length < 72u ? slices[i].label.length : 72u),
+                    slices[i].label.chars ? slices[i].label.chars : "", double(slices[i].value), double(pct));
+                if (n > 0) {
+                    const uint32_t clen = uint32_t(n < int(sizeof(tmp) - 1) ? n : int(sizeof(tmp) - 1));
+                    if (char* copy = static_cast<char*>(env.alloc(clen + 1u, 1u))) {
+                        std::memcpy(copy, tmp, clen);
+                        copy[clen] = '\0';
+                        pnodes[i].label = { copy, clen, false };
+                    }
+                }
+            } else {
+                char tmp[128] = {};
+                const float pct = (slices[i].value / total_val) * 100.0f;
+                const int n = std::snprintf(tmp, sizeof(tmp), "%.*s (%.0f%%)",
+                    int(slices[i].label.length < 88u ? slices[i].label.length : 88u),
+                    slices[i].label.chars ? slices[i].label.chars : "", double(pct));
+                if (n > 0) {
+                    const uint32_t clen = uint32_t(n < int(sizeof(tmp) - 1) ? n : int(sizeof(tmp) - 1));
+                    if (char* copy = static_cast<char*>(env.alloc(clen + 1u, 1u))) {
+                        std::memcpy(copy, tmp, clen);
+                        copy[clen] = '\0';
+                        pnodes[i].label = { copy, clen, false };
+                    }
+                }
+            }
+        }
+        EtchVec2 pie_center = {};
+        float pie_radius = 74.0f;
+        const auto place_pie = [&](float s) noexcept -> EtchVec2 {
+            const float eff_font = std::fmax(8.0f, input->font_size_px * s);
+            const float title_h = title.length ? (eff_font * 1.8f + 8.0f * s) : 0.0f;
+            pie_radius = 76.0f * s;
+            const float pad = 14.0f * s;
+            const float row_h = std::fmax(eff_font * 1.45f, 18.0f * s);
+            const float legend_h = float(slice_count) * row_h;
+            const float body_h = std::fmax(pie_radius * 2.0f, legend_h);
+            pie_center = { input->pos.x + pad + pie_radius, input->pos.y + title_h + pad + body_h * 0.5f };
+            const float legend_x = input->pos.x + pad + pie_radius * 2.0f + 24.0f * s;
+            const float legend_y0 = input->pos.y + title_h + pad + (body_h - legend_h) * 0.5f;
+            float max_lw = 80.0f * s;
+            for (uint32_t i = 0u; i < slice_count; ++i) {
+                const float tw = env.measure_text(pnodes[i].label, body_font, eff_font * 0.9f).x + 22.0f * s;
+                if (tw > max_lw) max_lw = tw;
+                pnodes[i].bounds = { legend_x, legend_y0 + float(i) * row_h, tw, row_h };
+            }
+            const float title_w = title.length ? (env.measure_text(title, bold_font, eff_font * 1.1f).x + 2.0f * pad) : 0.0f;
+            const float total_w = std::fmax(title_w, (legend_x - input->pos.x) + max_lw + pad);
+            const float total_h = title_h + body_h + 2.0f * pad;
+            return { total_w, total_h };
+        };
+        const EtchVec2 nat = place_pie(1.0f);
+        float final_scale = 1.0f;
+        EtchVec2 final_sz = nat;
+        if (input->max_width_px > 0.0f && nat.x > input->max_width_px) {
+            float s = std::fmax(min_scale, std::fmin(1.0f, input->max_width_px / nat.x));
+            final_sz = place_pie(s);
+            final_scale = s;
+        }
+        if (out_meta) {
+            out_meta->shapes = pshapes;
+            out_meta->diagram_kind = InlayDiagramPie;
+            out_meta->title = title;
+            out_meta->pie_center = pie_center;
+            out_meta->pie_radius = pie_radius;
+            out_meta->pie_slices = slices;
+            out_meta->pie_slice_count = slice_count;
+        }
+        return { pnodes, nullptr, slice_count, 0u, final_sz.x, final_sz.y, true, false, false, final_scale, nat.x, nat.y, warnings };
+    }
+
+    // ---- Mermaid gantt chart ----
+    if (gantt_diag) {
+        EtchStr title = {};
+        EtchStr cur_section = {};
+        bool cur_section_fresh = false;
+        constexpr uint32_t kMaxTasks = 64u;
+        struct GanttTaskTmp {
+            EtchStr id;
+            EtchStr label;
+            EtchStr section;
+            float start_u;
+            float dur_u;
+            uint8_t status;
+            bool section_first;
+        };
+        auto* tasks = static_cast<GanttTaskTmp*>(env.alloc(kMaxTasks * sizeof(GanttTaskTmp), alignof(GanttTaskTmp)));
+        auto* gnodes = static_cast<InlayDiagramNode*>(env.alloc(kMaxTasks * sizeof(InlayDiagramNode), alignof(InlayDiagramNode)));
+        auto* gshapes = static_cast<InlayDiagramShape*>(env.alloc(kMaxTasks * sizeof(InlayDiagramShape), alignof(InlayDiagramShape)));
+        auto* gbars = static_cast<InlayDiagramGanttBar*>(env.alloc(kMaxTasks * sizeof(InlayDiagramGanttBar), alignof(InlayDiagramGanttBar)));
+        if (!tasks || !gnodes || !gshapes || !gbars) return {};
+        uint32_t task_count = 0u;
+        float cursor_u = 0.0f;
+        bool has_base_day = false;
+        int32_t base_day = 0;
+        const auto parse_ymd_days = [](EtchStr s, int32_t* out_days) noexcept -> bool {
+            if (s.length < 10u || s.chars[4] != '-' || s.chars[7] != '-') return false;
+            auto rd = [&](uint32_t off, uint32_t cnt) noexcept -> int32_t {
+                int32_t v = 0;
+                for (uint32_t i = 0u; i < cnt; ++i) {
+                    const char ch = s.chars[off + i];
+                    if (ch < '0' || ch > '9') return -1;
+                    v = v * 10 + (ch - '0');
+                }
+                return v;
+            };
+            const int32_t y = rd(0u, 4u), m = rd(5u, 2u), d = rd(8u, 2u);
+            if (y < 1970 || m < 1 || m > 12 || d < 1 || d > 31) return false;
+            *out_days = y * 365 + (m - 1) * 30 + (d - 1);
+            return true;
+        };
+        while (g.pos < source.length) {
+            spaces(&g);
+            if (g.pos >= source.length) break;
+            if (source.chars[g.pos] == '\n') { ++g.pos; continue; }
+            if (starts(g, ETCH_STR_LIT("%%"))) { while (g.pos < source.length && source.chars[g.pos] != '\n') ++g.pos; continue; }
+            const uint32_t ls = g.pos;
+            while (g.pos < source.length && source.chars[g.pos] != '\n') ++g.pos;
+            const EtchStr line = trim_slice(source, ls, g.pos);
+            if (line.length == 0u) continue;
+            auto starts_kw = [&](const char* kw) noexcept -> bool {
+                const uint32_t kl = static_cast<uint32_t>(std::strlen(kw));
+                return line.length > kl && std::memcmp(line.chars, kw, kl) == 0 &&
+                       (line.chars[kl] == ' ' || line.chars[kl] == '\t');
+            };
+            if (starts_kw("title")) {
+                title = trim_slice(line, 5u, line.length);
+                continue;
+            }
+            if (starts_kw("section")) {
+                cur_section = trim_slice(line, 7u, line.length);
+                cur_section_fresh = true;
+                continue;
+            }
+            if (starts_kw("dateFormat") || starts_kw("axisFormat") || starts_kw("excludes") ||
+                starts_kw("todayMarker") || starts_kw("tickInterval") || starts_kw("weekday")) {
+                continue;
+            }
+            uint32_t colon = UINT32_MAX;
+            for (uint32_t ci = 0u; ci < line.length; ++ci) {
+                if (line.chars[ci] == ':') { colon = ci; break; }
+            }
+            if (colon == UINT32_MAX || task_count >= kMaxTasks) continue;
+            const EtchStr tlabel = trim_slice(line, 0u, colon);
+            if (tlabel.length == 0u) continue;
+            const EtchStr meta_s = trim_slice(line, colon + 1u, line.length);
+            uint8_t status = 0u;
+            EtchStr tid = {};
+            float start_u = cursor_u;
+            float dur_u = 3.0f;
+            bool explicit_start = false;
+            uint32_t mp = 0u;
+            while (mp <= meta_s.length) {
+                uint32_t me = mp;
+                while (me < meta_s.length && meta_s.chars[me] != ',') ++me;
+                const EtchStr tok = trim_slice(meta_s, mp, me);
+                if (tok.length > 0u) {
+                    int32_t ymd = 0;
+                    if (equal(tok, ETCH_STR_LIT("done"))) status = 1u;
+                    else if (equal(tok, ETCH_STR_LIT("active"))) status = 2u;
+                    else if (equal(tok, ETCH_STR_LIT("crit"))) status = 3u;
+                    else if (equal(tok, ETCH_STR_LIT("milestone"))) { dur_u = 0.6f; }
+                    else if (tok.length > 6u && std::memcmp(tok.chars, "after ", 6u) == 0) {
+                        const EtchStr ref = trim_slice(tok, 6u, tok.length);
+                        for (uint32_t ti = 0u; ti < task_count; ++ti) {
+                            if (equal(tasks[ti].id, ref) || equal(tasks[ti].label, ref)) {
+                                start_u = tasks[ti].start_u + tasks[ti].dur_u;
+                                explicit_start = true;
+                                break;
+                            }
+                        }
+                    } else if (parse_ymd_days(tok, &ymd)) {
+                        if (!has_base_day) { has_base_day = true; base_day = ymd; }
+                        start_u = float(ymd - base_day);
+                        explicit_start = true;
+                    } else if (tok.chars[0] >= '0' && tok.chars[0] <= '9') {
+                        char nb[32] = {};
+                        const uint32_t nn = tok.length < 31u ? tok.length : 31u;
+                        std::memcpy(nb, tok.chars, nn);
+                        char* ep = nullptr;
+                        const float v = std::strtof(nb, &ep);
+                        if (ep > nb && std::isfinite(v) && v > 0.0f) {
+                            float mult = 1.0f;
+                            if (*ep == 'w' || *ep == 'W') mult = 7.0f;
+                            else if (*ep == 'h' || *ep == 'H') mult = 1.0f / 24.0f;
+                            dur_u = std::fmax(0.4f, v * mult);
+                        }
+                    } else if (tid.length == 0u) {
+                        tid = tok;
+                    }
+                }
+                if (me >= meta_s.length) break;
+                mp = me + 1u;
+            }
+            if (!explicit_start) start_u = cursor_u;
+            cursor_u = start_u + dur_u;
+            tasks[task_count] = { tid.length ? tid : tlabel, tlabel, cur_section, start_u, dur_u, status, cur_section_fresh };
+            cur_section_fresh = false;
+            ++task_count;
+        }
+        if (task_count == 0u) return syntax_failure(g.pos);
+        float min_u = tasks[0].start_u, max_u = tasks[0].start_u + tasks[0].dur_u;
+        for (uint32_t i = 1u; i < task_count; ++i) {
+            if (tasks[i].start_u < min_u) min_u = tasks[i].start_u;
+            if (tasks[i].start_u + tasks[i].dur_u > max_u) max_u = tasks[i].start_u + tasks[i].dur_u;
+        }
+        const float span_u = std::fmax(1.0f, max_u - min_u);
+        float gantt_lbl_w = 120.0f;
+        const auto place_gantt = [&](float s) noexcept -> EtchVec2 {
+            const float eff_font = std::fmax(8.0f, input->font_size_px * s);
+            const float pad = 14.0f * s;
+            const float title_h = title.length ? (eff_font * 1.8f + 6.0f * s) : 0.0f;
+            const float sec_h = eff_font * 1.45f + 6.0f * s;
+            const float row_h = std::fmax(eff_font * 1.65f, 24.0f * s);
+            float lw = 96.0f * s;
+            for (uint32_t i = 0u; i < task_count; ++i) {
+                const float tw = env.measure_text(tasks[i].label, body_font, eff_font * 0.92f).x + 20.0f * s;
+                if (tw > lw) lw = tw;
+            }
+            if (lw > 210.0f * s) lw = 210.0f * s;
+            gantt_lbl_w = lw;
+            const float chart_w = std::fmax(240.0f * s, std::fmin(520.0f * s, span_u * 26.0f * s));
+            const float total_w = pad * 2.0f + lw + chart_w;
+            float cur_y = input->pos.y + pad + title_h;
+            for (uint32_t i = 0u; i < task_count; ++i) {
+                if (tasks[i].section_first && tasks[i].section.length > 0u) {
+                    cur_y += sec_h;
+                }
+                const float bx = input->pos.x + pad + lw + ((tasks[i].start_u - min_u) / span_u) * chart_w;
+                const float bw = std::fmax(10.0f * s, (tasks[i].dur_u / span_u) * chart_w);
+                gnodes[i] = { tasks[i].id, tasks[i].label, { input->pos.x + pad, cur_y, lw + chart_w, row_h }, 0u };
+                gshapes[i] = InlayShapeGanttTask;
+                gbars[i] = { tasks[i].section, { bx, cur_y + 3.0f * s, bw, row_h - 6.0f * s }, tasks[i].status, tasks[i].section_first };
+                cur_y += row_h + 2.0f * s;
+            }
+            const float total_h = (cur_y - input->pos.y) + pad;
+            return { total_w, total_h };
+        };
+        const EtchVec2 nat = place_gantt(1.0f);
+        float final_scale = 1.0f;
+        EtchVec2 final_sz = nat;
+        if (input->max_width_px > 0.0f && nat.x > input->max_width_px) {
+            float s = std::fmax(min_scale, std::fmin(1.0f, input->max_width_px / nat.x));
+            final_sz = place_gantt(s);
+            final_scale = s;
+        }
+        if (out_meta) {
+            out_meta->shapes = gshapes;
+            out_meta->diagram_kind = InlayDiagramGantt;
+            out_meta->title = title;
+            out_meta->gantt_bars = gbars;
+            out_meta->gantt_bar_count = task_count;
+            out_meta->gantt_label_width = gantt_lbl_w;
+        }
+        return { gnodes, nullptr, task_count, 0u, final_sz.x, final_sz.y, true, true, false, final_scale, nat.x, nat.y, warnings };
+    }
+
+    // ---- Mermaid gitGraph ----
+    if (git_diag) {
+        while (g.pos < source.length && source.chars[g.pos] != '\n') ++g.pos;
+        constexpr uint32_t kMaxBranches = 16u;
+        constexpr uint32_t kMaxCommits = 128u;
+        constexpr uint32_t kMaxGitEdges = 256u;
+        struct BranchRec { EtchStr name; int32_t head; };
+        BranchRec branches[kMaxBranches] = {};
+        uint32_t branch_count = 1u;
+        branches[0] = { ETCH_STR_LIT("main"), -1 };
+        uint32_t cur_branch = 0u;
+        auto* cnodes = static_cast<InlayDiagramNode*>(env.alloc(kMaxCommits * sizeof(InlayDiagramNode), alignof(InlayDiagramNode)));
+        auto* cshapes = static_cast<InlayDiagramShape*>(env.alloc(kMaxCommits * sizeof(InlayDiagramShape), alignof(InlayDiagramShape)));
+        auto* cedges = static_cast<InlayDiagramEdge*>(env.alloc(kMaxGitEdges * sizeof(InlayDiagramEdge), alignof(InlayDiagramEdge)));
+        auto* cstyles = static_cast<uint8_t*>(env.alloc(kMaxGitEdges, 1));
+        auto* blanes = static_cast<InlayDiagramSubgraph*>(env.alloc(kMaxBranches * sizeof(InlayDiagramSubgraph), alignof(InlayDiagramSubgraph)));
+        if (!cnodes || !cshapes || !cedges || !cstyles || !blanes) return {};
+        uint32_t commit_count = 0u, edge_count = 0u;
+
+        auto find_or_add_branch = [&](EtchStr bname, bool create_if_missing) noexcept -> int32_t {
+            for (uint32_t bi = 0u; bi < branch_count; ++bi) {
+                if (equal(branches[bi].name, bname)) return static_cast<int32_t>(bi);
+            }
+            if (!create_if_missing || branch_count >= kMaxBranches) return -1;
+            const uint32_t ni = branch_count++;
+            branches[ni] = { bname, branches[cur_branch].head };
+            return static_cast<int32_t>(ni);
+        };
+        auto extract_quoted_field = [&](EtchStr line, const char* key) noexcept -> EtchStr {
+            const uint32_t kl = static_cast<uint32_t>(std::strlen(key));
+            for (uint32_t i = 0u; i + kl + 2u < line.length; ++i) {
+                if (std::memcmp(line.chars + i, key, kl) == 0 && (i == 0u || line.chars[i - 1u] == ' ' || line.chars[i - 1u] == '\t')) {
+                    uint32_t p = i + kl;
+                    while (p < line.length && (line.chars[p] == ' ' || line.chars[p] == '\t')) ++p;
+                    if (p < line.length && line.chars[p] == ':') {
+                        ++p;
+                        while (p < line.length && (line.chars[p] == ' ' || line.chars[p] == '\t')) ++p;
+                        if (p < line.length && (line.chars[p] == '"' || line.chars[p] == '\'')) {
+                            const char q = line.chars[p++];
+                            const uint32_t vs = p;
+                            while (p < line.length && line.chars[p] != q) ++p;
+                            return { line.chars + vs, p - vs, false };
+                        }
+                    }
+                }
+            }
+            return {};
+        };
+
+        while (g.pos < source.length) {
+            spaces(&g);
+            if (g.pos >= source.length) break;
+            if (source.chars[g.pos] == '\n') { ++g.pos; continue; }
+            if (starts(g, ETCH_STR_LIT("%%"))) { while (g.pos < source.length && source.chars[g.pos] != '\n') ++g.pos; continue; }
+            const uint32_t ls = g.pos;
+            while (g.pos < source.length && source.chars[g.pos] != '\n') ++g.pos;
+            const EtchStr line = trim_slice(source, ls, g.pos);
+            if (line.length == 0u) continue;
+            uint32_t kw_end = 0u;
+            while (kw_end < line.length && line.chars[kw_end] != ' ' && line.chars[kw_end] != '\t' && line.chars[kw_end] != ':') ++kw_end;
+            const EtchStr kw = { line.chars, kw_end, false };
+            const EtchStr rest = trim_slice(line, kw_end, line.length);
+            if (equal(kw, ETCH_STR_LIT("branch")) && rest.length > 0u) {
+                uint32_t ne = 0u;
+                while (ne < rest.length && rest.chars[ne] != ' ' && rest.chars[ne] != '\t') ++ne;
+                const EtchStr bname = { rest.chars, ne, false };
+                const int32_t bi = find_or_add_branch(bname, true);
+                if (bi >= 0) cur_branch = static_cast<uint32_t>(bi);
+            } else if ((equal(kw, ETCH_STR_LIT("checkout")) || equal(kw, ETCH_STR_LIT("switch"))) && rest.length > 0u) {
+                uint32_t ne = 0u;
+                while (ne < rest.length && rest.chars[ne] != ' ' && rest.chars[ne] != '\t') ++ne;
+                const int32_t bi = find_or_add_branch({ rest.chars, ne, false }, true);
+                if (bi >= 0) cur_branch = static_cast<uint32_t>(bi);
+            } else if ((equal(kw, ETCH_STR_LIT("commit")) || equal(kw, ETCH_STR_LIT("merge")) || equal(kw, ETCH_STR_LIT("cherry-pick"))) &&
+                       commit_count < kMaxCommits) {
+                const bool is_merge = equal(kw, ETCH_STR_LIT("merge"));
+                int32_t merge_from_head = -1;
+                if (is_merge && rest.length > 0u) {
+                    uint32_t ne = 0u;
+                    while (ne < rest.length && rest.chars[ne] != ' ' && rest.chars[ne] != '\t') ++ne;
+                    const int32_t mbi = find_or_add_branch({ rest.chars, ne, false }, false);
+                    if (mbi >= 0) merge_from_head = branches[mbi].head;
+                }
+                EtchStr cid = extract_quoted_field(line, "id");
+                const EtchStr tag = extract_quoted_field(line, "tag");
+                if (cid.length == 0u) {
+                    auto* idbuf = static_cast<char*>(env.alloc(16u, 1u));
+                    if (idbuf) {
+                        const int n = std::snprintf(idbuf, 16u, "c%u", commit_count + 1u);
+                        if (n > 0) cid = { idbuf, static_cast<uint32_t>(n), false };
+                    }
+                }
+                EtchStr lbl = cid;
+                if (tag.length > 0u) {
+                    const uint32_t llen = cid.length + tag.length + 3u;
+                    auto* lbuf = static_cast<char*>(env.alloc(llen, 1u));
+                    if (lbuf) {
+                        std::memcpy(lbuf, cid.chars, cid.length);
+                        lbuf[cid.length] = '\n';
+                        lbuf[cid.length + 1u] = '[';
+                        std::memcpy(lbuf + cid.length + 2u, tag.chars, tag.length);
+                        lbuf[cid.length + 2u + tag.length] = ']';
+                        lbl = { lbuf, llen, false };
+                    }
+                }
+                const uint32_t ci = commit_count++;
+                cnodes[ci] = { cid, lbl, {}, cur_branch };
+                cshapes[ci] = InlayShapeGitCommit;
+                if (branches[cur_branch].head >= 0 && edge_count < kMaxGitEdges) {
+                    cedges[edge_count] = { static_cast<uint32_t>(branches[cur_branch].head), ci, false, false, {} };
+                    cstyles[edge_count] = InlayEdgeStyleNoArrow;
+                    ++edge_count;
+                }
+                if (is_merge && merge_from_head >= 0 && merge_from_head != branches[cur_branch].head && edge_count < kMaxGitEdges) {
+                    cedges[edge_count] = { static_cast<uint32_t>(merge_from_head), ci, false, true, {} };
+                    cstyles[edge_count] = InlayEdgeStyleNoArrow;
+                    ++edge_count;
+                }
+                branches[cur_branch].head = static_cast<int32_t>(ci);
+            }
+        }
+        if (commit_count == 0u) return syntax_failure(g.pos);
+        const auto place_git = [&](float s) noexcept -> EtchVec2 {
+            const float eff_font = std::fmax(8.0f, input->font_size_px * s);
+            const float pad = 16.0f * s;
+            float lbl_w = 64.0f * s;
+            for (uint32_t bi = 0u; bi < branch_count; ++bi) {
+                const float tw = env.measure_text(branches[bi].name, bold_font, eff_font * 0.85f).x + 22.0f * s;
+                if (tw > lbl_w) lbl_w = tw;
+            }
+            const float step_x = std::fmax(56.0f * s, eff_font * 3.8f);
+            const float lane_h = std::fmax(52.0f * s, eff_font * 3.4f);
+            const float r_dia = std::fmax(14.0f * s, eff_font * 1.05f);
+            const float start_x = input->pos.x + pad + lbl_w + 18.0f * s;
+            const float total_w = pad * 2.0f + lbl_w + 18.0f * s + float(commit_count) * step_x + 20.0f * s;
+            const float total_h = pad * 2.0f + float(branch_count) * lane_h + 12.0f * s;
+            for (uint32_t bi = 0u; bi < branch_count; ++bi) {
+                const float ly = input->pos.y + pad + float(bi) * lane_h + lane_h * 0.38f;
+                blanes[bi] = { branches[bi].name, { input->pos.x + pad, ly - 11.0f * s, total_w - pad * 2.0f, 22.0f * s }, -1, true };
+            }
+            for (uint32_t ci = 0u; ci < commit_count; ++ci) {
+                const uint32_t bi = cnodes[ci].rank;
+                const float cx = start_x + float(ci) * step_x;
+                const float cy = input->pos.y + pad + float(bi) * lane_h + lane_h * 0.38f;
+                cnodes[ci].bounds = { cx - r_dia * 0.5f, cy - r_dia * 0.5f, r_dia, r_dia };
+            }
+            return { total_w, total_h };
+        };
+        const EtchVec2 nat = place_git(1.0f);
+        float final_scale = 1.0f;
+        EtchVec2 final_sz = nat;
+        if (input->max_width_px > 0.0f && nat.x > input->max_width_px) {
+            final_scale = std::fmax(min_scale, std::fmin(1.0f, input->max_width_px / nat.x));
+            final_sz = place_git(final_scale);
+        }
+        if (out_meta) {
+            out_meta->shapes = cshapes;
+            out_meta->edge_styles = cstyles;
+            out_meta->subgraphs = blanes;
+            out_meta->subgraph_count = branch_count;
+            out_meta->diagram_kind = InlayDiagramGitGraph;
+        }
+        return { cnodes, cedges, commit_count, edge_count, final_sz.x, final_sz.y, true, true, false, final_scale, nat.x, nat.y, warnings };
+    }
+
+    // ---- Mermaid mindmap ----
+    if (mindmap_diag) {
+        while (g.pos < source.length && source.chars[g.pos] != '\n') ++g.pos;
+        constexpr uint32_t kMaxMindNodes = 128u;
+        struct MindItem { EtchStr label; int32_t parent; uint32_t depth; float sub_h; };
+        auto* items = static_cast<MindItem*>(env.alloc(kMaxMindNodes * sizeof(MindItem), alignof(MindItem)));
+        auto* mnodes = static_cast<InlayDiagramNode*>(env.alloc(kMaxMindNodes * sizeof(InlayDiagramNode), alignof(InlayDiagramNode)));
+        auto* mshapes = static_cast<InlayDiagramShape*>(env.alloc(kMaxMindNodes * sizeof(InlayDiagramShape), alignof(InlayDiagramShape)));
+        auto* medges = static_cast<InlayDiagramEdge*>(env.alloc(kMaxMindNodes * sizeof(InlayDiagramEdge), alignof(InlayDiagramEdge)));
+        auto* mstyles = static_cast<uint8_t*>(env.alloc(kMaxMindNodes, 1));
+        if (!items || !mnodes || !mshapes || !medges || !mstyles) return {};
+        uint32_t mcount = 0u, ecount = 0u;
+        struct StackEnt { uint32_t indent; uint32_t idx; };
+        StackEnt stk[32] = {};
+        uint32_t sp = 0u;
+        auto strip_mind_shape = [](EtchStr s) noexcept -> EtchStr {
+            // Strip leading `root` prefix before `((...))` / `(...)` / `[...]`
+            if (s.length > 4u && std::memcmp(s.chars, "root", 4u) == 0 &&
+                (s.chars[4] == '(' || s.chars[4] == '[' || s.chars[4] == '{')) {
+                s = { s.chars + 4u, s.length - 4u, false };
+            }
+            for (int pass = 0; pass < 2 && s.length >= 2u; ++pass) {
+                const char a = s.chars[0], b = s.chars[s.length - 1u];
+                if ((a == '(' && b == ')') || (a == '[' && b == ']') || (a == '{' && b == '}') || (a == ')' && b == '(')) {
+                    s = { s.chars + 1u, s.length - 2u, false };
+                } else break;
+            }
+            return trim_slice(s, 0u, s.length);
+        };
+        while (g.pos < source.length && mcount < kMaxMindNodes) {
+            const uint32_t ls = g.pos;
+            while (g.pos < source.length && source.chars[g.pos] != '\n') ++g.pos;
+            const uint32_t le = g.pos;
+            if (g.pos < source.length) ++g.pos;
+            uint32_t ind = 0u, p = ls;
+            while (p < le && (source.chars[p] == ' ' || source.chars[p] == '\t')) {
+                ind += (source.chars[p] == '\t') ? 2u : 1u;
+                ++p;
+            }
+            const EtchStr raw = trim_slice(source, p, le);
+            if (raw.length == 0u || (raw.length >= 2u && raw.chars[0] == '%' && raw.chars[1] == '%')) continue;
+            if (raw.length >= 2u && raw.chars[0] == ':' && raw.chars[1] == ':') continue; // skip ::icon(...)
+            const EtchStr lbl = strip_mind_shape(raw);
+            if (lbl.length == 0u) continue;
+            while (sp > 0u && stk[sp - 1u].indent >= ind) --sp;
+            const int32_t par = sp > 0u ? static_cast<int32_t>(stk[sp - 1u].idx) : -1;
+            const uint32_t dep = sp;
+            const uint32_t ni = mcount++;
+            items[ni] = { lbl, par, dep, 0.0f };
+            mnodes[ni] = { lbl, lbl, {}, dep };
+            mshapes[ni] = InlayShapeMindmapNode;
+            if (par >= 0 && ecount < kMaxMindNodes) {
+                medges[ecount] = { static_cast<uint32_t>(par), ni, false, false, {} };
+                mstyles[ecount] = InlayEdgeStyleNoArrow;
+                ++ecount;
+            }
+            if (sp < 32u) stk[sp++] = { ind, ni };
+        }
+        if (mcount == 0u) return syntax_failure(g.pos);
+        const auto place_mindmap = [&](float s) noexcept -> EtchVec2 {
+            const float eff_font = std::fmax(8.0f, input->font_size_px * s);
+            const float pad = 16.0f * s;
+            const float h_gap = std::fmax(28.0f * s, input->rank_gap_px * 0.72f * s);
+            const float v_gap = std::fmax(10.0f * s, input->node_gap_px * 0.5f * s);
+            float col_w[32] = {};
+            uint32_t max_dep = 0u;
+            for (uint32_t i = 0u; i < mcount; ++i) {
+                const uint32_t d = items[i].depth < 31u ? items[i].depth : 31u;
+                if (d > max_dep) max_dep = d;
+                const uint16_t f = (d == 0u) ? bold_font : body_font;
+                const float fsz = (d == 0u) ? (eff_font * 1.05f) : (eff_font * 0.92f);
+                const EtchVec2 tsz = env.measure_text(items[i].label, f, fsz);
+                const float nw = tsz.x + (d == 0u ? 30.0f : 22.0f) * s;
+                const float nh = std::fmax(tsz.y + (d == 0u ? 16.0f : 12.0f) * s, 26.0f * s);
+                mnodes[i].bounds = { 0.0f, 0.0f, nw, nh };
+                if (nw > col_w[d]) col_w[d] = nw;
+            }
+            float col_x[32] = {};
+            col_x[0] = input->pos.x + pad;
+            for (uint32_t d = 1u; d <= max_dep; ++d) col_x[d] = col_x[d - 1u] + col_w[d - 1u] + h_gap;
+            // Bottom-up subtree height
+            for (uint32_t i = mcount; i-- > 0u;) {
+                float ch_sum = 0.0f;
+                uint32_t ch_cnt = 0u;
+                for (uint32_t j = i + 1u; j < mcount; ++j) {
+                    if (items[j].parent == static_cast<int32_t>(i)) {
+                        ch_sum += items[j].sub_h;
+                        ++ch_cnt;
+                    }
+                }
+                if (ch_cnt > 1u) ch_sum += float(ch_cnt - 1u) * v_gap;
+                items[i].sub_h = std::fmax(mnodes[i].bounds.h, ch_sum);
+            }
+            // Top-down vertical placement
+            float cur_root_y = input->pos.y + pad;
+            auto place_sub = [&](auto&& self, uint32_t idx, float top_y) noexcept -> void {
+                const uint32_t d = items[idx].depth < 31u ? items[idx].depth : 31u;
+                mnodes[idx].bounds.x = col_x[d];
+                mnodes[idx].bounds.y = top_y + (items[idx].sub_h - mnodes[idx].bounds.h) * 0.5f;
+                float cy = top_y;
+                for (uint32_t j = idx + 1u; j < mcount; ++j) {
+                    if (items[j].parent == static_cast<int32_t>(idx)) {
+                        self(self, j, cy);
+                        cy += items[j].sub_h + v_gap;
+                    }
+                }
+            };
+            for (uint32_t i = 0u; i < mcount; ++i) {
+                if (items[i].parent < 0) {
+                    place_sub(place_sub, i, cur_root_y);
+                    cur_root_y += items[i].sub_h + v_gap * 1.5f;
+                }
+            }
+            const float total_w = (col_x[max_dep] + col_w[max_dep] - input->pos.x) + pad;
+            const float total_h = (cur_root_y - v_gap * 1.5f - input->pos.y) + pad;
+            return { total_w, std::fmax(48.0f * s, total_h) };
+        };
+        const EtchVec2 nat = place_mindmap(1.0f);
+        float final_scale = 1.0f;
+        EtchVec2 final_sz = nat;
+        if (input->max_width_px > 0.0f && nat.x > input->max_width_px) {
+            final_scale = std::fmax(min_scale, std::fmin(1.0f, input->max_width_px / nat.x));
+            final_sz = place_mindmap(final_scale);
+        }
+        if (out_meta) {
+            out_meta->shapes = mshapes;
+            out_meta->edge_styles = mstyles;
+            out_meta->diagram_kind = InlayDiagramMindmap;
+        }
+        return { mnodes, medges, mcount, ecount, final_sz.x, final_sz.y, true, true, false, final_scale, nat.x, nat.y, warnings };
+    }
+
+    // ---- Mermaid timeline ----
+    if (timeline_diag) {
+        while (g.pos < source.length && source.chars[g.pos] != '\n') ++g.pos;
+        constexpr uint32_t kMaxPeriods = 32u;
+        constexpr uint32_t kMaxTlNodes = 160u;
+        constexpr uint32_t kMaxSections = 16u;
+        EtchStr title = {};
+        struct SecRec { EtchStr name; uint32_t first_col; uint32_t last_col; };
+        SecRec secs[kMaxSections] = {};
+        uint32_t sec_count = 0u;
+        auto* tnodes = static_cast<InlayDiagramNode*>(env.alloc(kMaxTlNodes * sizeof(InlayDiagramNode), alignof(InlayDiagramNode)));
+        auto* tshapes = static_cast<InlayDiagramShape*>(env.alloc(kMaxTlNodes * sizeof(InlayDiagramShape), alignof(InlayDiagramShape)));
+        auto* tsgs = static_cast<InlayDiagramSubgraph*>(env.alloc(kMaxSections * sizeof(InlayDiagramSubgraph), alignof(InlayDiagramSubgraph)));
+        if (!tnodes || !tshapes || !tsgs) return {};
+        uint32_t tcount = 0u;
+        uint32_t col_count = 0u;
+        uint32_t col_events[kMaxPeriods] = {};
+        while (g.pos < source.length && tcount < kMaxTlNodes) {
+            spaces(&g);
+            if (g.pos >= source.length) break;
+            if (source.chars[g.pos] == '\n') { ++g.pos; continue; }
+            if (starts(g, ETCH_STR_LIT("%%"))) { while (g.pos < source.length && source.chars[g.pos] != '\n') ++g.pos; continue; }
+            const uint32_t ls = g.pos;
+            while (g.pos < source.length && source.chars[g.pos] != '\n') ++g.pos;
+            const EtchStr line = trim_slice(source, ls, g.pos);
+            if (line.length == 0u) continue;
+            if (line.length > 6u && std::memcmp(line.chars, "title", 5u) == 0 && (line.chars[5] == ' ' || line.chars[5] == '\t')) {
+                title = trim_slice(line, 6u, line.length);
+                continue;
+            }
+            if (line.length > 8u && std::memcmp(line.chars, "section", 7u) == 0 && (line.chars[7] == ' ' || line.chars[7] == '\t')) {
+                if (sec_count < kMaxSections) {
+                    secs[sec_count++] = { trim_slice(line, 8u, line.length), col_count, col_count };
+                }
+                continue;
+            }
+            // Split on `:` -> first part is period (or empty for continuation `: event`), rest are events
+            uint32_t colon = UINT32_MAX;
+            for (uint32_t ci = 0u; ci < line.length; ++ci) {
+                if (line.chars[ci] == ':') { colon = ci; break; }
+            }
+            const EtchStr pstr = (colon == UINT32_MAX) ? line : trim_slice(line, 0u, colon);
+            if (pstr.length > 0u) {
+                if (col_count >= kMaxPeriods) continue;
+                const uint32_t cidx = col_count++;
+                tnodes[tcount] = { pstr, pstr, {}, cidx };
+                tshapes[tcount] = InlayShapeRound;
+                ++tcount;
+                if (sec_count > 0u) secs[sec_count - 1u].last_col = col_count;
+            }
+            if (colon != UINT32_MAX && col_count > 0u) {
+                const uint32_t cidx = col_count - 1u;
+                uint32_t ep = colon + 1u;
+                while (ep <= line.length && tcount < kMaxTlNodes) {
+                    uint32_t nxt = ep;
+                    while (nxt < line.length && line.chars[nxt] != ':') ++nxt;
+                    const EtchStr ev = trim_slice(line, ep, nxt);
+                    if (ev.length > 0u) {
+                        tnodes[tcount] = { ev, ev, {}, cidx };
+                        tshapes[tcount] = InlayShapeTimelineCard;
+                        ++tcount;
+                        ++col_events[cidx];
+                    }
+                    if (nxt >= line.length) break;
+                    ep = nxt + 1u;
+                }
+            }
+        }
+        if (col_count == 0u) return syntax_failure(g.pos);
+        const auto place_timeline = [&](float s) noexcept -> EtchVec2 {
+            const float eff_font = std::fmax(8.0f, input->font_size_px * s);
+            const float pad = 16.0f * s;
+            const float title_h = title.length ? (eff_font * 1.8f + 6.0f * s) : 0.0f;
+            const float sec_h = (sec_count > 0u) ? (eff_font * 1.6f + 8.0f * s) : 0.0f;
+            const float hdr_h = std::fmax(eff_font * 1.7f + 8.0f * s, 28.0f * s);
+            const float card_h = std::fmax(eff_font * 1.55f + 10.0f * s, 28.0f * s);
+            const float col_gap = 18.0f * s;
+            const float card_gap = 8.0f * s;
+            float col_w[kMaxPeriods] = {};
+            for (uint32_t c = 0u; c < col_count; ++c) col_w[c] = 96.0f * s;
+            for (uint32_t i = 0u; i < tcount; ++i) {
+                const uint32_t c = tnodes[i].rank;
+                const uint16_t f = (tshapes[i] == InlayShapeRound) ? bold_font : body_font;
+                const float tw = env.measure_text(tnodes[i].label, f, eff_font * 0.9f).x + 24.0f * s;
+                if (tw > col_w[c]) col_w[c] = std::fmin(220.0f * s, tw);
+            }
+            float col_x[kMaxPeriods] = {};
+            float cx = input->pos.x + pad;
+            for (uint32_t c = 0u; c < col_count; ++c) { col_x[c] = cx; cx += col_w[c] + col_gap; }
+            const float hdr_y = input->pos.y + pad + title_h + sec_h;
+            uint32_t row_idx[kMaxPeriods] = {};
+            float max_y = hdr_y + hdr_h;
+            for (uint32_t i = 0u; i < tcount; ++i) {
+                const uint32_t c = tnodes[i].rank;
+                if (tshapes[i] == InlayShapeRound) {
+                    tnodes[i].bounds = { col_x[c], hdr_y, col_w[c], hdr_h };
+                } else {
+                    const uint32_t r = row_idx[c]++;
+                    const float ey = hdr_y + hdr_h + 16.0f * s + float(r) * (card_h + card_gap);
+                    tnodes[i].bounds = { col_x[c], ey, col_w[c], card_h };
+                    if (ey + card_h > max_y) max_y = ey + card_h;
+                }
+            }
+            for (uint32_t si = 0u; si < sec_count; ++si) {
+                const bool valid_s = secs[si].last_col > secs[si].first_col && secs[si].first_col < col_count;
+                const uint32_t c0 = valid_s ? secs[si].first_col : 0u;
+                const uint32_t c1 = valid_s ? (secs[si].last_col - 1u) : 0u;
+                const float sx = col_x[c0];
+                const float sw = (col_x[c1] + col_w[c1]) - sx;
+                tsgs[si] = { secs[si].name, { sx, input->pos.y + pad + title_h, sw, sec_h - 6.0f * s }, -1, valid_s };
+            }
+            return { (cx - col_gap - input->pos.x) + pad, (max_y - input->pos.y) + pad };
+        };
+        const EtchVec2 nat = place_timeline(1.0f);
+        float final_scale = 1.0f;
+        EtchVec2 final_sz = nat;
+        if (input->max_width_px > 0.0f && nat.x > input->max_width_px) {
+            final_scale = std::fmax(min_scale, std::fmin(1.0f, input->max_width_px / nat.x));
+            final_sz = place_timeline(final_scale);
+        }
+        if (out_meta) {
+            out_meta->shapes = tshapes;
+            out_meta->subgraphs = sec_count ? tsgs : nullptr;
+            out_meta->subgraph_count = sec_count;
+            out_meta->diagram_kind = InlayDiagramTimeline;
+            out_meta->title = title;
+        }
+        return { tnodes, nullptr, tcount, 0u, final_sz.x, final_sz.y, true, true, false, final_scale, nat.x, nat.y, warnings };
+    }
+
+    const uint32_t req_nodes = input->max_nodes > 0u ? (input->max_nodes > 2048u ? 2048u : input->max_nodes) : 256u;
+    const uint32_t req_edges = input->max_edges > 0u ? (input->max_edges > 8192u ? 8192u : input->max_edges) : 1024u;
     constexpr uint32_t kSubgraphCap = 32;
     // Each parsed entry consumes at least one byte. Small diagrams need only
     // reserve enough space for their remaining input.
     const uint32_t body = source.length - g.pos;
     if (!body) return syntax_failure(g.pos);
-    g.node_capacity = body < kNodeCap ? body : kNodeCap;
-    const uint32_t edge_cap = body < kEdgeCap ? body : kEdgeCap;
+    g.node_capacity = body < req_nodes ? body : req_nodes;
+    const uint32_t edge_cap = body < req_edges ? body : req_edges;
     const uint32_t subgraph_cap = body < kSubgraphCap ? body : kSubgraphCap;
     auto* nodes = static_cast<InlayDiagramNode*>(env.alloc(size_t(g.node_capacity) * sizeof(InlayDiagramNode), alignof(InlayDiagramNode)));
     auto* edges = static_cast<InlayDiagramEdge*>(env.alloc(size_t(edge_cap) * sizeof(InlayDiagramEdge), alignof(InlayDiagramEdge)));
@@ -770,7 +1551,356 @@ InlayDiagramResult diagram_layout_core(EtchStr source, const InlayDiagramDesc* i
 
     int32_t sub_stack[kSubgraphCap] = {};
     uint32_t sub_depth = 0;
-    while (g.valid && g.pos < source.length) {
+    if (state_diag) {
+        const auto add_state_node = [&](EtchStr nid, EtchStr lbl, InlayDiagramShape sh) noexcept -> uint32_t {
+            uint32_t index = 0u;
+            while (index < g.node_count && !equal(g.nodes[index].id, nid)) ++index;
+            if (index == g.node_count) {
+                if (index == g.node_capacity) { g.valid = false; return 0u; }
+                g.nodes[index] = {};
+                g.nodes[index].id = nid;
+                g.nodes[index].label = lbl;
+                g.shapes[index] = sh;
+                g.node_subgraph[index] = g.active_subgraph;
+                ++g.node_count;
+            } else {
+                if (g.node_subgraph[index] < 0 && g.active_subgraph >= 0) g.node_subgraph[index] = g.active_subgraph;
+                if (lbl.length > 0u && equal(g.nodes[index].label, g.nodes[index].id)) g.nodes[index].label = lbl;
+            }
+            return index;
+        };
+        const auto read_state_id = [&](bool is_source) noexcept -> uint32_t {
+            spaces(&g);
+            if (starts(g, ETCH_STR_LIT("[*]"))) {
+                g.pos += 3u;
+                return is_source
+                    ? add_state_node(ETCH_STR_LIT("__start"), ETCH_STR_LIT(""), InlayShapeStateStart)
+                    : add_state_node(ETCH_STR_LIT("__end"), ETCH_STR_LIT(""), InlayShapeStateEnd);
+            }
+            const uint32_t start = g.pos;
+            while (g.pos < source.length) {
+                const char c = source.chars[g.pos];
+                if (word(c)) { ++g.pos; continue; }
+                if (c == '-' && g.pos + 1u < source.length && word(source.chars[g.pos + 1u])) { ++g.pos; continue; }
+                break;
+            }
+            if (start == g.pos) { g.valid = false; return 0u; }
+            const EtchStr sid = { source.chars + start, g.pos - start, false };
+            return add_state_node(sid, sid, InlayShapeRound);
+        };
+
+        while (g.valid && g.pos < source.length) {
+            spaces(&g);
+            if (g.pos == source.length) break;
+            if (statement_end(g)) { ++g.pos; continue; }
+            if (starts(g, ETCH_STR_LIT("%%"))) { while (g.pos < source.length && source.chars[g.pos] != '\n') ++g.pos; continue; }
+            const uint32_t stmt = g.pos;
+            if (source.chars[g.pos] == '}') {
+                ++g.pos;
+                if (!sub_depth) return syntax_failure(stmt);
+                g.active_subgraph = sub_stack[--sub_depth];
+                continue;
+            }
+            if (starts(g, ETCH_STR_LIT("direction")) && g.pos + 9u < source.length &&
+                (source.chars[g.pos + 9u] == ' ' || source.chars[g.pos + 9u] == '\t'))
+            {
+                g.pos += 9u;
+                spaces(&g);
+                const uint32_t dpos = g.pos;
+                while (g.pos < source.length && word(source.chars[g.pos])) ++g.pos;
+                const EtchStr dir = { source.chars + dpos, g.pos - dpos, false };
+                const bool is_lr = equal(dir, ETCH_STR_LIT("LR"));
+                const bool is_rl = equal(dir, ETCH_STR_LIT("RL"));
+                const bool is_td = equal(dir, ETCH_STR_LIT("TD")) || equal(dir, ETCH_STR_LIT("TB"));
+                const bool is_bt = equal(dir, ETCH_STR_LIT("BT"));
+                if (!is_lr && !is_rl && !is_td && !is_bt) {
+                    diagnostic(INLAY_DIAGRAM_INVALID_DIRECTION, dpos, dir.length);
+                    return {};
+                }
+                g.lr = is_lr || is_rl;
+                g.reverse_dir = is_rl || is_bt;
+                continue;
+            }
+            if ((starts(g, ETCH_STR_LIT("note ")) || starts(g, ETCH_STR_LIT("classDef ")) || starts(g, ETCH_STR_LIT("class ")))) {
+                while (g.pos < source.length && source.chars[g.pos] != '\n') ++g.pos;
+                ++warnings;
+                diagnostic(INLAY_DIAGRAM_UNSUPPORTED_DIRECTIVE, stmt, g.pos - stmt);
+                continue;
+            }
+            if (starts(g, ETCH_STR_LIT("state")) && g.pos + 5u < source.length &&
+                (source.chars[g.pos + 5u] == ' ' || source.chars[g.pos + 5u] == '\t'))
+            {
+                g.pos += 5u;
+                spaces(&g);
+                EtchStr alias_label = {};
+                if (g.pos < source.length && source.chars[g.pos] == '"') {
+                    ++g.pos;
+                    const uint32_t ls = g.pos;
+                    while (g.pos < source.length && source.chars[g.pos] != '"' && source.chars[g.pos] != '\n') ++g.pos;
+                    if (g.pos == source.length || source.chars[g.pos] != '"') return syntax_failure(stmt);
+                    alias_label = { source.chars + ls, g.pos - ls, false };
+                    ++g.pos;
+                    spaces(&g);
+                    if (starts(g, ETCH_STR_LIT("as")) && g.pos + 2u < source.length &&
+                        (source.chars[g.pos + 2u] == ' ' || source.chars[g.pos + 2u] == '\t'))
+                    {
+                        g.pos += 2u;
+                        spaces(&g);
+                    }
+                }
+                const uint32_t id_s = g.pos;
+                while (g.pos < source.length && (word(source.chars[g.pos]) || source.chars[g.pos] == '-')) ++g.pos;
+                if (g.pos == id_s) return syntax_failure(stmt);
+                const EtchStr sid = { source.chars + id_s, g.pos - id_s, false };
+                spaces(&g);
+                if (g.pos < source.length && source.chars[g.pos] == '{') {
+                    ++g.pos;
+                    if (g.subgraph_count == subgraph_cap) return syntax_failure(stmt);
+                    const int32_t idx = int32_t(g.subgraph_count++);
+                    subgraphs[idx] = { alias_label.length ? alias_label : sid, {}, g.active_subgraph, false };
+                    sub_stack[sub_depth++] = g.active_subgraph;
+                    g.active_subgraph = idx;
+                    continue;
+                }
+                const uint32_t ni = add_state_node(sid, alias_label.length ? alias_label : sid, InlayShapeRound);
+                if (!g.valid) break;
+                if (alias_label.length) g.nodes[ni].label = alias_label;
+                while (!statement_end(g)) ++g.pos;
+                continue;
+            }
+            const uint32_t from = read_state_id(true);
+            if (!g.valid) break;
+            spaces(&g);
+            if (starts(g, ETCH_STR_LIT("-->"))) {
+                g.pos += 3u;
+                const uint32_t to = read_state_id(false);
+                if (!g.valid || g.edge_count == edge_cap) { g.valid = false; break; }
+                spaces(&g);
+                EtchStr elbl = {};
+                if (g.pos < source.length && source.chars[g.pos] == ':') {
+                    ++g.pos;
+                    spaces(&g);
+                    const uint32_t ls = g.pos;
+                    while (!statement_end(g)) ++g.pos;
+                    elbl = trim_slice(source, ls, g.pos);
+                }
+                edge_styles[g.edge_count] = InlayEdgeStyleNone;
+                edges[g.edge_count++] = { from, to, false, false, elbl };
+            } else if (g.pos < source.length && source.chars[g.pos] == ':') {
+                ++g.pos;
+                spaces(&g);
+                const uint32_t ls = g.pos;
+                while (!statement_end(g)) ++g.pos;
+                const EtchStr desc_lbl = trim_slice(source, ls, g.pos);
+                if (desc_lbl.length) g.nodes[from].label = desc_lbl;
+            } else if (!statement_end(g)) {
+                g.valid = false;
+                break;
+            }
+        }
+    } else if (class_diag || er_diag) {
+        const auto add_box_node = [&](EtchStr nid) noexcept -> uint32_t {
+            uint32_t idx = 0u;
+            while (idx < g.node_count && !equal(g.nodes[idx].id, nid)) ++idx;
+            if (idx == g.node_count) {
+                if (idx == g.node_capacity) { g.valid = false; return 0u; }
+                g.nodes[idx] = {};
+                g.nodes[idx].id = nid;
+                g.nodes[idx].label = nid;
+                g.shapes[idx] = InlayShapeClassBox;
+                g.node_subgraph[idx] = g.active_subgraph;
+                ++g.node_count;
+            } else if (g.node_subgraph[idx] < 0 && g.active_subgraph >= 0) {
+                g.node_subgraph[idx] = g.active_subgraph;
+            }
+            return idx;
+        };
+        const auto append_member = [&](uint32_t idx, EtchStr member) noexcept {
+            if (!member.chars || member.length == 0u || idx >= g.node_count) return;
+            const EtchStr cur = g.nodes[idx].label;
+            const uint32_t total = cur.length + 1u + member.length;
+            if (char* buf = static_cast<char*>(env.alloc(total + 1u, 1u))) {
+                if (cur.length > 0u && cur.chars) std::memcpy(buf, cur.chars, cur.length);
+                buf[cur.length] = '\n';
+                std::memcpy(buf + cur.length + 1u, member.chars, member.length);
+                buf[total] = '\0';
+                g.nodes[idx].label = { buf, total, false };
+            }
+        };
+        const auto read_ident = [&](uint32_t* p, const char* s, uint32_t len) noexcept -> EtchStr {
+            while (*p < len && (s[*p] == ' ' || s[*p] == '\t')) ++(*p);
+            const uint32_t st = *p;
+            while (*p < len) {
+                const char ch = s[*p];
+                if (word(ch) || ch == '-' || ch == '~' || ch == '$' || ch == '<' || ch == '>') {
+                    if (ch == '-' && *p + 1u < len && (s[*p + 1u] == '-' || s[*p + 1u] == '>' || s[*p + 1u] == '|' || s[*p + 1u] == '*' || s[*p + 1u] == 'o')) break;
+                    if (ch == '<' && *p + 1u < len && (s[*p + 1u] == '|' || s[*p + 1u] == '-' || s[*p + 1u] == '.')) break;
+                    if (ch == '>' && *p > st && (s[*p - 1u] == '-' || s[*p - 1u] == '.')) break;
+                    ++(*p);
+                } else break;
+            }
+            return { s + st, *p - st, false };
+        };
+        int32_t open_box_node = -1;
+        while (g.valid && g.pos < source.length) {
+            spaces(&g);
+            if (g.pos >= source.length) break;
+            if (source.chars[g.pos] == '\n' || source.chars[g.pos] == ';') { ++g.pos; continue; }
+            if (starts(g, ETCH_STR_LIT("%%"))) { while (g.pos < source.length && source.chars[g.pos] != '\n') ++g.pos; continue; }
+            const uint32_t ls = g.pos;
+            while (g.pos < source.length && source.chars[g.pos] != '\n') ++g.pos;
+            const EtchStr line = trim_slice(source, ls, g.pos);
+            if (line.length == 0u) continue;
+            if (open_box_node >= 0) {
+                if (line.chars[0] == '}') {
+                    open_box_node = -1;
+                    continue;
+                }
+                // Strip trailing '}' if inline close
+                EtchStr mem = line;
+                if (mem.chars[mem.length - 1u] == '}') {
+                    mem = trim_slice(mem, 0u, mem.length - 1u);
+                    if (mem.length > 0u) append_member(uint32_t(open_box_node), mem);
+                    open_box_node = -1;
+                } else {
+                    append_member(uint32_t(open_box_node), mem);
+                }
+                continue;
+            }
+            if (line.chars[0] == '}' && sub_depth > 0u) {
+                g.active_subgraph = sub_stack[--sub_depth];
+                continue;
+            }
+            if (class_diag && line.length > 10u && std::memcmp(line.chars, "direction ", 10u) == 0) {
+                const EtchStr dir = trim_slice(line, 10u, line.length);
+                const bool is_lr = equal(dir, ETCH_STR_LIT("LR"));
+                const bool is_rl = equal(dir, ETCH_STR_LIT("RL"));
+                const bool is_bt = equal(dir, ETCH_STR_LIT("BT"));
+                g.lr = is_lr || is_rl;
+                g.reverse_dir = is_rl || is_bt;
+                continue;
+            }
+            if (class_diag && line.length > 10u && std::memcmp(line.chars, "namespace ", 10u) == 0) {
+                uint32_t p = 10u;
+                const EtchStr ns = read_ident(&p, line.chars, line.length);
+                if (ns.length > 0u && g.subgraph_count < subgraph_cap) {
+                    const int32_t idx = int32_t(g.subgraph_count++);
+                    subgraphs[idx] = { ns, {}, g.active_subgraph, false };
+                    sub_stack[sub_depth++] = g.active_subgraph;
+                    g.active_subgraph = idx;
+                }
+                continue;
+            }
+            if (class_diag && line.length > 6u && std::memcmp(line.chars, "class ", 6u) == 0) {
+                uint32_t p = 6u;
+                const EtchStr cname = read_ident(&p, line.chars, line.length);
+                if (cname.length > 0u) {
+                    const uint32_t ci = add_box_node(cname);
+                    while (p < line.length && (line.chars[p] == ' ' || line.chars[p] == '\t')) ++p;
+                    if (p < line.length && line.chars[p] == '{') {
+                        const EtchStr rest = trim_slice(line, p + 1u, line.length);
+                        if (rest.length > 0u && rest.chars[rest.length - 1u] == '}') {
+                            const EtchStr inner = trim_slice(rest, 0u, rest.length - 1u);
+                            if (inner.length > 0u) append_member(ci, inner);
+                        } else {
+                            if (rest.length > 0u) append_member(ci, rest);
+                            open_box_node = int32_t(ci);
+                        }
+                    }
+                }
+                continue;
+            }
+            // Check ER entity attribute block: ENTITY { ...
+            if (er_diag) {
+                uint32_t p = 0u;
+                const EtchStr ename = read_ident(&p, line.chars, line.length);
+                while (p < line.length && (line.chars[p] == ' ' || line.chars[p] == '\t')) ++p;
+                if (ename.length > 0u && p < line.length && line.chars[p] == '{') {
+                    const uint32_t ei = add_box_node(ename);
+                    const EtchStr rest = trim_slice(line, p + 1u, line.length);
+                    if (rest.length > 0u && rest.chars[rest.length - 1u] == '}') {
+                        const EtchStr inner = trim_slice(rest, 0u, rest.length - 1u);
+                        if (inner.length > 0u) append_member(ei, inner);
+                    } else {
+                        if (rest.length > 0u) append_member(ei, rest);
+                        open_box_node = int32_t(ei);
+                    }
+                    continue;
+                }
+            }
+            // Check class member line: ClassName : +member
+            if (class_diag) {
+                uint32_t p = 0u;
+                const EtchStr cname = read_ident(&p, line.chars, line.length);
+                while (p < line.length && (line.chars[p] == ' ' || line.chars[p] == '\t')) ++p;
+                if (cname.length > 0u && p < line.length && line.chars[p] == ':') {
+                    const uint32_t ci = add_box_node(cname);
+                    append_member(ci, trim_slice(line, p + 1u, line.length));
+                    continue;
+                }
+            }
+            // Relationship edge line
+            uint32_t p = 0u;
+            const EtchStr lhs = read_ident(&p, line.chars, line.length);
+            if (lhs.length == 0u) continue;
+            while (p < line.length && (line.chars[p] == ' ' || line.chars[p] == '\t')) ++p;
+            if (p < line.length && line.chars[p] == '"') {
+                ++p;
+                while (p < line.length && line.chars[p] != '"') ++p;
+                if (p < line.length) ++p;
+                while (p < line.length && (line.chars[p] == ' ' || line.chars[p] == '\t')) ++p;
+            }
+            const uint32_t rel_s = p;
+            while (p < line.length && (line.chars[p] == '<' || line.chars[p] == '>' || line.chars[p] == '|' ||
+                   line.chars[p] == '-' || line.chars[p] == '.' || line.chars[p] == '*' || line.chars[p] == 'o' ||
+                   line.chars[p] == '{' || line.chars[p] == '}')) {
+                ++p;
+            }
+            const EtchStr rel = { line.chars + rel_s, p - rel_s, false };
+            if (rel.length < 2u) {
+                (void)add_box_node(lhs);
+                continue;
+            }
+            while (p < line.length && (line.chars[p] == ' ' || line.chars[p] == '\t')) ++p;
+            if (p < line.length && line.chars[p] == '"') {
+                ++p;
+                while (p < line.length && line.chars[p] != '"') ++p;
+                if (p < line.length) ++p;
+                while (p < line.length && (line.chars[p] == ' ' || line.chars[p] == '\t')) ++p;
+            }
+            const EtchStr rhs = read_ident(&p, line.chars, line.length);
+            if (rhs.length == 0u) continue;
+            EtchStr elbl = {};
+            while (p < line.length && (line.chars[p] == ' ' || line.chars[p] == '\t')) ++p;
+            if (p < line.length && line.chars[p] == ':') {
+                elbl = strip_outer_quotes(trim_slice(line, p + 1u, line.length));
+            }
+            uint32_t from = add_box_node(lhs);
+            uint32_t to = add_box_node(rhs);
+            bool dashed = false;
+            for (uint32_t ri = 0u; ri + 1u < rel.length; ++ri) {
+                if (rel.chars[ri] == '.' && rel.chars[ri + 1u] == '.') { dashed = true; break; }
+            }
+            uint8_t estyle = InlayEdgeStyleNone;
+            if (er_diag) {
+                estyle = InlayEdgeStyleNoArrow;
+            } else {
+                const bool left_arrow = (rel.chars[0] == '<');
+                const bool right_arrow = (rel.chars[rel.length - 1u] == '>');
+                if (left_arrow && right_arrow) {
+                    estyle = InlayEdgeStyleBidir;
+                } else if (left_arrow && !right_arrow) {
+                    const uint32_t tmp = from; from = to; to = tmp;
+                } else if (!left_arrow && !right_arrow) {
+                    estyle = InlayEdgeStyleNoArrow;
+                }
+            }
+            if (g.valid && g.edge_count < edge_cap) {
+                edge_styles[g.edge_count] = estyle;
+                edges[g.edge_count++] = { from, to, false, dashed, elbl };
+            }
+        }
+    } else while (g.valid && g.pos < source.length) {
         spaces(&g);
         if (g.pos == source.length) break;
         if (statement_end(g)) { ++g.pos; continue; }
@@ -874,12 +2004,13 @@ InlayDiagramResult diagram_layout_core(EtchStr source, const InlayDiagramDesc* i
     // 3. Build Sugiyama virtual-dummy graph for multi-rank non-reversed long edges.
     struct VEdge { uint32_t u, v; };
     uint32_t dummy_count = 0;
+    const uint32_t dummy_cap = edge_cap > 1024u ? 2048u : 512u;
     for (uint32_t i = 0; i < g.edge_count; ++i) {
         const auto& e = edges[i];
         if (e.from == e.to || e.reversed) continue;
         if (nodes[e.to].rank > nodes[e.from].rank + 1) {
             const uint32_t span = nodes[e.to].rank - nodes[e.from].rank - 1;
-            if (dummy_count + span <= 512u) dummy_count += span;
+            if (dummy_count + span <= dummy_cap) dummy_count += span;
         }
     }
     const uint32_t vnode_count = g.node_count + dummy_count;
@@ -999,6 +2130,16 @@ InlayDiagramResult diagram_layout_core(EtchStr source, const InlayDiagramDesc* i
         }
 
         for (uint32_t i = 0; i < g.node_count; ++i) {
+            if (shapes[i] == InlayShapeStateStart) {
+                const float d = std::fmax(12.0f, 16.0f * s);
+                nodes[i].bounds = { 0.0f, 0.0f, d, d };
+                continue;
+            }
+            if (shapes[i] == InlayShapeStateEnd) {
+                const float d = std::fmax(16.0f, 22.0f * s);
+                nodes[i].bounds = { 0.0f, 0.0f, d, d };
+                continue;
+            }
             const auto text = measure_label_env(nodes[i].label, body_font, eff_font, env);
             float w = text.x + 32.0f * s;
             float h = std::fmax(eff_font * 1.5f, text.y) + 24.0f * s;
@@ -1009,6 +2150,13 @@ InlayDiagramResult diagram_layout_core(EtchStr source, const InlayDiagramDesc* i
                 const float d = std::fmax(w, h);
                 w = d;
                 h = d;
+            } else if (shapes[i] == InlayShapeClassBox) {
+                bool has_members = false;
+                for (uint32_t li = 0u; li < nodes[i].label.length; ++li) {
+                    if (nodes[i].label.chars[li] == '\n') { has_members = true; break; }
+                }
+                w = std::fmax(w, 128.0f * s);
+                if (has_members) h += 12.0f * s;
             }
             nodes[i].bounds = { 0.0f, 0.0f, w, h };
         }
@@ -1173,6 +2321,7 @@ InlayDiagramResult diagram_layout_core(EtchStr source, const InlayDiagramDesc* i
         out_meta->waypoints = waypoints;
         out_meta->waypoint_count = wp_used;
         out_meta->reversed_dir = g.reverse_dir;
+        out_meta->diagram_kind = class_diag ? InlayDiagramClass : (er_diag ? InlayDiagramEr : (state_diag ? InlayDiagramState : InlayDiagramFlowchart));
     }
     return { nodes, edges, g.node_count, g.edge_count, final_sz.x, final_sz.y, true, g.lr, false, final_scale, nat.x, nat.y, warnings };
 }
@@ -1308,6 +2457,267 @@ void inlay_diagram_draw_ex(const InlayDiagramResult& result, const InlayDiagramD
         canvas.width = etch_sizing_fixed(input.viewport_width_px);
         canvas.height = etch_sizing_fixed(input.viewport_height_px);
         etch_begin_canvas(&canvas);
+    }
+
+    // Specialized Pie & Gantt rendering paths
+    if (meta && meta->diagram_kind == InlayDiagramPie && meta->pie_slices && meta->pie_slice_count > 0u) {
+        static constexpr EtchColor kPieColors[8] = {
+            {59, 130, 246, 255}, {16, 185, 129, 255}, {245, 158, 11, 255}, {239, 68, 68, 255},
+            {139, 92, 246, 255}, {6, 182, 212, 255}, {249, 115, 22, 255}, {236, 72, 153, 255}
+        };
+        if (meta->title.length > 0u) {
+            draw_label(meta->title, { input.pos.x + result.width * 0.5f, input.pos.y + 8.0f * scale },
+                       bold_font, eff_font * 1.08f, theme.text_primary, ETCH_ALIGN_X_CENTER);
+        }
+        const EtchVec2 c = meta->pie_center;
+        const float r = meta->pie_radius;
+        for (uint32_t i = 0u; i < meta->pie_slice_count; ++i) {
+            const auto& sl = meta->pie_slices[i];
+            const EtchColor col = kPieColors[sl.color_index % 8u];
+            uint32_t segs = static_cast<uint32_t>(std::ceil(std::fabs(sl.sweep_rad) / 0.16f));
+            if (segs < 4u) segs = 4u;
+            if (segs > 44u) segs = 44u;
+            EtchVec2 pts[46] = {};
+            pts[0] = c;
+            for (uint32_t k = 0u; k <= segs; ++k) {
+                const float a = sl.start_rad + sl.sweep_rad * (float(k) / float(segs));
+                pts[k + 1u] = { c.x + std::cos(a) * r, c.y + std::sin(a) * r };
+            }
+            EtchFilledPolygonDesc poly = etch_filled_polygon_desc_default();
+            poly.points = pts;
+            poly.point_count = segs + 2u;
+            poly.fill = col;
+            poly.stroke_color = theme.bg_surface;
+            poly.stroke_width = std::fmax(1.0f, 1.5f * scale);
+            etch_draw_filled_polygon(&poly);
+            if (i < result.node_count) {
+                const auto& nr = result.nodes[i];
+                const float sw = 10.0f * scale;
+                auto swatch = etch_rect_draw_desc_default();
+                swatch.rect = { nr.bounds.x, nr.bounds.y + (nr.bounds.h - sw) * 0.5f, sw, sw };
+                swatch.fill = col;
+                swatch.radius = etch_corners_all(2.5f * scale);
+                etch_draw_rect(&swatch);
+                draw_label(nr.label, { nr.bounds.x + sw + 7.0f * scale, nr.bounds.y + (nr.bounds.h - eff_font * 0.9f) * 0.35f },
+                           body_font, eff_font * 0.9f, theme.text_primary, ETCH_ALIGN_X_LEFT);
+            }
+        }
+        if (input.canvas_id) etch_end_canvas();
+        return;
+    }
+    if (meta && meta->diagram_kind == InlayDiagramGantt && meta->gantt_bars && meta->gantt_bar_count > 0u) {
+        const float pad = 14.0f * scale;
+        const float chart_x = input.pos.x + pad + meta->gantt_label_width;
+        const float chart_w = std::fmax(40.0f, result.width - 2.0f * pad - meta->gantt_label_width);
+        const float top_y = input.pos.y + pad + (meta->title.length ? (eff_font * 1.8f + 6.0f * scale) : 0.0f);
+        const float bot_y = input.pos.y + result.height - pad;
+        if (meta->title.length > 0u) {
+            draw_label(meta->title, { input.pos.x + result.width * 0.5f, input.pos.y + 8.0f * scale },
+                       bold_font, eff_font * 1.08f, theme.text_primary, ETCH_ALIGN_X_CENTER);
+        }
+        // Subtle vertical timeline grid guides
+        for (uint32_t g = 0u; g <= 4u; ++g) {
+            const float gx = chart_x + chart_w * (float(g) / 4.0f);
+            EtchLineDesc gl = {};
+            gl.from = { gx, top_y };
+            gl.to = { gx, bot_y };
+            gl.color = { theme.border_subtle.r, theme.border_subtle.g, theme.border_subtle.b, uint8_t(dark ? 90u : 130u) };
+            gl.thickness = std::fmax(0.75f, 0.9f * scale);
+            etch_draw_line(&gl);
+        }
+        const float sec_h = eff_font * 1.45f + 6.0f * scale;
+        for (uint32_t i = 0u; i < meta->gantt_bar_count && i < result.node_count; ++i) {
+            const auto& nr = result.nodes[i];
+            const auto& bar = meta->gantt_bars[i];
+            if (bar.section_first && bar.section.length > 0u) {
+                auto sb = etch_rect_draw_desc_default();
+                sb.rect = { nr.bounds.x, nr.bounds.y - sec_h + 2.0f * scale, nr.bounds.w, sec_h - 4.0f * scale };
+                sb.fill = { theme.surface_subtle.r, theme.surface_subtle.g, theme.surface_subtle.b, uint8_t(dark ? 110u : 160u) };
+                sb.radius = etch_corners_all(4.0f * scale);
+                etch_draw_rect(&sb);
+                draw_label(bar.section, { sb.rect.x + 8.0f * scale, sb.rect.y + 3.0f * scale },
+                           bold_font, eff_font * 0.88f, theme.text_secondary, ETCH_ALIGN_X_LEFT);
+            }
+            draw_label(nr.label, { nr.bounds.x + 6.0f * scale, nr.bounds.y + (nr.bounds.h - eff_font * 0.92f) * 0.35f },
+                       body_font, eff_font * 0.92f, theme.text_primary, ETCH_ALIGN_X_LEFT);
+            EtchColor bcol = theme.accent;
+            if (bar.status == 1u) bcol = etch_rgba8(100, 116, 139, 210);
+            else if (bar.status == 2u) bcol = etch_rgba8(59, 130, 246, 255);
+            else if (bar.status == 3u) bcol = etch_rgba8(239, 68, 68, 255);
+            else bcol = etch_rgba8(16, 185, 129, 235);
+            auto brect = etch_rect_draw_desc_default();
+            brect.rect = bar.bar_bounds;
+            brect.fill = bcol;
+            brect.radius = etch_corners_all(4.0f * scale);
+            brect.continuous_corners = true;
+            etch_draw_rect(&brect);
+        }
+        if (input.canvas_id) etch_end_canvas();
+        return;
+    }
+    if (meta && meta->diagram_kind == InlayDiagramGitGraph && result.node_count > 0u) {
+        static constexpr EtchColor kLaneCols[8] = {
+            {59, 130, 246, 255}, {16, 185, 129, 255}, {245, 158, 11, 255}, {139, 92, 246, 255},
+            {239, 68, 68, 255}, {6, 182, 212, 255}, {236, 72, 153, 255}, {249, 115, 22, 255}
+        };
+        // 1. Branch lane guide lines & badges
+        for (uint32_t bi = 0u; bi < meta->subgraph_count && meta->subgraphs; ++bi) {
+            const auto& sg = meta->subgraphs[bi];
+            const EtchColor lcol = kLaneCols[bi % 8u];
+            const float cy = sg.bounds.y + sg.bounds.h * 0.5f;
+            EtchLineDesc gl = {};
+            gl.from = { sg.bounds.x, cy };
+            gl.to = { sg.bounds.x + sg.bounds.w, cy };
+            gl.color = { lcol.r, lcol.g, lcol.b, uint8_t(dark ? 65u : 85u) };
+            gl.thickness = std::fmax(1.0f, 1.4f * scale);
+            etch_draw_line(&gl);
+            const EtchVec2 tsz = etch_measure_text(sg.title, bold_font, eff_font * 0.82f, 0);
+            auto badge = etch_rect_draw_desc_default();
+            badge.rect = { sg.bounds.x, cy - (tsz.y * 0.5f + 3.0f * scale), tsz.x + 14.0f * scale, tsz.y + 6.0f * scale };
+            badge.fill = { lcol.r, lcol.g, lcol.b, uint8_t(dark ? 45u : 32u) };
+            badge.border_color = lcol;
+            badge.border_width = std::fmax(0.8f, 1.0f * scale);
+            badge.radius = etch_corners_all(badge.rect.h * 0.5f);
+            etch_draw_rect(&badge);
+            draw_label(sg.title, { badge.rect.x + 7.0f * scale, badge.rect.y + 3.0f * scale },
+                       bold_font, eff_font * 0.82f, lcol, ETCH_ALIGN_X_LEFT);
+        }
+        // 2. Commit & merge curves
+        for (uint32_t ei = 0u; ei < result.edge_count; ++ei) {
+            const auto& ed = result.edges[ei];
+            const auto& a = result.nodes[ed.from];
+            const auto& b = result.nodes[ed.to];
+            const EtchColor ecol = kLaneCols[b.rank % 8u];
+            EtchBezierDesc bz = {};
+            bz.p0 = { a.bounds.x + a.bounds.w * 0.5f, a.bounds.y + a.bounds.h * 0.5f };
+            bz.p3 = { b.bounds.x + b.bounds.w * 0.5f, b.bounds.y + b.bounds.h * 0.5f };
+            bz.p1 = { (bz.p0.x + bz.p3.x) * 0.5f, bz.p0.y };
+            bz.p2 = { (bz.p0.x + bz.p3.x) * 0.5f, bz.p3.y };
+            bz.cubic = true;
+            bz.color_start = ecol;
+            bz.color_end = ecol;
+            bz.thickness = std::fmax(1.8f, 2.4f * scale);
+            if (ed.dashed) draw_dashed(bz, scale);
+            else etch_draw_bezier(&bz);
+        }
+        // 3. Commit nodes & captions
+        for (uint32_t ci = 0u; ci < result.node_count; ++ci) {
+            const auto& n = result.nodes[ci];
+            const EtchColor ccol = kLaneCols[n.rank % 8u];
+            auto dot = etch_rect_draw_desc_default();
+            dot.rect = n.bounds;
+            dot.fill = ccol;
+            dot.border_color = theme.bg_surface;
+            dot.border_width = std::fmax(1.5f, 2.0f * scale);
+            dot.radius = etch_corners_all(n.bounds.w * 0.5f);
+            etch_draw_rect(&dot);
+            draw_label(n.label, { n.bounds.x + n.bounds.w * 0.5f, n.bounds.y + n.bounds.h + 4.0f * scale },
+                       body_font, caption_font, theme.text_secondary, ETCH_ALIGN_X_CENTER);
+        }
+        if (input.canvas_id) etch_end_canvas();
+        return;
+    }
+    if (meta && meta->diagram_kind == InlayDiagramMindmap && result.node_count > 0u) {
+        static constexpr EtchColor kDepthCols[6] = {
+            {59, 130, 246, 255}, {16, 185, 129, 255}, {139, 92, 246, 255},
+            {245, 158, 11, 255}, {6, 182, 212, 255}, {236, 72, 153, 255}
+        };
+        for (uint32_t ei = 0u; ei < result.edge_count; ++ei) {
+            const auto& ed = result.edges[ei];
+            const auto& a = result.nodes[ed.from];
+            const auto& b = result.nodes[ed.to];
+            const EtchColor ecol = kDepthCols[b.rank % 6u];
+            EtchBezierDesc bz = {};
+            bz.p0 = { a.bounds.x + a.bounds.w, a.bounds.y + a.bounds.h * 0.5f };
+            bz.p3 = { b.bounds.x, b.bounds.y + b.bounds.h * 0.5f };
+            const float mx = (bz.p0.x + bz.p3.x) * 0.5f;
+            bz.p1 = { mx, bz.p0.y };
+            bz.p2 = { mx, bz.p3.y };
+            bz.cubic = true;
+            bz.color_start = { ecol.r, ecol.g, ecol.b, 200u };
+            bz.color_end = bz.color_start;
+            bz.thickness = std::fmax(1.4f, 1.9f * scale);
+            etch_draw_bezier(&bz);
+        }
+        for (uint32_t ni = 0u; ni < result.node_count; ++ni) {
+            const auto& n = result.nodes[ni];
+            const EtchColor ncol = kDepthCols[n.rank % 6u];
+            const bool is_root = (n.rank == 0u);
+            auto pill = etch_rect_draw_desc_default();
+            pill.rect = n.bounds;
+            pill.fill = is_root ? ncol : EtchColor{ ncol.r, ncol.g, ncol.b, uint8_t(dark ? 42u : 28u) };
+            pill.border_color = ncol;
+            pill.border_width = std::fmax(1.0f, 1.35f * scale);
+            pill.radius = etch_corners_all(is_root ? (n.bounds.h * 0.5f) : (8.0f * scale));
+            pill.continuous_corners = true;
+            etch_draw_rect(&pill);
+            const uint16_t f = is_root ? bold_font : body_font;
+            const float fsz = is_root ? (eff_font * 1.05f) : (eff_font * 0.92f);
+            const EtchVec2 tsz = etch_measure_text(n.label, f, fsz, 0);
+            draw_label(n.label, { n.bounds.x + n.bounds.w * 0.5f, n.bounds.y + (n.bounds.h - tsz.y) * 0.5f },
+                       f, fsz, is_root ? EtchColor{255, 255, 255, 255} : theme.text_primary, ETCH_ALIGN_X_CENTER);
+        }
+        if (input.canvas_id) etch_end_canvas();
+        return;
+    }
+    if (meta && meta->diagram_kind == InlayDiagramTimeline && result.node_count > 0u) {
+        static constexpr EtchColor kColCols[6] = {
+            {59, 130, 246, 255}, {16, 185, 129, 255}, {139, 92, 246, 255},
+            {245, 158, 11, 255}, {6, 182, 212, 255}, {236, 72, 153, 255}
+        };
+        if (meta->title.length > 0u) {
+            draw_label(meta->title, { input.pos.x + result.width * 0.5f, input.pos.y + 8.0f * scale },
+                       bold_font, eff_font * 1.08f, theme.text_primary, ETCH_ALIGN_X_CENTER);
+        }
+        for (uint32_t si = 0u; si < meta->subgraph_count && meta->subgraphs; ++si) {
+            const auto& sg = meta->subgraphs[si];
+            if (!sg.has_nodes) continue;
+            auto sb = etch_rect_draw_desc_default();
+            sb.rect = sg.bounds;
+            sb.fill = { theme.surface_subtle.r, theme.surface_subtle.g, theme.surface_subtle.b, uint8_t(dark ? 120u : 180u) };
+            sb.radius = etch_corners_all(5.0f * scale);
+            etch_draw_rect(&sb);
+            draw_label(sg.title, { sg.bounds.x + sg.bounds.w * 0.5f, sg.bounds.y + 3.0f * scale },
+                       bold_font, eff_font * 0.86f, theme.text_secondary, ETCH_ALIGN_X_CENTER);
+        }
+        // Horizontal timeline axis connecting period headers
+        float axis_y = 0.0f, axis_x0 = 1e9f, axis_x1 = -1e9f;
+        for (uint32_t i = 0u; i < result.node_count; ++i) {
+            if (meta->shapes && meta->shapes[i] == InlayShapeRound) {
+                const auto& b = result.nodes[i].bounds;
+                axis_y = b.y + b.h * 0.5f;
+                if (b.x < axis_x0) axis_x0 = b.x;
+                if (b.x + b.w > axis_x1) axis_x1 = b.x + b.w;
+            }
+        }
+        if (axis_x1 > axis_x0) {
+            EtchLineDesc ax = {};
+            ax.from = { axis_x0, axis_y };
+            ax.to = { axis_x1 + 10.0f * scale, axis_y };
+            ax.color = theme.border_control.a ? theme.border_control : theme.border_line;
+            ax.thickness = std::fmax(1.5f, 2.0f * scale);
+            etch_draw_line(&ax);
+        }
+        for (uint32_t i = 0u; i < result.node_count; ++i) {
+            const auto& n = result.nodes[i];
+            const EtchColor ccol = kColCols[n.rank % 6u];
+            const bool is_hdr = meta->shapes && meta->shapes[i] == InlayShapeRound;
+            auto r = etch_rect_draw_desc_default();
+            r.rect = n.bounds;
+            r.fill = is_hdr ? ccol : theme.bg_elevated;
+            r.border_color = is_hdr ? ccol : EtchColor{ ccol.r, ccol.g, ccol.b, 160u };
+            r.border_width = std::fmax(1.0f, 1.2f * scale);
+            r.radius = etch_corners_all(is_hdr ? (n.bounds.h * 0.5f) : (6.0f * scale));
+            r.continuous_corners = true;
+            etch_draw_rect(&r);
+            const uint16_t f = is_hdr ? bold_font : body_font;
+            const float fsz = eff_font * 0.9f;
+            const EtchVec2 tsz = etch_measure_text(n.label, f, fsz, 0);
+            draw_label(n.label, { n.bounds.x + n.bounds.w * 0.5f, n.bounds.y + (n.bounds.h - tsz.y) * 0.5f },
+                       f, fsz, is_hdr ? EtchColor{255, 255, 255, 255} : theme.text_primary, ETCH_ALIGN_X_CENTER);
+        }
+        if (input.canvas_id) etch_end_canvas();
+        return;
     }
 
     // 1. Subgraph cluster frames (outer before inner).
@@ -1520,7 +2930,29 @@ void inlay_diagram_draw_ex(const InlayDiagramResult& result, const InlayDiagramD
         const auto& n = result.nodes[i];
         const InlayDiagramShape shape = (meta && meta->shapes) ? meta->shapes[i] : InlayShapeRect;
         const auto tsz = measure_label(n.label, body_font, eff_font);
-        if (shape == InlayShapeDiamond) {
+        if (shape == InlayShapeStateStart || shape == InlayShapeStateEnd) {
+            const float r = n.bounds.w * 0.5f;
+            auto outer = etch_rect_draw_desc_default();
+            outer.rect = n.bounds;
+            outer.radius = etch_corners_all(r);
+            if (shape == InlayShapeStateStart) {
+                outer.fill = theme.text_primary;
+                etch_draw_rect(&outer);
+            } else {
+                outer.fill = theme.bg_elevated;
+                outer.border_color = theme.text_primary;
+                outer.border_width = std::fmax(1.5f, 2.0f * scale);
+                etch_draw_rect(&outer);
+                const float inset = std::fmax(3.5f, n.bounds.w * 0.24f);
+                auto inner = etch_rect_draw_desc_default();
+                inner.rect = { n.bounds.x + inset, n.bounds.y + inset,
+                               std::fmax(2.0f, n.bounds.w - 2.0f * inset),
+                               std::fmax(2.0f, n.bounds.h - 2.0f * inset) };
+                inner.fill = theme.text_primary;
+                inner.radius = etch_corners_all(inner.rect.w * 0.5f);
+                etch_draw_rect(&inner);
+            }
+        } else if (shape == InlayShapeDiamond) {
             const float cx = n.bounds.x + n.bounds.w * 0.5f;
             const float cy = n.bounds.y + n.bounds.h * 0.5f;
             const float sy_off = 2.0f * scale;
@@ -1595,8 +3027,40 @@ void inlay_diagram_draw_ex(const InlayDiagramResult& result, const InlayDiagramD
             rect.radius = etch_corners_all(base_r);
             rect.continuous_corners = cont;
             etch_draw_rect(&rect);
-            draw_label(n.label, { n.bounds.x + n.bounds.w * 0.5f, n.bounds.y + (n.bounds.h - tsz.y) * 0.5f },
-                       body_font, eff_font, theme.text_primary, ETCH_ALIGN_X_CENTER);
+            if (shape == InlayShapeClassBox) {
+                uint32_t nl = UINT32_MAX;
+                for (uint32_t ci = 0u; ci < n.label.length; ++ci) {
+                    if (n.label.chars[ci] == '\n') { nl = ci; break; }
+                }
+                const float line_h = std::fmax(etch_font_metrics(body_font, eff_font).line_height, eff_font * 1.25f);
+                if (nl != UINT32_MAX) {
+                    const EtchStr hdr = { n.label.chars, nl, false };
+                    const EtchStr members = { n.label.chars + nl + 1u, n.label.length - (nl + 1u), false };
+                    const float hdr_h = line_h + 14.0f * scale;
+                    auto hband = etch_rect_draw_desc_default();
+                    hband.rect = { n.bounds.x + border_w, n.bounds.y + border_w,
+                                   std::fmax(0.0f, n.bounds.w - 2.0f * border_w), std::fmax(0.0f, hdr_h - border_w) };
+                    hband.fill = { theme.accent.r, theme.accent.g, theme.accent.b, uint8_t(dark ? 44u : 28u) };
+                    hband.radius = { base_r, base_r, 0.0f, 0.0f };
+                    etch_draw_rect(&hband);
+                    EtchLineDesc sep = {};
+                    sep.from = { n.bounds.x, n.bounds.y + hdr_h };
+                    sep.to = { n.bounds.x + n.bounds.w, n.bounds.y + hdr_h };
+                    sep.color = theme.border_node;
+                    sep.thickness = border_w;
+                    etch_draw_line(&sep);
+                    draw_label(hdr, { n.bounds.x + n.bounds.w * 0.5f, n.bounds.y + 7.0f * scale },
+                               bold_font, eff_font, theme.text_primary, ETCH_ALIGN_X_CENTER);
+                    draw_label(members, { n.bounds.x + 12.0f * scale, n.bounds.y + hdr_h + 6.0f * scale },
+                               body_font, eff_font * 0.92f, theme.text_secondary, ETCH_ALIGN_X_LEFT);
+                } else {
+                    draw_label(n.label, { n.bounds.x + n.bounds.w * 0.5f, n.bounds.y + (n.bounds.h - tsz.y) * 0.5f },
+                               bold_font, eff_font, theme.text_primary, ETCH_ALIGN_X_CENTER);
+                }
+            } else {
+                draw_label(n.label, { n.bounds.x + n.bounds.w * 0.5f, n.bounds.y + (n.bounds.h - tsz.y) * 0.5f },
+                           body_font, eff_font, theme.text_primary, ETCH_ALIGN_X_CENTER);
+            }
         }
     }
     if (input.canvas_id) etch_end_canvas();
@@ -1668,6 +3132,208 @@ INLAY_API uint32_t inlay_diagram_export_svg(EtchStr source, const InlayDiagramDe
                   "<marker id=\"arrow-rev\" viewBox=\"0 0 10 10\" refX=\"9\" refY=\"5\" markerWidth=\"7\" markerHeight=\"7\" orient=\"auto-start-reverse\">"
                   "<path d=\"M 0 1 L 10 5 L 0 9 z\" fill=\"#8b5cf6\"/></marker>\n"
                   "</defs>\n");
+
+    // Specialized SVG output for Pie and Gantt diagrams
+    if (meta.diagram_kind == InlayDiagramPie && meta.pie_slices && meta.pie_slice_count > 0u) {
+        static constexpr const char* kPieHex[8] = {
+            "#3b82f6", "#10b981", "#f59e0b", "#ef4444", "#8b5cf6", "#06b6d4", "#f97316", "#ec4899"
+        };
+        if (meta.title.length > 0u) {
+            svg_emit_diagram_label(&out, meta.title, desc.pos.x + result.width * 0.5f + ox, desc.pos.y + 8.0f * scale + oy,
+                                   env.line_height(bold_font, eff_font * 1.08f), eff_font * 1.08f, "#0f172a", "600", "middle");
+        }
+        const float cx = meta.pie_center.x + ox, cy = meta.pie_center.y + oy, r = meta.pie_radius;
+        for (uint32_t i = 0u; i < meta.pie_slice_count; ++i) {
+            const auto& sl = meta.pie_slices[i];
+            const char* hex = kPieHex[sl.color_index % 8u];
+            if (sl.sweep_rad >= 6.27f) {
+                out.write_lit("<circle cx=\""); out.write_num(cx); out.write_lit("\" cy=\""); out.write_num(cy);
+                out.write_lit("\" r=\""); out.write_num(r); out.write_lit("\" fill=\""); out.write_lit(hex); out.write_lit("\"/>\n");
+            } else {
+                const float x0 = cx + std::cos(sl.start_rad) * r;
+                const float y0 = cy + std::sin(sl.start_rad) * r;
+                const float x1 = cx + std::cos(sl.start_rad + sl.sweep_rad) * r;
+                const float y1 = cy + std::sin(sl.start_rad + sl.sweep_rad) * r;
+                const int large_arc = (sl.sweep_rad > 3.14159265f) ? 1 : 0;
+                out.write_lit("<path d=\"M "); out.write_num(cx); out.write_lit(" "); out.write_num(cy);
+                out.write_lit(" L "); out.write_num(x0); out.write_lit(" "); out.write_num(y0);
+                out.write_lit(" A "); out.write_num(r); out.write_lit(" "); out.write_num(r);
+                out.write_lit(large_arc ? " 0 1 1 " : " 0 0 1 ");
+                out.write_num(x1); out.write_lit(" "); out.write_num(y1);
+                out.write_lit(" Z\" fill=\""); out.write_lit(hex); out.write_lit("\" stroke=\"#ffffff\" stroke-width=\"1.5\"/>\n");
+            }
+            if (i < result.node_count) {
+                const auto& nr = result.nodes[i];
+                const float sw = 10.0f * scale;
+                out.write_lit("<rect x=\""); out.write_num(nr.bounds.x + ox);
+                out.write_lit("\" y=\""); out.write_num(nr.bounds.y + (nr.bounds.h - sw) * 0.5f + oy);
+                out.write_lit("\" width=\""); out.write_num(sw); out.write_lit("\" height=\""); out.write_num(sw);
+                out.write_lit("\" rx=\"2.5\" fill=\""); out.write_lit(hex); out.write_lit("\"/>\n");
+                svg_emit_diagram_label(&out, nr.label, nr.bounds.x + sw + 7.0f * scale + ox, nr.bounds.y + oy,
+                                       env.line_height(body_font, eff_font * 0.9f), eff_font * 0.9f, "#0f172a", nullptr, "start");
+            }
+        }
+        out.write_lit("</svg>\n");
+        heap.destroy();
+        if (out_buf && cap > 0u) out_buf[out.len < cap - 1u ? out.len : (cap - 1u)] = '\0';
+        return out.len;
+    }
+    if (meta.diagram_kind == InlayDiagramGantt && meta.gantt_bars && meta.gantt_bar_count > 0u) {
+        if (meta.title.length > 0u) {
+            svg_emit_diagram_label(&out, meta.title, desc.pos.x + result.width * 0.5f + ox, desc.pos.y + 8.0f * scale + oy,
+                                   env.line_height(bold_font, eff_font * 1.08f), eff_font * 1.08f, "#0f172a", "600", "middle");
+        }
+        const float sec_h = eff_font * 1.45f + 6.0f * scale;
+        for (uint32_t i = 0u; i < meta.gantt_bar_count && i < result.node_count; ++i) {
+            const auto& nr = result.nodes[i];
+            const auto& bar = meta.gantt_bars[i];
+            if (bar.section_first && bar.section.length > 0u) {
+                out.write_lit("<rect x=\""); out.write_num(nr.bounds.x + ox);
+                out.write_lit("\" y=\""); out.write_num(nr.bounds.y - sec_h + 2.0f * scale + oy);
+                out.write_lit("\" width=\""); out.write_num(nr.bounds.w);
+                out.write_lit("\" height=\""); out.write_num(sec_h - 4.0f * scale);
+                out.write_lit("\" rx=\"4\" fill=\"#f1f5f9\"/>\n");
+                svg_emit_diagram_label(&out, bar.section, nr.bounds.x + 8.0f * scale + ox, nr.bounds.y - sec_h + 4.0f * scale + oy,
+                                       env.line_height(bold_font, eff_font * 0.88f), eff_font * 0.88f, "#475569", "600", "start");
+            }
+            svg_emit_diagram_label(&out, nr.label, nr.bounds.x + 6.0f * scale + ox, nr.bounds.y + 2.0f * scale + oy,
+                                   env.line_height(body_font, eff_font * 0.92f), eff_font * 0.92f, "#0f172a", nullptr, "start");
+            const char* bhex = (bar.status == 1u) ? "#64748b" : (bar.status == 2u ? "#3b82f6" : (bar.status == 3u ? "#ef4444" : "#10b981"));
+            out.write_lit("<rect x=\""); out.write_num(bar.bar_bounds.x + ox);
+            out.write_lit("\" y=\""); out.write_num(bar.bar_bounds.y + oy);
+            out.write_lit("\" width=\""); out.write_num(bar.bar_bounds.w);
+            out.write_lit("\" height=\""); out.write_num(bar.bar_bounds.h);
+            out.write_lit("\" rx=\"4\" fill=\""); out.write_lit(bhex); out.write_lit("\"/>\n");
+        }
+        out.write_lit("</svg>\n");
+        heap.destroy();
+        if (out_buf && cap > 0u) out_buf[out.len < cap - 1u ? out.len : (cap - 1u)] = '\0';
+        return out.len;
+    }
+    if (meta.diagram_kind == InlayDiagramGitGraph && result.node_count > 0u) {
+        static constexpr const char* kLaneHex[8] = {
+            "#3b82f6", "#10b981", "#f59e0b", "#8b5cf6", "#ef4444", "#06b6d4", "#ec4899", "#f97316"
+        };
+        for (uint32_t bi = 0u; bi < meta.subgraph_count && meta.subgraphs; ++bi) {
+            const auto& sg = meta.subgraphs[bi];
+            const char* hex = kLaneHex[bi % 8u];
+            const float cy = sg.bounds.y + sg.bounds.h * 0.5f + oy;
+            out.write_lit("<line x1=\""); out.write_num(sg.bounds.x + ox);
+            out.write_lit("\" y1=\""); out.write_num(cy);
+            out.write_lit("\" x2=\""); out.write_num(sg.bounds.x + sg.bounds.w + ox);
+            out.write_lit("\" y2=\""); out.write_num(cy);
+            out.write_lit("\" stroke=\""); out.write_lit(hex);
+            out.write_lit("\" stroke-opacity=\"0.35\" stroke-width=\"1.5\"/>\n");
+            svg_emit_diagram_label(&out, sg.title, sg.bounds.x + 6.0f * scale + ox, cy - eff_font * 0.5f,
+                                   env.line_height(bold_font, eff_font * 0.82f), eff_font * 0.82f, hex, "600", "start");
+        }
+        for (uint32_t ei = 0u; ei < result.edge_count; ++ei) {
+            const auto& ed = result.edges[ei];
+            const auto& a = result.nodes[ed.from];
+            const auto& b = result.nodes[ed.to];
+            EtchBezierDesc bz = {};
+            bz.p0 = { a.bounds.x + a.bounds.w * 0.5f, a.bounds.y + a.bounds.h * 0.5f };
+            bz.p3 = { b.bounds.x + b.bounds.w * 0.5f, b.bounds.y + b.bounds.h * 0.5f };
+            bz.p1 = { (bz.p0.x + bz.p3.x) * 0.5f, bz.p0.y };
+            bz.p2 = { (bz.p0.x + bz.p3.x) * 0.5f, bz.p3.y };
+            svg_emit_bezier_polyline(&out, bz, ox, oy, kLaneHex[b.rank % 8u], std::fmax(1.8f, 2.2f * scale), ed.dashed, nullptr, nullptr);
+        }
+        for (uint32_t ci = 0u; ci < result.node_count; ++ci) {
+            const auto& n = result.nodes[ci];
+            const float cx = n.bounds.x + n.bounds.w * 0.5f + ox;
+            const float cy = n.bounds.y + n.bounds.h * 0.5f + oy;
+            out.write_lit("<circle cx=\""); out.write_num(cx); out.write_lit("\" cy=\""); out.write_num(cy);
+            out.write_lit("\" r=\""); out.write_num(n.bounds.w * 0.5f);
+            out.write_lit("\" fill=\""); out.write_lit(kLaneHex[n.rank % 8u]);
+            out.write_lit("\" stroke=\"#ffffff\" stroke-width=\"2\"/>\n");
+            svg_emit_diagram_label(&out, n.label, cx, n.bounds.y + n.bounds.h + 4.0f * scale + oy,
+                                   env.line_height(body_font, caption_font), caption_font, "#334155", nullptr, "middle");
+        }
+        out.write_lit("</svg>\n");
+        heap.destroy();
+        if (out_buf && cap > 0u) out_buf[out.len < cap - 1u ? out.len : (cap - 1u)] = '\0';
+        return out.len;
+    }
+    if (meta.diagram_kind == InlayDiagramMindmap && result.node_count > 0u) {
+        static constexpr const char* kDepthHex[6] = {
+            "#3b82f6", "#10b981", "#8b5cf6", "#f59e0b", "#06b6d4", "#ec4899"
+        };
+        for (uint32_t ei = 0u; ei < result.edge_count; ++ei) {
+            const auto& ed = result.edges[ei];
+            const auto& a = result.nodes[ed.from];
+            const auto& b = result.nodes[ed.to];
+            EtchBezierDesc bz = {};
+            bz.p0 = { a.bounds.x + a.bounds.w, a.bounds.y + a.bounds.h * 0.5f };
+            bz.p3 = { b.bounds.x, b.bounds.y + b.bounds.h * 0.5f };
+            const float mx = (bz.p0.x + bz.p3.x) * 0.5f;
+            bz.p1 = { mx, bz.p0.y }; bz.p2 = { mx, bz.p3.y };
+            svg_emit_bezier_polyline(&out, bz, ox, oy, kDepthHex[b.rank % 6u], std::fmax(1.4f, 1.8f * scale), false, nullptr, nullptr);
+        }
+        for (uint32_t ni = 0u; ni < result.node_count; ++ni) {
+            const auto& n = result.nodes[ni];
+            const char* hex = kDepthHex[n.rank % 6u];
+            const bool is_root = (n.rank == 0u);
+            const float rad = is_root ? (n.bounds.h * 0.5f) : (8.0f * scale);
+            out.write_lit("<rect x=\""); out.write_num(n.bounds.x + ox);
+            out.write_lit("\" y=\""); out.write_num(n.bounds.y + oy);
+            out.write_lit("\" width=\""); out.write_num(n.bounds.w);
+            out.write_lit("\" height=\""); out.write_num(n.bounds.h);
+            out.write_lit("\" rx=\""); out.write_num(rad);
+            out.write_lit("\" fill=\""); out.write_lit(is_root ? hex : "#f8fafc");
+            out.write_lit("\" stroke=\""); out.write_lit(hex); out.write_lit("\" stroke-width=\"1.4\"/>\n");
+            const float fsz = is_root ? (eff_font * 1.05f) : (eff_font * 0.92f);
+            const float lh = env.line_height(is_root ? bold_font : body_font, fsz);
+            svg_emit_diagram_label(&out, n.label, n.bounds.x + n.bounds.w * 0.5f + ox,
+                                   n.bounds.y + (n.bounds.h - lh) * 0.5f + oy, lh, fsz,
+                                   is_root ? "#ffffff" : "#0f172a", is_root ? "600" : nullptr, "middle");
+        }
+        out.write_lit("</svg>\n");
+        heap.destroy();
+        if (out_buf && cap > 0u) out_buf[out.len < cap - 1u ? out.len : (cap - 1u)] = '\0';
+        return out.len;
+    }
+    if (meta.diagram_kind == InlayDiagramTimeline && result.node_count > 0u) {
+        static constexpr const char* kColHex[6] = {
+            "#3b82f6", "#10b981", "#8b5cf6", "#f59e0b", "#06b6d4", "#ec4899"
+        };
+        if (meta.title.length > 0u) {
+            svg_emit_diagram_label(&out, meta.title, desc.pos.x + result.width * 0.5f + ox, desc.pos.y + 8.0f * scale + oy,
+                                   env.line_height(bold_font, eff_font * 1.08f), eff_font * 1.08f, "#0f172a", "600", "middle");
+        }
+        for (uint32_t si = 0u; si < meta.subgraph_count && meta.subgraphs; ++si) {
+            const auto& sg = meta.subgraphs[si];
+            if (!sg.has_nodes) continue;
+            out.write_lit("<rect x=\""); out.write_num(sg.bounds.x + ox);
+            out.write_lit("\" y=\""); out.write_num(sg.bounds.y + oy);
+            out.write_lit("\" width=\""); out.write_num(sg.bounds.w);
+            out.write_lit("\" height=\""); out.write_num(sg.bounds.h);
+            out.write_lit("\" rx=\"5\" fill=\"#f1f5f9\"/>\n");
+            svg_emit_diagram_label(&out, sg.title, sg.bounds.x + sg.bounds.w * 0.5f + ox, sg.bounds.y + 3.0f * scale + oy,
+                                   env.line_height(bold_font, eff_font * 0.86f), eff_font * 0.86f, "#475569", "600", "middle");
+        }
+        for (uint32_t i = 0u; i < result.node_count; ++i) {
+            const auto& n = result.nodes[i];
+            const char* hex = kColHex[n.rank % 6u];
+            const bool is_hdr = meta.shapes && meta.shapes[i] == InlayShapeRound;
+            const float rad = is_hdr ? (n.bounds.h * 0.5f) : (6.0f * scale);
+            out.write_lit("<rect x=\""); out.write_num(n.bounds.x + ox);
+            out.write_lit("\" y=\""); out.write_num(n.bounds.y + oy);
+            out.write_lit("\" width=\""); out.write_num(n.bounds.w);
+            out.write_lit("\" height=\""); out.write_num(n.bounds.h);
+            out.write_lit("\" rx=\""); out.write_num(rad);
+            out.write_lit("\" fill=\""); out.write_lit(is_hdr ? hex : "#ffffff");
+            out.write_lit("\" stroke=\""); out.write_lit(hex); out.write_lit("\" stroke-width=\"1.2\"/>\n");
+            const float fsz = eff_font * 0.9f;
+            const float lh = env.line_height(is_hdr ? bold_font : body_font, fsz);
+            svg_emit_diagram_label(&out, n.label, n.bounds.x + n.bounds.w * 0.5f + ox,
+                                   n.bounds.y + (n.bounds.h - lh) * 0.5f + oy, lh, fsz,
+                                   is_hdr ? "#ffffff" : "#0f172a", is_hdr ? "600" : nullptr, "middle");
+        }
+        out.write_lit("</svg>\n");
+        heap.destroy();
+        if (out_buf && cap > 0u) out_buf[out.len < cap - 1u ? out.len : (cap - 1u)] = '\0';
+        return out.len;
+    }
 
     // 1. Subgraphs
     if (meta.subgraphs && meta.subgraph_count > 0u) {
@@ -1835,6 +3501,25 @@ INLAY_API uint32_t inlay_diagram_export_svg(EtchStr source, const InlayDiagramDe
         const EtchVec2 tsz = measure_label_env(n.label, body_font, eff_font, env, &n_lh);
         const float cx = n.bounds.x + n.bounds.w * 0.5f + ox;
         const float cy = n.bounds.y + n.bounds.h * 0.5f + oy;
+        if (shape == InlayShapeStateStart || shape == InlayShapeStateEnd) {
+            const float r = n.bounds.w * 0.5f;
+            if (shape == InlayShapeStateStart) {
+                out.write_lit("<circle cx=\""); out.write_num(cx);
+                out.write_lit("\" cy=\""); out.write_num(cy);
+                out.write_lit("\" r=\""); out.write_num(r);
+                out.write_lit("\" fill=\"#0f172a\"/>\n");
+            } else {
+                out.write_lit("<circle cx=\""); out.write_num(cx);
+                out.write_lit("\" cy=\""); out.write_num(cy);
+                out.write_lit("\" r=\""); out.write_num(r);
+                out.write_lit("\" fill=\"#ffffff\" stroke=\"#0f172a\" stroke-width=\"2\"/>\n");
+                out.write_lit("<circle cx=\""); out.write_num(cx);
+                out.write_lit("\" cy=\""); out.write_num(cy);
+                out.write_lit("\" r=\""); out.write_num(r * 0.52f);
+                out.write_lit("\" fill=\"#0f172a\"/>\n");
+            }
+            continue;
+        }
         if (shape == InlayShapeDiamond) {
             out.write_lit("<polygon points=\"");
             out.write_num(cx); out.write_lit(","); out.write_num(n.bounds.y + oy); out.write_lit(" ");
@@ -1849,6 +3534,36 @@ INLAY_API uint32_t inlay_diagram_export_svg(EtchStr source, const InlayDiagramDe
             out.write_lit("\" r=\""); out.write_num(n.bounds.w * 0.5f);
             out.write_lit("\" fill=\"#ffffff\" stroke=\"#94a3b8\" stroke-width=\"");
             out.write_num(border_w); out.write_lit("\"/>\n");
+        } else if (shape == InlayShapeClassBox) {
+            const float rad = 6.0f * scale;
+            out.write_lit("<rect x=\""); out.write_num(n.bounds.x + ox);
+            out.write_lit("\" y=\""); out.write_num(n.bounds.y + oy);
+            out.write_lit("\" width=\""); out.write_num(n.bounds.w);
+            out.write_lit("\" height=\""); out.write_num(n.bounds.h);
+            out.write_lit("\" rx=\""); out.write_num(rad);
+            out.write_lit("\" ry=\""); out.write_num(rad);
+            out.write_lit("\" fill=\"#ffffff\" stroke=\"#94a3b8\" stroke-width=\"");
+            out.write_num(border_w); out.write_lit("\"/>\n");
+            uint32_t nl = UINT32_MAX;
+            for (uint32_t ci = 0u; ci < n.label.length; ++ci) {
+                if (n.label.chars[ci] == '\n') { nl = ci; break; }
+            }
+            if (nl != UINT32_MAX) {
+                const EtchStr hdr = { n.label.chars, nl, false };
+                const EtchStr members = { n.label.chars + nl + 1u, n.label.length - (nl + 1u), false };
+                const float hdr_h = n_lh + 14.0f * scale;
+                out.write_lit("<line x1=\""); out.write_num(n.bounds.x + ox);
+                out.write_lit("\" y1=\""); out.write_num(n.bounds.y + hdr_h + oy);
+                out.write_lit("\" x2=\""); out.write_num(n.bounds.x + n.bounds.w + ox);
+                out.write_lit("\" y2=\""); out.write_num(n.bounds.y + hdr_h + oy);
+                out.write_lit("\" stroke=\"#cbd5e1\" stroke-width=\""); out.write_num(border_w); out.write_lit("\"/>\n");
+                svg_emit_diagram_label(&out, hdr, cx, n.bounds.y + 7.0f * scale + oy, n_lh, eff_font, "#0f172a", "600", "middle");
+                svg_emit_diagram_label(&out, members, n.bounds.x + 12.0f * scale + ox, n.bounds.y + hdr_h + 6.0f * scale + oy,
+                                       n_lh, eff_font * 0.92f, "#334155", nullptr, "start");
+            } else {
+                svg_emit_diagram_label(&out, n.label, cx, cy - tsz.y * 0.5f, n_lh, eff_font, "#0f172a", "600", "middle");
+            }
+            continue;
         } else {
             const float rad = (shape == InlayShapeRound) ? (n.bounds.h * 0.5f) : (6.0f * scale);
             out.write_lit("<rect x=\""); out.write_num(n.bounds.x + ox);

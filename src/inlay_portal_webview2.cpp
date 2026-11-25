@@ -6,11 +6,17 @@ struct InlayPortalHostHooks {
                                          bool is_new_window) noexcept;
   void (*on_web_message)(void *ctx, EtchStr msg) noexcept;
   bool (*on_perm_check)(void *ctx, EtchStr origin, EtchStr perm_kind) noexcept;
+  void (*on_title_changed)(void *ctx, EtchStr title) noexcept;
+  void (*on_loading_changed)(void *ctx, bool is_loading) noexcept;
+  void (*on_source_changed)(void *ctx, EtchStr url) noexcept;
+  void (*on_favicon_changed)(void *ctx, EtchStr favicon_url) noexcept;
   void *ctx;
 };
 #endif
 void inlay_portal_webview2_set_hooks(void *backend,
                                      const InlayPortalHostHooks *hooks) noexcept;
+bool inlay_portal_webview2_set_zoom(void *backend, float zoom_factor) noexcept;
+bool inlay_portal_webview2_inject_mouse_button(void *backend, EtchVec2 local_pos, uint8_t button, bool down) noexcept;
 #if defined(_WIN32) && INLAY_ENABLE_PORTAL_WEBVIEW2
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -38,6 +44,12 @@ HRESULT on_navigation_starting(WebPortal *p, ICoreWebView2NavigationStartingEven
 HRESULT on_new_window_requested(WebPortal *p, ICoreWebView2NewWindowRequestedEventArgs *args) noexcept;
 HRESULT on_web_message_received(WebPortal *p, ICoreWebView2WebMessageReceivedEventArgs *args) noexcept;
 HRESULT on_permission_requested(WebPortal *p, ICoreWebView2PermissionRequestedEventArgs *args) noexcept;
+HRESULT on_document_title_changed(WebPortal *p) noexcept;
+HRESULT on_navigation_completed(WebPortal *p) noexcept;
+HRESULT on_source_changed(WebPortal *p) noexcept;
+#ifdef __ICoreWebView2_15_INTERFACE_DEFINED__
+HRESULT on_favicon_changed(WebPortal *p) noexcept;
+#endif
 
 struct EnvironmentHandler final : ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler {
   WebPortal *owner;
@@ -190,6 +202,94 @@ struct PermissionHandler final : ICoreWebView2PermissionRequestedEventHandler {
   }
 };
 
+struct TitleChangedHandler final : ICoreWebView2DocumentTitleChangedEventHandler {
+  WebPortal *owner;
+  explicit TitleChangedHandler(WebPortal *o) noexcept : owner(o) {}
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id, void **out) override {
+    if (!out)
+      return E_POINTER;
+    *out = nullptr;
+    if (!IsEqualIID(id, IID_IUnknown) &&
+        !IsEqualIID(id, IID_ICoreWebView2DocumentTitleChangedEventHandler))
+      return E_NOINTERFACE;
+    *out = static_cast<ICoreWebView2DocumentTitleChangedEventHandler *>(this);
+    AddRef();
+    return S_OK;
+  }
+  ULONG STDMETHODCALLTYPE AddRef() override { return retain(owner); }
+  ULONG STDMETHODCALLTYPE Release() override { return release(owner); }
+  HRESULT STDMETHODCALLTYPE Invoke(ICoreWebView2 *, IUnknown *) override {
+    return on_document_title_changed(owner);
+  }
+};
+
+struct NavCompletedHandler final : ICoreWebView2NavigationCompletedEventHandler {
+  WebPortal *owner;
+  explicit NavCompletedHandler(WebPortal *o) noexcept : owner(o) {}
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id, void **out) override {
+    if (!out)
+      return E_POINTER;
+    *out = nullptr;
+    if (!IsEqualIID(id, IID_IUnknown) &&
+        !IsEqualIID(id, IID_ICoreWebView2NavigationCompletedEventHandler))
+      return E_NOINTERFACE;
+    *out = static_cast<ICoreWebView2NavigationCompletedEventHandler *>(this);
+    AddRef();
+    return S_OK;
+  }
+  ULONG STDMETHODCALLTYPE AddRef() override { return retain(owner); }
+  ULONG STDMETHODCALLTYPE Release() override { return release(owner); }
+  HRESULT STDMETHODCALLTYPE Invoke(ICoreWebView2 *,
+                                   ICoreWebView2NavigationCompletedEventArgs *) override {
+    return on_navigation_completed(owner);
+  }
+};
+
+struct SourceChangedHandler final : ICoreWebView2SourceChangedEventHandler {
+  WebPortal *owner;
+  explicit SourceChangedHandler(WebPortal *o) noexcept : owner(o) {}
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id, void **out) override {
+    if (!out)
+      return E_POINTER;
+    *out = nullptr;
+    if (!IsEqualIID(id, IID_IUnknown) &&
+        !IsEqualIID(id, IID_ICoreWebView2SourceChangedEventHandler))
+      return E_NOINTERFACE;
+    *out = static_cast<ICoreWebView2SourceChangedEventHandler *>(this);
+    AddRef();
+    return S_OK;
+  }
+  ULONG STDMETHODCALLTYPE AddRef() override { return retain(owner); }
+  ULONG STDMETHODCALLTYPE Release() override { return release(owner); }
+  HRESULT STDMETHODCALLTYPE Invoke(ICoreWebView2 *,
+                                   ICoreWebView2SourceChangedEventArgs *) override {
+    return on_source_changed(owner);
+  }
+};
+
+#ifdef __ICoreWebView2_15_INTERFACE_DEFINED__
+struct FaviconChangedHandler final : ICoreWebView2FaviconChangedEventHandler {
+  WebPortal *owner;
+  explicit FaviconChangedHandler(WebPortal *o) noexcept : owner(o) {}
+  HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id, void **out) override {
+    if (!out)
+      return E_POINTER;
+    *out = nullptr;
+    if (!IsEqualIID(id, IID_IUnknown) &&
+        !IsEqualIID(id, IID_ICoreWebView2FaviconChangedEventHandler))
+      return E_NOINTERFACE;
+    *out = static_cast<ICoreWebView2FaviconChangedEventHandler *>(this);
+    AddRef();
+    return S_OK;
+  }
+  ULONG STDMETHODCALLTYPE AddRef() override { return retain(owner); }
+  ULONG STDMETHODCALLTYPE Release() override { return release(owner); }
+  HRESULT STDMETHODCALLTYPE Invoke(ICoreWebView2 *, IUnknown *) override {
+    return on_favicon_changed(owner);
+  }
+};
+#endif
+
 struct WebPortal {
   EnvironmentHandler environment_handler;
   ControllerHandler controller_handler;
@@ -198,6 +298,14 @@ struct WebPortal {
   NewWindowHandler new_window_handler;
   WebMessageHandler web_message_handler;
   PermissionHandler perm_requested_handler;
+  TitleChangedHandler title_changed_handler;
+  NavCompletedHandler nav_completed_handler;
+  SourceChangedHandler source_changed_handler;
+#ifdef __ICoreWebView2_15_INTERFACE_DEFINED__
+  FaviconChangedHandler favicon_changed_handler;
+  EventRegistrationToken favicon_changed_token;
+  bool has_favicon_changed;
+#endif
   volatile LONG references;
   DWORD com_thread;
   HWND parent;
@@ -217,9 +325,16 @@ struct WebPortal {
   EventRegistrationToken new_window_token;
   EventRegistrationToken web_message_token;
   EventRegistrationToken perm_requested_token;
+  EventRegistrationToken title_changed_token;
+  EventRegistrationToken nav_completed_token;
+  EventRegistrationToken source_changed_token;
   bool has_nav_starting, has_new_window, has_web_message, has_perm_requested;
+  bool has_title_changed, has_nav_completed, has_source_changed;
   InlayPortalHostHooks hooks;
   wchar_t *navigation;
+  wchar_t **pending_init_scripts;
+  uint32_t pending_init_count, pending_init_cap;
+  double pending_zoom;
   bool html, closed, com_initialized, disable_dcomp, using_dcomp;
   void (*completed)(void *, int32_t);
   void *user;
@@ -240,6 +355,14 @@ struct WebPortal {
         new_window_handler(this),
         web_message_handler(this),
         perm_requested_handler(this),
+        title_changed_handler(this),
+        nav_completed_handler(this),
+        source_changed_handler(this),
+#ifdef __ICoreWebView2_15_INTERFACE_DEFINED__
+        favicon_changed_handler(this),
+        favicon_changed_token{},
+        has_favicon_changed(false),
+#endif
         references(1),
         com_thread(0),
         parent(nullptr),
@@ -259,12 +382,22 @@ struct WebPortal {
         new_window_token{},
         web_message_token{},
         perm_requested_token{},
+        title_changed_token{},
+        nav_completed_token{},
+        source_changed_token{},
         has_nav_starting(false),
         has_new_window(false),
         has_web_message(false),
         has_perm_requested(false),
+        has_title_changed(false),
+        has_nav_completed(false),
+        has_source_changed(false),
         hooks{},
         navigation(nullptr),
+        pending_init_scripts(nullptr),
+        pending_init_count(0),
+        pending_init_cap(0),
+        pending_zoom(1.0),
         html(false),
         closed(false),
         com_initialized(false),
@@ -390,6 +523,12 @@ ULONG release(WebPortal *p) noexcept {
       p->environment = nullptr;
     }
     std::free(p->navigation);
+    for (uint32_t i = 0u; i < p->pending_init_count; ++i)
+      std::free(p->pending_init_scripts[i]);
+    std::free(p->pending_init_scripts);
+    p->pending_init_scripts = nullptr;
+    p->pending_init_count = 0u;
+    p->pending_init_cap = 0u;
     if (p->loader)
       FreeLibrary(p->loader);
     if (p->com_initialized && GetCurrentThreadId() == p->com_thread)
@@ -569,6 +708,18 @@ const char *permission_kind_name(COREWEBVIEW2_PERMISSION_KIND kind) noexcept {
 void attach_web_events(WebPortal *p) noexcept {
   if (!p->web)
     return;
+  if (p->pending_init_count > 0u) {
+    for (uint32_t i = 0u; i < p->pending_init_count; ++i) {
+      if (p->pending_init_scripts[i]) {
+        (void)p->web->AddScriptToExecuteOnDocumentCreated(p->pending_init_scripts[i], nullptr);
+        std::free(p->pending_init_scripts[i]);
+      }
+    }
+    std::free(p->pending_init_scripts);
+    p->pending_init_scripts = nullptr;
+    p->pending_init_count = 0u;
+    p->pending_init_cap = 0u;
+  }
   if (!p->has_nav_starting &&
       SUCCEEDED(p->web->add_NavigationStarting(&p->nav_starting_handler,
                                                &p->nav_starting_token)))
@@ -585,6 +736,31 @@ void attach_web_events(WebPortal *p) noexcept {
       SUCCEEDED(p->web->add_PermissionRequested(&p->perm_requested_handler,
                                                 &p->perm_requested_token)))
     p->has_perm_requested = true;
+  if (!p->has_title_changed &&
+      SUCCEEDED(p->web->add_DocumentTitleChanged(&p->title_changed_handler,
+                                                 &p->title_changed_token)))
+    p->has_title_changed = true;
+  if (!p->has_nav_completed &&
+      SUCCEEDED(p->web->add_NavigationCompleted(&p->nav_completed_handler,
+                                                &p->nav_completed_token)))
+    p->has_nav_completed = true;
+  if (!p->has_source_changed &&
+      SUCCEEDED(p->web->add_SourceChanged(&p->source_changed_handler,
+                                          &p->source_changed_token)))
+    p->has_source_changed = true;
+#ifdef __ICoreWebView2_15_INTERFACE_DEFINED__
+  if (!p->has_favicon_changed) {
+    ICoreWebView2_15 *web15 = nullptr;
+    if (SUCCEEDED(p->web->QueryInterface(IID_ICoreWebView2_15, reinterpret_cast<void **>(&web15))) && web15) {
+      if (SUCCEEDED(web15->add_FaviconChanged(&p->favicon_changed_handler, &p->favicon_changed_token))) {
+        p->has_favicon_changed = true;
+      }
+      web15->Release();
+    }
+  }
+#endif
+  if (p->controller && p->pending_zoom > 0.0 && p->pending_zoom != 1.0)
+    (void)p->controller->put_ZoomFactor(p->pending_zoom);
 }
 
 void detach_web_events(WebPortal *p) noexcept {
@@ -606,6 +782,28 @@ void detach_web_events(WebPortal *p) noexcept {
     p->web->remove_PermissionRequested(p->perm_requested_token);
     p->has_perm_requested = false;
   }
+  if (p->has_title_changed) {
+    p->web->remove_DocumentTitleChanged(p->title_changed_token);
+    p->has_title_changed = false;
+  }
+  if (p->has_nav_completed) {
+    p->web->remove_NavigationCompleted(p->nav_completed_token);
+    p->has_nav_completed = false;
+  }
+  if (p->has_source_changed) {
+    p->web->remove_SourceChanged(p->source_changed_token);
+    p->has_source_changed = false;
+  }
+#ifdef __ICoreWebView2_15_INTERFACE_DEFINED__
+  if (p->has_favicon_changed) {
+    ICoreWebView2_15 *web15 = nullptr;
+    if (SUCCEEDED(p->web->QueryInterface(IID_ICoreWebView2_15, reinterpret_cast<void **>(&web15))) && web15) {
+      web15->remove_FaviconChanged(p->favicon_changed_token);
+      web15->Release();
+    }
+    p->has_favicon_changed = false;
+  }
+#endif
 }
 
 HRESULT on_navigation_starting(
@@ -630,8 +828,11 @@ HRESULT on_navigation_starting(
   const EtchStr url = {url_utf8 ? url_utf8 : "", url_len, false};
   const InlayPortalNavDecision decision = check(ctx, url, false);
   std::free(url_utf8);
-  if (decision != INLAY_PORTAL_NAV_ALLOW)
+  if (decision != INLAY_PORTAL_NAV_ALLOW) {
     args->put_Cancel(TRUE);
+  } else if (p->hooks.on_loading_changed) {
+    p->hooks.on_loading_changed(ctx, true);
+  }
   return S_OK;
 }
 
@@ -728,6 +929,65 @@ HRESULT on_permission_requested(
                           : COREWEBVIEW2_PERMISSION_STATE_DENY);
   return S_OK;
 }
+
+HRESULT on_document_title_changed(WebPortal *p) noexcept {
+  if (p->closed || !p->web || !p->hooks.on_title_changed)
+    return S_OK;
+  LPWSTR wtitle = nullptr;
+  if (SUCCEEDED(p->web->get_DocumentTitle(&wtitle)) && wtitle) {
+    uint32_t len = 0u;
+    char *utf8 = narrow_utf8(wtitle, &len);
+    CoTaskMemFree(wtitle);
+    p->hooks.on_title_changed(p->hooks.ctx, {utf8 ? utf8 : "", len, false});
+    std::free(utf8);
+  }
+  return S_OK;
+}
+
+HRESULT on_navigation_completed(WebPortal *p) noexcept {
+  if (p->closed)
+    return S_OK;
+  if (p->hooks.on_loading_changed)
+    p->hooks.on_loading_changed(p->hooks.ctx, false);
+  (void)on_document_title_changed(p);
+  return S_OK;
+}
+
+HRESULT on_source_changed(WebPortal *p) noexcept {
+  if (p->closed || !p->web || !p->hooks.on_source_changed)
+    return S_OK;
+  LPWSTR wsrc = nullptr;
+  if (SUCCEEDED(p->web->get_Source(&wsrc)) && wsrc) {
+    uint32_t len = 0u;
+    char *utf8 = narrow_utf8(wsrc, &len);
+    CoTaskMemFree(wsrc);
+    if (utf8 && len > 0u)
+      p->hooks.on_source_changed(p->hooks.ctx, {utf8, len, false});
+    std::free(utf8);
+  }
+  return S_OK;
+}
+
+#ifdef __ICoreWebView2_15_INTERFACE_DEFINED__
+HRESULT on_favicon_changed(WebPortal *p) noexcept {
+  if (p->closed || !p->web || !p->hooks.on_favicon_changed)
+    return S_OK;
+  ICoreWebView2_15 *web15 = nullptr;
+  if (SUCCEEDED(p->web->QueryInterface(IID_ICoreWebView2_15, reinterpret_cast<void **>(&web15))) && web15) {
+    LPWSTR wfav = nullptr;
+    if (SUCCEEDED(web15->get_FaviconUri(&wfav)) && wfav) {
+      uint32_t len = 0u;
+      char *utf8 = narrow_utf8(wfav, &len);
+      CoTaskMemFree(wfav);
+      if (utf8 && len > 0u)
+        p->hooks.on_favicon_changed(p->hooks.ctx, {utf8, len, false});
+      std::free(utf8);
+    }
+    web15->Release();
+  }
+  return S_OK;
+}
+#endif
 
 HRESULT navigate(WebPortal *p) noexcept {
   if (!p->navigation || !p->web)
@@ -1055,6 +1315,36 @@ void inject_wheel(void *b, EtchVec2 delta) {
   }
 }
 
+void inject_key(void *b, uint32_t key, bool down, uint16_t mods) {
+  (void)mods;
+  auto *p = static_cast<WebPortal *>(b);
+  if (!p || p->closed || !p->controller) return;
+  if (down) (void)p->controller->MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
+  HWND child = find_webview_child(p);
+  if (child) {
+    WPARAM vk = static_cast<WPARAM>(key);
+    if (key >= 'a' && key <= 'z') vk = static_cast<WPARAM>(key - ('a' - 'A'));
+    else if (key == 13u) vk = VK_RETURN;
+    else if (key == 27u) vk = VK_ESCAPE;
+    else if (key == 8u) vk = VK_BACK;
+    else if (key == 9u) vk = VK_TAB;
+    PostMessageW(child, down ? WM_KEYDOWN : WM_KEYUP, vk, 0);
+  }
+}
+
+void inject_text(void *b, EtchStr text) {
+  auto *p = static_cast<WebPortal *>(b);
+  if (!p || p->closed || !p->controller || !text.chars || text.length == 0u) return;
+  HWND child = find_webview_child(p);
+  if (!child) return;
+  wchar_t *ws = wide(text.chars, text.length);
+  if (!ws) return;
+  for (size_t i = 0u; ws[i] != 0; ++i) {
+    PostMessageW(child, WM_CHAR, static_cast<WPARAM>(ws[i]), 0);
+  }
+  std::free(ws);
+}
+
 void set_radius(void *b, float radius_px) {
   auto *p = static_cast<WebPortal *>(b);
   p->radius_logical = (std::isfinite(radius_px) && radius_px > 0.f) ? radius_px : 0.f;
@@ -1069,9 +1359,34 @@ void bounds(void *b, EtchRect rect, EtchRect clip) {
 
 const InlayPortalBackendVTable api = {
     create,  destroy,        load_url,     load_html, resize,
-    poll,    inject_pointer, inject_wheel, nullptr,   nullptr,
+    poll,    inject_pointer, inject_wheel, inject_key, inject_text,
     nullptr, bounds,         ack,          set_radius};
 } // namespace
+
+bool inlay_portal_webview2_inject_mouse_button(void *b, EtchVec2 local_pos, uint8_t button, bool down) noexcept {
+  auto *p = static_cast<WebPortal *>(b);
+  if (!p || p->closed || !p->using_dcomp || !p->comp_controller || button < 1u || button > 3u)
+    return false;
+  if (button == 1u) {
+    inject_pointer(b, local_pos, down);
+    return true;
+  }
+  const float bw = static_cast<float>(p->bounds.right - p->bounds.left);
+  const float bh = static_cast<float>(p->bounds.bottom - p->bounds.top);
+  const float sx = p->portal_width ? (bw / static_cast<float>(p->portal_width)) : 1.f;
+  const float sy = p->portal_height ? (bh / static_cast<float>(p->portal_height)) : 1.f;
+  const POINT pt = {static_cast<LONG>(std::lround(local_pos.x * sx)),
+                    static_cast<LONG>(std::lround(local_pos.y * sy))};
+  p->last_mouse_pt = pt;
+  p->has_mouse_pt = true;
+  const auto kind = (button == 2u)
+      ? (down ? COREWEBVIEW2_MOUSE_EVENT_KIND_MIDDLE_BUTTON_DOWN : COREWEBVIEW2_MOUSE_EVENT_KIND_MIDDLE_BUTTON_UP)
+      : (down ? COREWEBVIEW2_MOUSE_EVENT_KIND_RIGHT_BUTTON_DOWN : COREWEBVIEW2_MOUSE_EVENT_KIND_RIGHT_BUTTON_UP);
+  const auto vkeys = down
+      ? (button == 2u ? COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS_MIDDLE_BUTTON : COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS_RIGHT_BUTTON)
+      : COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS_NONE;
+  return SUCCEEDED(p->comp_controller->SendMouseInput(kind, vkeys, 0u, pt));
+}
 
 bool inlay_portal_webview2_post_message(void *backend, EtchStr msg) noexcept {
   if (!backend || !msg.chars || msg.length == 0u || msg.length > 65536u ||
@@ -1117,6 +1432,66 @@ void inlay_portal_webview2_set_hooks(void *backend,
     p->hooks = {};
 }
 
+bool inlay_portal_webview2_eval_script(void *backend, EtchStr script) noexcept {
+  if (!backend || !script.chars || script.length == 0u || script.length > 65536u ||
+      std::memchr(script.chars, 0, script.length))
+    return false;
+  auto *p = static_cast<WebPortal *>(backend);
+  if (p->closed || !p->web)
+    return false;
+  wchar_t *ws = wide(script.chars, script.length);
+  if (!ws)
+    return false;
+  const HRESULT hr = p->web->ExecuteScript(ws, nullptr);
+  std::free(ws);
+  return SUCCEEDED(hr);
+}
+
+bool inlay_portal_webview2_add_init_script(void *backend, EtchStr script) noexcept {
+  if (!backend || !script.chars || script.length == 0u || script.length > 65536u ||
+      std::memchr(script.chars, 0, script.length))
+    return false;
+  auto *p = static_cast<WebPortal *>(backend);
+  if (p->closed)
+    return false;
+  wchar_t *ws = wide(script.chars, script.length);
+  if (!ws)
+    return false;
+  if (p->web) {
+    const HRESULT hr = p->web->AddScriptToExecuteOnDocumentCreated(ws, nullptr);
+    std::free(ws);
+    return SUCCEEDED(hr);
+  }
+  if (!inlay_grow_pod(p->pending_init_scripts, p->pending_init_cap,
+                      p->pending_init_count + 1u, 4u, 64u)) {
+    std::free(ws);
+    return false;
+  }
+  p->pending_init_scripts[p->pending_init_count++] = ws;
+  return true;
+}
+
+bool inlay_portal_webview2_open_devtools(void *backend) noexcept {
+  if (!backend)
+    return false;
+  auto *p = static_cast<WebPortal *>(backend);
+  if (p->closed || !p->web)
+    return false;
+  return SUCCEEDED(p->web->OpenDevToolsWindow());
+}
+
+bool inlay_portal_webview2_set_zoom(void *backend, float zoom_factor) noexcept {
+  if (!backend || !std::isfinite(zoom_factor) || zoom_factor <= 0.0f)
+    return false;
+  auto *p = static_cast<WebPortal *>(backend);
+  if (p->closed)
+    return false;
+  p->pending_zoom = static_cast<double>(zoom_factor);
+  if (p->controller)
+    return SUCCEEDED(p->controller->put_ZoomFactor(p->pending_zoom));
+  return true;
+}
+
 extern "C" INLAY_API const InlayPortalBackendVTable *
 inlay_portal_webview2_backend(void) {
   return &api;
@@ -1127,6 +1502,26 @@ bool inlay_portal_webview2_post_message(void *, EtchStr) noexcept {
 }
 
 bool inlay_portal_webview2_nav_action(void *, int) noexcept {
+  return false;
+}
+
+bool inlay_portal_webview2_eval_script(void *, EtchStr) noexcept {
+  return false;
+}
+
+bool inlay_portal_webview2_add_init_script(void *, EtchStr) noexcept {
+  return false;
+}
+
+bool inlay_portal_webview2_open_devtools(void *) noexcept {
+  return false;
+}
+
+bool inlay_portal_webview2_set_zoom(void *, float) noexcept {
+  return false;
+}
+
+bool inlay_portal_webview2_inject_mouse_button(void *, EtchVec2, uint8_t, bool) noexcept {
   return false;
 }
 

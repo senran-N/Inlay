@@ -12,6 +12,9 @@ using PortalDirtyRect=InlayPortalDirtyRect;
 using PortalBackendVTable=InlayPortalBackendVTable;
 using PortalStats=InlayPortalStats;
 using PortalWebView2Options=InlayPortalWebView2Options;
+using PortalMacOSOptions=InlayPortalMacOSOptions;
+using PortalGtkOptions=InlayPortalGtkOptions;
+using PortalFindResult=InlayPortalFindResult;
 using Surface=InlaySurface;
 using SurfaceDesc=InlaySurfaceDesc;
 using SurfaceViewDesc=InlaySurfaceViewDesc;
@@ -54,6 +57,10 @@ using TaskToggleFn=InlayTaskToggleFn;
 using CustomFenceEstimateFn=InlayCustomFenceEstimateFn;
 using CustomFenceRenderFn=InlayCustomFenceRenderFn;
 using CodeHeaderFn=InlayCodeHeaderFn;
+using CodeHighlightToken=InlayCodeHighlightToken;
+using CodeHighlightFn=InlayCodeHighlightFn;
+using TerminalSnapshot=InlayTerminalSnapshot;
+using TerminalReadFn=InlayTerminalReadFn;
 using SlotMeasureFn=InlaySlotMeasureFn;
 using ActionPermission=InlayActionPermission;
 using ActionPolicy=InlayActionPolicy;
@@ -77,7 +84,14 @@ using PortalNavDecision=InlayPortalNavDecision;
 using PortalNavFn=InlayPortalNavFn;
 using PortalMessageFn=InlayPortalMessageFn;
 using PortalPermissionFn=InlayPortalPermissionFn;
+using PortalState=InlayPortalState;
+using PortalStateChangeFn=InlayPortalStateChangeFn;
 using PortalPolicy=InlayPortalPolicy;
+using ConsoleLevel=InlayConsoleLevel;
+using ConsoleFn=InlayConsoleFn;
+using StorageGetFn=InlayStorageGetFn;
+using StorageSetFn=InlayStorageSetFn;
+using StorageRemoveFn=InlayStorageRemoveFn;
 
 inline uint32_t abi_version() noexcept { return inlay_abi_version(); }
 inline EtchContext* to_c_context(etch::Context* ctx) noexcept {
@@ -148,6 +162,9 @@ inline void doc_view_scroll_to_bottom(uint32_t view_id,bool stop_momentum=true) 
 inline DocSelection doc_view_selection(const Doc* doc,uint32_t view_id) noexcept {
  return inlay_doc_view_selection(doc,view_id);
 }
+inline bool doc_view_selection_rect(const Doc* doc,uint32_t view_id,EtchRect* out_rect) noexcept {
+ return inlay_doc_view_selection_rect(doc,view_id,out_rect);
+}
 inline DocSelection doc_view_find_text(const Doc* doc,uint32_t view_id,EtchStr query,uint32_t from_byte=0u) noexcept {
  return inlay_doc_view_find_text(doc,view_id,query,from_byte);
 }
@@ -193,6 +210,71 @@ inline bool surface_bind_document(Surface* s, EtchStr name, Doc* doc) noexcept {
 inline bool surface_bind_text_buffer(Surface* s, EtchStr name, EtchTextBuffer* buffer) noexcept {
  return inlay_surface_bind_text_buffer(s, name, buffer);
 }
+inline TerminalSnapshot terminal_snapshot_default() noexcept { return inlay_terminal_snapshot_default(); }
+inline bool surface_bind_terminal(Surface* s, EtchStr name, TerminalReadFn read_fn, void* user_data=nullptr) noexcept {
+ return inlay_surface_bind_terminal(s, name, read_fn, user_data);
+}
+inline bool surface_bind_portal(Surface* s, EtchStr name, Portal* portal) noexcept {
+ return inlay_surface_bind_portal(s, name, portal);
+}
+inline bool surface_bind_stream(Surface* s, EtchStr name, Stream* stream) noexcept {
+ return inlay_surface_bind_stream(s, name, stream);
+}
+inline void surface_set_console_callback(Surface* s, ConsoleFn fn, void* user_data=nullptr) noexcept {
+ inlay_surface_set_console_callback(s, fn, user_data);
+}
+inline void surface_set_storage_hooks(Surface* s, StorageGetFn get_fn, StorageSetFn set_fn,
+ StorageRemoveFn remove_fn, void* user_data=nullptr) noexcept {
+ inlay_surface_set_storage_hooks(s, get_fn, set_fn, remove_fn, user_data);
+}
+inline void surface_set_code_tokenizer(Surface* s, EtchSyntaxTokenizeFn fn, void* user_data=nullptr) noexcept {
+ inlay_surface_set_code_tokenizer(s, fn, user_data);
+}
+inline void surface_set_doc_hooks(Surface* s, CodeHighlightFn hl_fn, void* hl_user=nullptr,
+ CustomFenceEstimateFn fence_est=nullptr, CustomFenceRenderFn fence_ren=nullptr, void* fence_user=nullptr) noexcept {
+ inlay_surface_set_doc_hooks(s, hl_fn, hl_user, fence_est, fence_ren, fence_user);
+}
+inline bool surface_register_module(Surface* s, EtchStr module_name, EtchStr source_utf8) noexcept {
+ return inlay_surface_register_module(s, module_name, source_utf8);
+}
+inline bool surface_unregister_module(Surface* s, EtchStr module_name) noexcept {
+ return inlay_surface_unregister_module(s, module_name);
+}
+inline bool portal_eval_script(Portal* p, EtchStr script_utf8) noexcept {
+ return inlay_portal_eval_script(p, script_utf8);
+}
+inline bool portal_add_init_script(Portal* p, EtchStr script_utf8) noexcept {
+ return inlay_portal_add_init_script(p, script_utf8);
+}
+inline bool portal_open_devtools(Portal* p) noexcept {
+ return inlay_portal_open_devtools(p);
+}
+inline bool portal_capture_preview_rgba(Portal* p, uint8_t* out_rgba, uint32_t width, uint32_t height) noexcept {
+ return inlay_portal_capture_preview_rgba(p, out_rgba, width, height);
+}
+inline PortalState portal_state_default() noexcept { return inlay_portal_state_default(); }
+inline bool portal_state(const Portal* p,PortalState* out_state) noexcept {
+ return inlay_portal_state(p,out_state);
+}
+inline bool portal_set_zoom(Portal* p,float zoom_factor) noexcept {
+ return inlay_portal_set_zoom(p,zoom_factor);
+}
+inline bool portal_find_in_page(Portal* p,EtchStr query,bool forward=true,bool match_case=false) noexcept {
+ return inlay_portal_find_in_page(p,query,forward,match_case);
+}
+inline bool portal_stop_find(Portal* p) noexcept {
+ return inlay_portal_stop_find(p);
+}
+inline PortalFindResult portal_find_result_default() noexcept { return inlay_portal_find_result_default(); }
+inline bool portal_find_status(const Portal* p,PortalFindResult* out_result) noexcept {
+ return inlay_portal_find_status(p,out_result);
+}
+inline bool portal_inject_mouse_button(Portal* p,EtchVec2 screen_pos,uint8_t button,bool down) noexcept {
+ return inlay_portal_inject_mouse_button(p,screen_pos,button,down);
+}
+inline PortalMacOSOptions portal_macos_options_default() noexcept { return inlay_portal_macos_options_default(); }
+inline PortalGtkOptions portal_gtk_options_default() noexcept { return inlay_portal_gtk_options_default(); }
+inline const PortalBackendVTable* portal_native_backend() noexcept { return inlay_portal_native_backend(); }
 inline bool surface_set_image_resolver(Surface* s, ImageResolverFn fn, void* user_data=nullptr) noexcept {
  return inlay_surface_set_image_resolver(s, fn, user_data);
 }

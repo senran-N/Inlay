@@ -1393,6 +1393,1307 @@ struct JsxTranspiler {
     }
 };
 
+// ============================================================================
+// Zero-Dependency Line-Preserving TypeScript Type Erasure (TS / TSX -> JS / JSX)
+// ============================================================================
+
+static bool is_ts_ident_kw(const char* s, size_t n, const char* lit) noexcept {
+    const size_t ln = std::strlen(lit);
+    return n == ln && std::memcmp(s, lit, ln) == 0;
+}
+
+static bool has_ts_candidate(const char* src, size_t len) noexcept {
+    for (size_t i = 0u; i < len; ++i) {
+        const char c = src[i];
+        if (c == ':' || c == '<') return true;
+        if (c == '!' && i + 1u < len && (src[i + 1u] == '.' || src[i + 1u] == '[' || src[i + 1u] == '(' || src[i + 1u] == ':')) return true;
+        if (c == '?' && i + 1u < len && (src[i + 1u] == ',' || src[i + 1u] == ')' || src[i + 1u] == ':')) return true;
+        if (is_ident_start(c) && (i == 0u || !is_ident_part(src[i - 1u]))) {
+            size_t j = i + 1u;
+            while (j < len && is_ident_part(src[j])) ++j;
+            const size_t n = j - i;
+            if (is_ts_ident_kw(src + i, n, "interface") ||
+                is_ts_ident_kw(src + i, n, "type") ||
+                is_ts_ident_kw(src + i, n, "declare") ||
+                is_ts_ident_kw(src + i, n, "implements") ||
+                is_ts_ident_kw(src + i, n, "readonly") ||
+                is_ts_ident_kw(src + i, n, "satisfies") ||
+                is_ts_ident_kw(src + i, n, "as") ||
+                is_ts_ident_kw(src + i, n, "public") ||
+                is_ts_ident_kw(src + i, n, "private") ||
+                is_ts_ident_kw(src + i, n, "protected") ||
+                is_ts_ident_kw(src + i, n, "override") ||
+                is_ts_ident_kw(src + i, n, "abstract")) {
+                return true;
+            }
+            i = j - 1u;
+        }
+    }
+    return false;
+}
+
+struct TsStripper {
+    const char* src;
+    size_t len;
+    char* out; // Same length as src; erased non-newline chars become ' '.
+    bool modified;
+    uint32_t depth;
+
+    void erase_span(size_t a, size_t b) noexcept {
+        if (a >= b || a >= len) return;
+        if (b > len) b = len;
+        for (size_t i = a; i < b; ++i) {
+            if (out[i] != '\n' && out[i] != '\r') {
+                if (out[i] != ' ') {
+                    out[i] = ' ';
+                    modified = true;
+                }
+            }
+        }
+    }
+
+    size_t skip_ws_comments(size_t p, bool* saw_nl = nullptr) const noexcept {
+        if (saw_nl) *saw_nl = false;
+        while (p < len) {
+            const char c = src[p];
+            if (c == ' ' || c == '\t' || c == '\r' || c == '\f' || c == '\v') { ++p; continue; }
+            if (c == '\n') { if (saw_nl) *saw_nl = true; ++p; continue; }
+            if (c == '/' && p + 1u < len && src[p + 1u] == '/') {
+                p += 2u;
+                while (p < len && src[p] != '\n') ++p;
+                continue;
+            }
+            if (c == '/' && p + 1u < len && src[p + 1u] == '*') {
+                p += 2u;
+                while (p + 1u < len && !(src[p] == '*' && src[p + 1u] == '/')) {
+                    if (src[p] == '\n' && saw_nl) *saw_nl = true;
+                    ++p;
+                }
+                p = (p + 1u < len) ? (p + 2u) : len;
+                continue;
+            }
+            break;
+        }
+        return p;
+    }
+
+    size_t skip_string(size_t p) const noexcept {
+        if (p >= len) return p;
+        const char q = src[p++];
+        while (p < len) {
+            if (src[p] == '\\' && p + 1u < len) { p += 2u; continue; }
+            if (src[p] == q) return p + 1u;
+            ++p;
+        }
+        return len;
+    }
+
+    size_t skip_regex(size_t p) const noexcept {
+        if (p >= len || src[p] != '/') return p;
+        ++p;
+        bool in_class = false;
+        while (p < len) {
+            const char c = src[p++];
+            if (c == '\\' && p < len) { ++p; continue; }
+            if (c == '[') { in_class = true; continue; }
+            if (c == ']') { in_class = false; continue; }
+            if (c == '\n') return p;
+            if (c == '/' && !in_class) {
+                while (p < len && is_ascii_alpha(src[p])) ++p;
+                return p;
+            }
+        }
+        return len;
+    }
+
+    size_t skip_template(size_t p) const noexcept {
+        if (p >= len || src[p] != '`') return p;
+        ++p;
+        while (p < len) {
+            const char c = src[p++];
+            if (c == '\\' && p < len) { ++p; continue; }
+            if (c == '`') return p;
+            if (c == '$' && p < len && src[p] == '{') {
+                p = skip_balanced(p, '{', '}');
+            }
+        }
+        return len;
+    }
+
+    size_t skip_balanced(size_t p, char open_ch, char close_ch) const noexcept {
+        if (p >= len || src[p] != open_ch) return p;
+        int d = 0;
+        while (p < len) {
+            const char c = src[p];
+            if (c == '\'' || c == '"') { p = skip_string(p); continue; }
+            if (c == '`') { p = skip_template(p); continue; }
+            if (c == '/' && p + 1u < len && (src[p + 1u] == '/' || src[p + 1u] == '*')) {
+                p = skip_ws_comments(p);
+                continue;
+            }
+            if (c == open_ch) ++d;
+            else if (c == close_ch) {
+                --d;
+                if (d == 0) return p + 1u;
+            }
+            ++p;
+        }
+        return len;
+    }
+
+    // Consume a balanced `<...>` generic parameter or argument list starting at `<`.
+    // Returns end offset (after `>`) or SIZE_MAX if invalid / unbalanced.
+    size_t skip_angle_group(size_t p, bool strict_call_args) const noexcept {
+        if (p >= len || src[p] != '<') return SIZE_MAX;
+        int angle = 0, paren = 0, brace = 0, bracket = 0;
+        size_t i = p;
+        while (i < len) {
+            const char c = src[i];
+            if (c == '\'' || c == '"') { i = skip_string(i); continue; }
+            if (c == '`') { i = skip_template(i); continue; }
+            if (c == '/' && i + 1u < len && (src[i + 1u] == '/' || src[i + 1u] == '*')) {
+                i = skip_ws_comments(i);
+                continue;
+            }
+            if (c == '(') { ++paren; ++i; continue; }
+            if (c == ')') { if (paren == 0) return SIZE_MAX; --paren; ++i; continue; }
+            if (c == '{') { ++brace; ++i; continue; }
+            if (c == '}') { if (brace == 0) return SIZE_MAX; --brace; ++i; continue; }
+            if (c == '[') { ++bracket; ++i; continue; }
+            if (c == ']') { if (bracket == 0) return SIZE_MAX; --bracket; ++i; continue; }
+            if (c == '<') { ++angle; ++i; continue; }
+            if (c == '>') {
+                if (i > p && src[i - 1u] == '=' && (paren > 0 || brace > 0 || angle > 0)) {
+                    ++i;
+                    continue; // `=>` inside function type argument
+                }
+                --angle;
+                ++i;
+                if (angle == 0 && paren == 0 && brace == 0 && bracket == 0) return i;
+                continue;
+            }
+            if (strict_call_args && paren == 0 && brace == 0 && bracket == 0) {
+                if (c == ';' || c == '+' || c == '-' || c == '*' || c == '/' || c == '%') return SIZE_MAX;
+                if ((c == '&' || c == '|') && i + 1u < len && src[i + 1u] == c) return SIZE_MAX;
+                if ((c == '=' || c == '!') && i + 1u < len && src[i + 1u] == '=') return SIZE_MAX;
+            }
+            ++i;
+        }
+        return SIZE_MAX;
+    }
+
+    // Consume a TS type expression starting at `p`.
+    size_t skip_type_expr(size_t p, bool stop_at_arrow, bool stop_at_eq, bool stop_at_lbrace_after_primary) const noexcept {
+        if (depth > 96u) return p;
+        size_t cur = skip_ws_comments(p);
+        bool have_primary = false;
+        while (cur < len) {
+            bool saw_nl = false;
+            const size_t next = skip_ws_comments(cur, &saw_nl);
+            if (next >= len) break;
+            const char c = src[next];
+
+            if (!have_primary) {
+                if (c == '|' || c == '&') { cur = next + 1u; continue; }
+                if (c == '(') {
+                    const size_t after_p = skip_balanced(next, '(', ')');
+                    cur = after_p;
+                    const size_t a2 = skip_ws_comments(cur);
+                    if (a2 + 1u < len && src[a2] == '=' && src[a2 + 1u] == '>') {
+                        cur = skip_type_expr(a2 + 2u, stop_at_arrow, stop_at_eq, stop_at_lbrace_after_primary);
+                    }
+                    have_primary = true;
+                    continue;
+                }
+                if (c == '[') {
+                    cur = skip_balanced(next, '[', ']');
+                    have_primary = true;
+                    continue;
+                }
+                if (c == '{') {
+                    cur = skip_balanced(next, '{', '}');
+                    have_primary = true;
+                    continue;
+                }
+                if (c == '<') {
+                    // Generic function type `<T>(x: T) => T`
+                    const size_t ag = skip_angle_group(next, false);
+                    if (ag != SIZE_MAX) {
+                        const size_t ap = skip_ws_comments(ag);
+                        if (ap < len && src[ap] == '(') {
+                            const size_t after_p = skip_balanced(ap, '(', ')');
+                            const size_t ar = skip_ws_comments(after_p);
+                            if (ar + 1u < len && src[ar] == '=' && src[ar + 1u] == '>') {
+                                cur = skip_type_expr(ar + 2u, stop_at_arrow, stop_at_eq, stop_at_lbrace_after_primary);
+                                have_primary = true;
+                                continue;
+                            }
+                        }
+                    }
+                    break;
+                }
+                if (c == '\'' || c == '"') {
+                    cur = skip_string(next);
+                    have_primary = true;
+                    continue;
+                }
+                if (c == '`') {
+                    cur = skip_template(next);
+                    have_primary = true;
+                    continue;
+                }
+                if (is_ascii_digit(c) || (c == '-' && next + 1u < len && is_ascii_digit(src[next + 1u]))) {
+                    cur = scan_number_end(src, len, c == '-' ? next + 1u : next);
+                    have_primary = true;
+                    continue;
+                }
+                if (is_ident_start(c)) {
+                    size_t id_end = next + 1u;
+                    while (id_end < len && is_ident_part(src[id_end])) ++id_end;
+                    const size_t id_len = id_end - next;
+                    if (is_ts_ident_kw(src + next, id_len, "readonly") ||
+                        is_ts_ident_kw(src + next, id_len, "keyof") ||
+                        is_ts_ident_kw(src + next, id_len, "typeof") ||
+                        is_ts_ident_kw(src + next, id_len, "unique") ||
+                        is_ts_ident_kw(src + next, id_len, "infer") ||
+                        is_ts_ident_kw(src + next, id_len, "asserts") ||
+                        is_ts_ident_kw(src + next, id_len, "new")) {
+                        // Prefix type operator: keep expecting primary unless followed by non-type token
+                        const size_t peek_after = skip_ws_comments(id_end);
+                        if (peek_after < len && (is_ident_start(src[peek_after]) || src[peek_after] == '[' ||
+                                                 src[peek_after] == '{' || src[peek_after] == '(' || src[peek_after] == '<')) {
+                            cur = id_end;
+                            continue;
+                        }
+                    }
+                    // Qualified name A.B.C
+                    cur = id_end;
+                    while (true) {
+                        const size_t dot = skip_ws_comments(cur);
+                        if (dot < len && src[dot] == '.' && dot + 1u < len && src[dot + 1u] != '.') {
+                            const size_t sub = skip_ws_comments(dot + 1u);
+                            if (sub < len && is_ident_start(src[sub])) {
+                                cur = sub + 1u;
+                                while (cur < len && is_ident_part(src[cur])) ++cur;
+                                continue;
+                            }
+                        }
+                        break;
+                    }
+                    // Optional generic args `<...>`
+                    const size_t ag_pos = skip_ws_comments(cur);
+                    if (ag_pos < len && src[ag_pos] == '<') {
+                        const size_t ag_end = skip_angle_group(ag_pos, false);
+                        if (ag_end != SIZE_MAX) cur = ag_end;
+                    }
+                    // Type predicate `x is Foo`
+                    bool is_nl = false;
+                    const size_t maybe_is = skip_ws_comments(cur, &is_nl);
+                    if (!is_nl && maybe_is + 2u <= len && src[maybe_is] == 'i' && src[maybe_is + 1u] == 's' &&
+                        (maybe_is + 2u == len || !is_ident_part(src[maybe_is + 2u]))) {
+                        cur = skip_type_expr(maybe_is + 2u, stop_at_arrow, stop_at_eq, stop_at_lbrace_after_primary);
+                    }
+                    have_primary = true;
+                    continue;
+                }
+                break;
+            } else {
+                // Already parsed a primary type; check for postfix/binary continuations.
+                if (c == '[' && !saw_nl) {
+                    cur = skip_balanced(next, '[', ']');
+                    continue;
+                }
+                if (c == '|' && (next + 1u >= len || src[next + 1u] != '|')) {
+                    cur = next + 1u;
+                    have_primary = false;
+                    continue;
+                }
+                if (c == '&' && (next + 1u >= len || src[next + 1u] != '&')) {
+                    cur = next + 1u;
+                    have_primary = false;
+                    continue;
+                }
+                if (c == '=' && next + 1u < len && src[next + 1u] == '>') {
+                    if (stop_at_arrow) break;
+                    cur = next + 2u;
+                    have_primary = false;
+                    continue;
+                }
+                if (c == '=' && stop_at_eq) break;
+                if (c == '{' && stop_at_lbrace_after_primary) break;
+                if (!saw_nl && is_ident_start(c)) {
+                    size_t kw_end = next + 1u;
+                    while (kw_end < len && is_ident_part(src[kw_end])) ++kw_end;
+                    if (is_ts_ident_kw(src + next, kw_end - next, "extends")) {
+                        // Conditional type `A extends B ? C : D`
+                        cur = skip_type_expr(kw_end, stop_at_arrow, stop_at_eq, stop_at_lbrace_after_primary);
+                        const size_t q = skip_ws_comments(cur);
+                        if (q < len && src[q] == '?') {
+                            cur = skip_type_expr(q + 1u, stop_at_arrow, stop_at_eq, stop_at_lbrace_after_primary);
+                            const size_t col = skip_ws_comments(cur);
+                            if (col < len && src[col] == ':') {
+                                cur = skip_type_expr(col + 1u, stop_at_arrow, stop_at_eq, stop_at_lbrace_after_primary);
+                            }
+                        }
+                        continue;
+                    }
+                }
+                break;
+            }
+        }
+        return cur;
+    }
+
+    // Check if `(` at `p` starts an arrow function parameter list `( ... ) =>` or `( ... ): Ret =>`.
+    bool is_arrow_params(size_t p) const noexcept {
+        if (p >= len || src[p] != '(') return false;
+        const size_t close = skip_balanced(p, '(', ')');
+        if (close > len || close == p) return false;
+        const size_t after = skip_ws_comments(close);
+        if (after + 1u < len && src[after] == '=' && src[after + 1u] == '>') return true;
+        if (after < len && src[after] == ':') {
+            const size_t tend = skip_type_expr(after + 1u, true, true, true);
+            const size_t a2 = skip_ws_comments(tend);
+            if (a2 + 1u < len && src[a2] == '=' && src[a2 + 1u] == '>') return true;
+        }
+        return false;
+    }
+
+    // Strip parameter type annotations, optional `?`, and constructor modifiers inside `(...)`.
+    size_t strip_param_list(size_t p) noexcept {
+        if (p >= len || src[p] != '(') return p;
+        size_t i = p + 1u;
+        while (i < len) {
+            i = skip_ws_comments(i);
+            if (i >= len) return len;
+            if (src[i] == ')') return i + 1u;
+            if (src[i] == ',') { ++i; continue; }
+            // Rest `...`
+            if (src[i] == '.' && i + 2u < len && src[i + 1u] == '.' && src[i + 2u] == '.') {
+                i += 3u;
+                i = skip_ws_comments(i);
+            }
+            // Parameter property modifiers (`public`/`private`/`protected`/`readonly`/`override`)
+            while (i < len && is_ident_start(src[i])) {
+                size_t k = i + 1u;
+                while (k < len && is_ident_part(src[k])) ++k;
+                const size_t kn = k - i;
+                if (is_ts_ident_kw(src + i, kn, "public") || is_ts_ident_kw(src + i, kn, "private") ||
+                    is_ts_ident_kw(src + i, kn, "protected") || is_ts_ident_kw(src + i, kn, "readonly") ||
+                    is_ts_ident_kw(src + i, kn, "override")) {
+                    const size_t nxt = skip_ws_comments(k);
+                    if (nxt < len && (is_ident_start(src[nxt]) || src[nxt] == '{' || src[nxt] == '[')) {
+                        erase_span(i, k);
+                        i = nxt;
+                        continue;
+                    }
+                }
+                break;
+            }
+            // Parameter pattern: ident, `{...}`, or `[...]`
+            if (i < len && (src[i] == '{' || src[i] == '[')) {
+                const char oc = src[i];
+                const char cc = (oc == '{') ? '}' : ']';
+                const size_t end_pat = skip_balanced(i, oc, cc);
+                // Strip any TS expressions inside default values within destructuring.
+                if (end_pat > i + 2u && depth < 64u) {
+                    ++depth;
+                    strip_range(i + 1u, end_pat - 1u, false, false);
+                    --depth;
+                }
+                i = end_pat;
+            } else if (i < len && is_ident_start(src[i])) {
+                // Handle TS `this: Foo` fake parameter
+                size_t id_end = i + 1u;
+                while (id_end < len && is_ident_part(src[id_end])) ++id_end;
+                if (is_ts_ident_kw(src + i, id_end - i, "this")) {
+                    const size_t col = skip_ws_comments(id_end);
+                    if (col < len && src[col] == ':') {
+                        size_t tend = skip_type_expr(col + 1u, false, true, true);
+                        const size_t comma = skip_ws_comments(tend);
+                        if (comma < len && src[comma] == ',') tend = comma + 1u;
+                        erase_span(i, tend);
+                        i = tend;
+                        continue;
+                    }
+                }
+                i = id_end;
+            } else {
+                // Unexpected token: bail to matching `)`
+                return skip_balanced(p, '(', ')');
+            }
+            i = skip_ws_comments(i);
+            // Optional `?`
+            if (i < len && src[i] == '?') {
+                erase_span(i, i + 1u);
+                i = skip_ws_comments(i + 1u);
+            }
+            // Type annotation `: Type`
+            if (i < len && src[i] == ':') {
+                const size_t tend = skip_type_expr(i + 1u, false, true, true);
+                erase_span(i, tend);
+                i = skip_ws_comments(tend);
+            }
+            // Default value `= expr`
+            if (i < len && src[i] == '=') {
+                const size_t val_start = i + 1u;
+                int pd = 0, bd = 0, kd = 0;
+                size_t j = val_start;
+                while (j < len) {
+                    const char ch = src[j];
+                    if (ch == '\'' || ch == '"') { j = skip_string(j); continue; }
+                    if (ch == '`') { j = skip_template(j); continue; }
+                    if (ch == '/' && j + 1u < len && (src[j + 1u] == '/' || src[j + 1u] == '*')) {
+                        j = skip_ws_comments(j);
+                        continue;
+                    }
+                    if (ch == '(') ++pd;
+                    else if (ch == ')') { if (pd == 0 && bd == 0 && kd == 0) break; if (pd > 0) --pd; }
+                    else if (ch == '{') ++bd;
+                    else if (ch == '}') { if (bd > 0) --bd; }
+                    else if (ch == '[') ++kd;
+                    else if (ch == ']') { if (kd > 0) --kd; }
+                    else if (ch == ',' && pd == 0 && bd == 0 && kd == 0) break;
+                    ++j;
+                }
+                if (j > val_start && depth < 64u) {
+                    ++depth;
+                    strip_range(val_start, j, false, false);
+                    --depth;
+                }
+                i = j;
+            }
+            i = skip_ws_comments(i);
+            if (i < len && src[i] == ',') ++i;
+            else if (i < len && src[i] == ')') return i + 1u;
+            else break;
+        }
+        return skip_balanced(p, '(', ')');
+    }
+
+    // Pass through a JSX element without corrupting JSX text/attributes, stripping TS inside `{...}`.
+    size_t pass_jsx_element(size_t p, size_t end) noexcept {
+        if (p >= end || src[p] != '<' || depth > 64u) return p;
+        ++depth;
+        size_t i = p + 1u;
+        // Fragment `<>`
+        bool is_frag = false;
+        if (i < end && src[i] == '>') {
+            is_frag = true;
+            ++i;
+        } else {
+            // Tag name (possibly dotted `Ctx.Provider`)
+            if (i >= end || !is_jsx_ident_start(src[i])) { --depth; return p; }
+            while (i < end && (is_jsx_name_part(src[i]) || src[i] == '.' || src[i] == ':')) ++i;
+            // Optional generic type arguments on JSX component `<List<Item> ...>`
+            if (i < end && src[i] == '<') {
+                const size_t ag = skip_angle_group(i, false);
+                if (ag != SIZE_MAX && ag <= end) {
+                    erase_span(i, ag);
+                    i = ag;
+                }
+            }
+            // Tag attributes
+            bool self_closing = false;
+            while (i < end) {
+                i = skip_ws_comments(i);
+                if (i >= end) break;
+                if (src[i] == '/' && i + 1u < end && src[i + 1u] == '>') {
+                    self_closing = true;
+                    i += 2u;
+                    break;
+                }
+                if (src[i] == '>') {
+                    ++i;
+                    break;
+                }
+                if (src[i] == '{') {
+                    const size_t close = skip_balanced(i, '{', '}');
+                    if (close > i + 2u && close <= end) {
+                        strip_range(i + 1u, close - 1u, false, false);
+                    }
+                    i = close < end ? close : end;
+                    continue;
+                }
+                if (src[i] == '\'' || src[i] == '"') {
+                    i = skip_string(i);
+                    continue;
+                }
+                ++i;
+            }
+            if (self_closing) { --depth; return i; }
+        }
+        // Children until matching `</...>`
+        (void)is_frag;
+        while (i < end) {
+            if (src[i] == '<') {
+                if (i + 1u < end && src[i + 1u] == '/') {
+                    // Closing tag
+                    i += 2u;
+                    while (i < end && src[i] != '>') ++i;
+                    if (i < end) ++i;
+                    --depth;
+                    return i;
+                }
+                if (i + 1u < end && (src[i + 1u] == '>' || is_jsx_ident_start(src[i + 1u]))) {
+                    const size_t nxt = pass_jsx_element(i, end);
+                    i = (nxt > i) ? nxt : (i + 1u);
+                    continue;
+                }
+            }
+            if (src[i] == '{') {
+                const size_t close = skip_balanced(i, '{', '}');
+                if (close > i + 2u && close <= end) {
+                    strip_range(i + 1u, close - 1u, false, false);
+                }
+                i = close < end ? close : end;
+                continue;
+            }
+            ++i;
+        }
+        --depth;
+        return i;
+    }
+
+    // Strip a `const`/`let`/`var` binding pattern + optional `: Type` / `!: Type` before `=` / `,` / `;` / `in` / `of`.
+    size_t strip_var_binding(size_t p, size_t end) noexcept {
+        size_t i = skip_ws_comments(p);
+        if (i >= end) return i;
+        if (src[i] == '{' || src[i] == '[') {
+            const char oc = src[i];
+            const char cc = (oc == '{') ? '}' : ']';
+            const size_t bend = skip_balanced(i, oc, cc);
+            if (bend > i + 2u && bend <= end && depth < 64u) {
+                ++depth;
+                strip_range(i + 1u, bend - 1u, false, false);
+                --depth;
+            }
+            i = bend < end ? bend : end;
+        } else if (is_ident_start(src[i])) {
+            while (i < end && is_ident_part(src[i])) ++i;
+        } else {
+            return p;
+        }
+        const size_t after = skip_ws_comments(i);
+        if (after < end && src[after] == '!' && after + 1u < end && src[after + 1u] == ':') {
+            const size_t tend = skip_type_expr(after + 2u, false, true, true);
+            erase_span(after, tend);
+            return tend;
+        }
+        if (after < end && src[after] == ':') {
+            const size_t tend = skip_type_expr(after + 1u, false, true, true);
+            erase_span(after, tend);
+            return tend;
+        }
+        return i;
+    }
+
+    void strip_range(size_t start, size_t end, bool in_class_body, bool in_import_braces) noexcept {
+        size_t i = start;
+        bool expr_expected = true;
+        bool stmt_start = true;
+        bool after_dot = false;
+        bool prev_control_kw = false;
+        bool prev_was_arrow = false;
+        int paren_depth = 0;
+        int brace_depth = 0;
+        int bracket_depth = 0;
+        bool active_var_decl = false;
+        int var_decl_brace = 0;
+        int var_decl_paren = 0;
+        uint8_t paren_ctrl[kMaxParenStack] = {};
+        uint32_t paren_sp = 0u;
+        uint8_t brace_is_expr[kMaxParenStack] = {};
+        uint32_t brace_sp = 0u;
+
+        while (i < end) {
+            const char c = src[i];
+            if (c == ' ' || c == '\t' || c == '\r' || c == '\f' || c == '\v') { ++i; continue; }
+            if (c == '\n') {
+                if (brace_depth == 0 && paren_depth == 0 && bracket_depth == 0 && !expr_expected) {
+                    stmt_start = true;
+                    active_var_decl = false;
+                }
+                ++i;
+                continue;
+            }
+            if (c == '/' && i + 1u < end && src[i + 1u] == '/') {
+                i += 2u;
+                while (i < end && src[i] != '\n') ++i;
+                continue;
+            }
+            if (c == '/' && i + 1u < end && src[i + 1u] == '*') {
+                i += 2u;
+                while (i + 1u < end && !(src[i] == '*' && src[i + 1u] == '/')) ++i;
+                i = (i + 1u < end) ? (i + 2u) : end;
+                continue;
+            }
+            if (c == '\'' || c == '"') {
+                i = skip_string(i);
+                expr_expected = false;
+                stmt_start = false;
+                after_dot = false;
+                prev_control_kw = false;
+                continue;
+            }
+            if (c == '`') {
+                // Scan template literal, stripping TS inside `${...}` expressions
+                ++i;
+                while (i < end) {
+                    const char tc = src[i++];
+                    if (tc == '\\' && i < end) { ++i; continue; }
+                    if (tc == '`') break;
+                    if (tc == '$' && i < end && src[i] == '{') {
+                        const size_t close = skip_balanced(i, '{', '}');
+                        if (close > i + 2u && close <= end && depth < 64u) {
+                            ++depth;
+                            strip_range(i + 1u, close - 1u, false, false);
+                            --depth;
+                        }
+                        i = close < end ? close : end;
+                    }
+                }
+                expr_expected = false;
+                stmt_start = false;
+                after_dot = false;
+                prev_control_kw = false;
+                continue;
+            }
+            if (c == '/' && expr_expected) {
+                i = skip_regex(i);
+                expr_expected = false;
+                stmt_start = false;
+                after_dot = false;
+                prev_control_kw = false;
+                continue;
+            }
+
+            // JSX or generic arrow `<T extends ...>(...) =>` / `<T,>(...) =>` in expression position
+            if (c == '<' && expr_expected) {
+                // First test TSX generic arrow `<T extends ...>(...) =>` or `<T,>(...) =>`
+                const size_t ag = skip_angle_group(i, false);
+                bool handled_generic_arrow = false;
+                if (ag != SIZE_MAX && ag <= end) {
+                    bool has_ts_marker = false;
+                    for (size_t k = i + 1u; k + 1u < ag; ++k) {
+                        if (src[k] == ',' || src[k] == '=') { has_ts_marker = true; break; }
+                        if (k + 7u < ag && std::memcmp(src + k, "extends", 7u) == 0 &&
+                            !is_ident_part(src[k - 1u]) && !is_ident_part(src[k + 7u])) {
+                            has_ts_marker = true;
+                            break;
+                        }
+                    }
+                    const size_t after_ag = skip_ws_comments(ag);
+                    if (has_ts_marker && after_ag < end && is_arrow_params(after_ag)) {
+                        erase_span(i, ag);
+                        i = after_ag;
+                        handled_generic_arrow = true;
+                    }
+                }
+                if (handled_generic_arrow) continue;
+
+                // Otherwise pass through JSX element if it looks like `<>` or `<Tag`
+                if (i + 1u < end && (src[i + 1u] == '>' || is_jsx_ident_start(src[i + 1u]))) {
+                    const size_t jend = pass_jsx_element(i, end);
+                    if (jend > i) {
+                        i = jend;
+                        expr_expected = false;
+                        stmt_start = false;
+                        after_dot = false;
+                        prev_control_kw = false;
+                        continue;
+                    }
+                }
+            }
+
+            // Arrow parameter list `(a: number, b?: string): boolean =>`
+            if (c == '(' && !prev_control_kw && !after_dot && is_arrow_params(i)) {
+                const size_t after_p = strip_param_list(i);
+                i = after_p;
+                const size_t col = skip_ws_comments(i);
+                if (col < end && src[col] == ':') {
+                    const size_t tend = skip_type_expr(col + 1u, true, true, true);
+                    erase_span(col, tend);
+                    i = tend;
+                }
+                expr_expected = false;
+                stmt_start = false;
+                after_dot = false;
+                prev_control_kw = false;
+                continue;
+            }
+
+            // Inside `import { type Foo, bar, type Baz as B }`
+            if (in_import_braces && is_ident_start(c)) {
+                size_t id_end = i + 1u;
+                while (id_end < end && is_ident_part(src[id_end])) ++id_end;
+                if (is_ts_ident_kw(src + i, id_end - i, "type")) {
+                    const size_t nxt = skip_ws_comments(id_end);
+                    if (nxt < end && is_ident_start(src[nxt])) {
+                        // Consume `type Foo [as Bar] [,]`
+                        size_t cur = nxt + 1u;
+                        while (cur < end && is_ident_part(src[cur])) ++cur;
+                        const size_t a2 = skip_ws_comments(cur);
+                        if (a2 + 2u <= end && src[a2] == 'a' && src[a2 + 1u] == 's' &&
+                            (a2 + 2u == end || !is_ident_part(src[a2 + 2u]))) {
+                            size_t a3 = skip_ws_comments(a2 + 2u);
+                            while (a3 < end && is_ident_part(src[a3])) ++a3;
+                            cur = a3;
+                        }
+                        const size_t comma = skip_ws_comments(cur);
+                        if (comma < end && src[comma] == ',') {
+                            erase_span(i, comma + 1u);
+                            i = comma + 1u;
+                        } else {
+                            // Erase preceding comma if any so `{ bar, type Foo }` becomes `{ bar }`
+                            size_t back = i;
+                            while (back > start && is_js_ws(out[back - 1u])) --back;
+                            if (back > start && out[back - 1u] == ',') erase_span(back - 1u, back);
+                            erase_span(i, cur);
+                            i = cur;
+                        }
+                        continue;
+                    }
+                }
+                i = id_end;
+                continue;
+            }
+
+            // Postfix non-null assertion `expr!`
+            if (c == '!' && !expr_expected && (i + 1u >= end || src[i + 1u] != '=')) {
+                const size_t nxt = skip_ws_comments(i + 1u);
+                if (nxt >= end || src[nxt] == '.' || src[nxt] == '[' || src[nxt] == '(' ||
+                    src[nxt] == ',' || src[nxt] == ';' || src[nxt] == ')' || src[nxt] == ']' ||
+                    src[nxt] == '}' || src[nxt] == '?' || src[nxt] == ':') {
+                    erase_span(i, i + 1u);
+                    ++i;
+                    continue;
+                }
+            }
+
+            // Identifiers & Keywords
+            if (is_ident_start(c)) {
+                const size_t id_start = i;
+                while (i < end && is_ident_part(src[i])) ++i;
+                const size_t id_len = i - id_start;
+                const char* id = src + id_start;
+
+                if (after_dot) {
+                    // Check generic method call `obj.foo<T>(...)`
+                    const size_t ag_p = skip_ws_comments(i);
+                    if (ag_p < end && src[ag_p] == '<') {
+                        const size_t ag_end = skip_angle_group(ag_p, true);
+                        if (ag_end != SIZE_MAX && ag_end <= end) {
+                            const size_t after_ag = skip_ws_comments(ag_end);
+                            if (after_ag < end && (src[after_ag] == '(' || src[after_ag] == '`')) {
+                                erase_span(ag_p, ag_end);
+                                i = ag_end;
+                            }
+                        }
+                    }
+                    expr_expected = false;
+                    stmt_start = false;
+                    after_dot = false;
+                    prev_control_kw = false;
+                    continue;
+                }
+
+                // Class body members (modifiers, fields, methods)
+                if (in_class_body && brace_depth == 0 && paren_depth == 0 && bracket_depth == 0 && stmt_start) {
+                    if (is_ts_ident_kw(id, id_len, "public") || is_ts_ident_kw(id, id_len, "private") ||
+                        is_ts_ident_kw(id, id_len, "protected") || is_ts_ident_kw(id, id_len, "readonly") ||
+                        is_ts_ident_kw(id, id_len, "override") || is_ts_ident_kw(id, id_len, "abstract")) {
+                        const size_t nxt = skip_ws_comments(i);
+                        if (nxt < end && (is_ident_start(src[nxt]) || src[nxt] == '[' || src[nxt] == '#' || src[nxt] == '*')) {
+                            erase_span(id_start, i);
+                            continue; // stay stmt_start
+                        }
+                    }
+                    if (!is_ts_ident_kw(id, id_len, "static") && !is_ts_ident_kw(id, id_len, "async") &&
+                        !is_ts_ident_kw(id, id_len, "get") && !is_ts_ident_kw(id, id_len, "set")) {
+                        size_t cur = skip_ws_comments(i);
+                        // Generic method `foo<T>(...)`
+                        if (cur < end && src[cur] == '<') {
+                            const size_t ag = skip_angle_group(cur, false);
+                            if (ag != SIZE_MAX && ag <= end) {
+                                erase_span(cur, ag);
+                                cur = skip_ws_comments(ag);
+                            }
+                        }
+                        if (cur < end && src[cur] == '(') {
+                            cur = strip_param_list(cur);
+                            const size_t col = skip_ws_comments(cur);
+                            if (col < end && src[col] == ':') {
+                                const size_t tend = skip_type_expr(col + 1u, false, true, true);
+                                erase_span(col, tend);
+                                cur = tend;
+                            }
+                            i = cur;
+                            expr_expected = false;
+                            stmt_start = false;
+                            continue;
+                        }
+                        // Class field `foo?: T = ...` / `foo!: T;` / `foo: T = ...`
+                        if (cur < end && (src[cur] == '?' || src[cur] == '!')) {
+                            const size_t after_q = skip_ws_comments(cur + 1u);
+                            if (after_q < end && (src[after_q] == ':' || src[after_q] == ';' || src[after_q] == '=' || src[after_q] == '\n')) {
+                                erase_span(cur, cur + 1u);
+                                cur = after_q;
+                            }
+                        }
+                        if (cur < end && src[cur] == ':') {
+                            const size_t tend = skip_type_expr(cur + 1u, false, true, true);
+                            erase_span(cur, tend);
+                            i = tend;
+                            expr_expected = false;
+                            stmt_start = false;
+                            continue;
+                        }
+                    }
+                }
+
+                // Statement-start TS declarations (`export interface/type/declare`, `interface`, `type`, `declare`, `import type`)
+                if (stmt_start && paren_depth == 0 && bracket_depth == 0 && !in_class_body) {
+                    if (is_ts_ident_kw(id, id_len, "export")) {
+                        const size_t nxt = skip_ws_comments(i);
+                        if (nxt < end && is_ident_start(src[nxt])) {
+                            size_t n2 = nxt + 1u;
+                            while (n2 < end && is_ident_part(src[n2])) ++n2;
+                            const size_t nlen = n2 - nxt;
+                            if (is_ts_ident_kw(src + nxt, nlen, "interface")) {
+                                size_t p = skip_ws_comments(n2);
+                                while (p < end && src[p] != '{') {
+                                    if (src[p] == '<') { const size_t a = skip_angle_group(p, false); p = a != SIZE_MAX ? a : p + 1u; }
+                                    else ++p;
+                                }
+                                if (p < end && src[p] == '{') p = skip_balanced(p, '{', '}');
+                                erase_span(id_start, p);
+                                i = p;
+                                continue;
+                            }
+                            if (is_ts_ident_kw(src + nxt, nlen, "type")) {
+                                const size_t after_t = skip_ws_comments(n2);
+                                if (after_t < end && (src[after_t] == '{' || src[after_t] == '*')) {
+                                    // `export type { ... } [from '...'];`
+                                    size_t p = (src[after_t] == '{') ? skip_balanced(after_t, '{', '}') : after_t + 1u;
+                                    p = skip_ws_comments(p);
+                                    if (p + 4u <= end && std::memcmp(src + p, "from", 4u) == 0 && !is_ident_part(src[p + 4u])) {
+                                        p = skip_ws_comments(p + 4u);
+                                        if (p < end && (src[p] == '\'' || src[p] == '"')) p = skip_string(p);
+                                    }
+                                    const size_t semi = skip_ws_comments(p);
+                                    if (semi < end && src[semi] == ';') p = semi + 1u;
+                                    erase_span(id_start, p);
+                                    i = p;
+                                    continue;
+                                }
+                                if (after_t < end && is_ident_start(src[after_t])) {
+                                    size_t p = after_t + 1u;
+                                    while (p < end && is_ident_part(src[p])) ++p;
+                                    p = skip_ws_comments(p);
+                                    if (p < end && src[p] == '<') {
+                                        const size_t ag = skip_angle_group(p, false);
+                                        if (ag != SIZE_MAX) p = skip_ws_comments(ag);
+                                    }
+                                    if (p < end && src[p] == '=') {
+                                        p = skip_type_expr(p + 1u, false, false, false);
+                                        const size_t semi = skip_ws_comments(p);
+                                        if (semi < end && src[semi] == ';') p = semi + 1u;
+                                        erase_span(id_start, p);
+                                        i = p;
+                                        continue;
+                                    }
+                                }
+                            }
+                            if (is_ts_ident_kw(src + nxt, nlen, "declare")) {
+                                // Fall through to `declare` after erasing `export`
+                                erase_span(id_start, i);
+                                i = nxt;
+                                continue;
+                            }
+                        }
+                        // Regular `export ...`: stay stmt_start so `export const/function/class` work
+                        expr_expected = true;
+                        continue;
+                    }
+
+                    if (is_ts_ident_kw(id, id_len, "interface")) {
+                        const size_t nxt = skip_ws_comments(i);
+                        if (nxt < end && is_ident_start(src[nxt])) {
+                            size_t p = nxt;
+                            while (p < end && src[p] != '{') {
+                                if (src[p] == '<') { const size_t a = skip_angle_group(p, false); p = a != SIZE_MAX ? a : p + 1u; }
+                                else ++p;
+                            }
+                            if (p < end && src[p] == '{') p = skip_balanced(p, '{', '}');
+                            erase_span(id_start, p);
+                            i = p;
+                            continue;
+                        }
+                    }
+
+                    if (is_ts_ident_kw(id, id_len, "type")) {
+                        const size_t nxt = skip_ws_comments(i);
+                        if (nxt < end && is_ident_start(src[nxt])) {
+                            size_t p = nxt + 1u;
+                            while (p < end && is_ident_part(src[p])) ++p;
+                            p = skip_ws_comments(p);
+                            if (p < end && src[p] == '<') {
+                                const size_t ag = skip_angle_group(p, false);
+                                if (ag != SIZE_MAX) p = skip_ws_comments(ag);
+                            }
+                            if (p < end && src[p] == '=') {
+                                p = skip_type_expr(p + 1u, false, false, false);
+                                const size_t semi = skip_ws_comments(p);
+                                if (semi < end && src[semi] == ';') p = semi + 1u;
+                                erase_span(id_start, p);
+                                i = p;
+                                continue;
+                            }
+                        }
+                    }
+
+                    if (is_ts_ident_kw(id, id_len, "declare")) {
+                        size_t p = skip_ws_comments(i);
+                        while (p < end) {
+                            if (src[p] == '{') { p = skip_balanced(p, '{', '}'); break; }
+                            if (src[p] == ';') { ++p; break; }
+                            if (src[p] == '\'' || src[p] == '"') { p = skip_string(p); continue; }
+                            if (src[p] == '(') { p = skip_balanced(p, '(', ')'); continue; }
+                            if (src[p] == '\n') { break; }
+                            ++p;
+                        }
+                        erase_span(id_start, p);
+                        i = p;
+                        continue;
+                    }
+
+                    if (is_ts_ident_kw(id, id_len, "import")) {
+                        const size_t nxt = skip_ws_comments(i);
+                        if (nxt < end && is_ident_start(src[nxt])) {
+                            size_t n2 = nxt + 1u;
+                            while (n2 < end && is_ident_part(src[n2])) ++n2;
+                            if (is_ts_ident_kw(src + nxt, n2 - nxt, "type")) {
+                                const size_t after_t = skip_ws_comments(n2);
+                                if (after_t < end && (is_ident_start(src[after_t]) || src[after_t] == '{' || src[after_t] == '*')) {
+                                    // Erase entire `import type ... from '...'[;]`
+                                    size_t p = after_t;
+                                    while (p < end) {
+                                        if (src[p] == '\'' || src[p] == '"') { p = skip_string(p); break; }
+                                        if (src[p] == '{') { p = skip_balanced(p, '{', '}'); continue; }
+                                        if (src[p] == ';') { ++p; break; }
+                                        ++p;
+                                    }
+                                    const size_t semi = skip_ws_comments(p);
+                                    if (semi < end && src[semi] == ';') p = semi + 1u;
+                                    erase_span(id_start, p);
+                                    i = p;
+                                    continue;
+                                }
+                            }
+                        }
+                        // Regular `import { type Foo, bar } from '...'`: strip inline `type` specifiers inside `{...}`
+                        size_t scan = nxt;
+                        while (scan < end && src[scan] != ';' && src[scan] != '\n' && src[scan] != '\'' && src[scan] != '"') {
+                            if (src[scan] == '{') {
+                                const size_t bclose = skip_balanced(scan, '{', '}');
+                                if (bclose > scan + 2u && bclose <= end && depth < 64u) {
+                                    ++depth;
+                                    strip_range(scan + 1u, bclose - 1u, false, true);
+                                    --depth;
+                                }
+                                i = bclose < end ? bclose : end;
+                                break;
+                            }
+                            ++scan;
+                        }
+                        expr_expected = false;
+                        stmt_start = false;
+                        continue;
+                    }
+                }
+
+                // `function name<T>(params): RetType`
+                if (is_ts_ident_kw(id, id_len, "function")) {
+                    size_t p = skip_ws_comments(i);
+                    if (p < end && src[p] == '*') p = skip_ws_comments(p + 1u);
+                    if (p < end && is_ident_start(src[p])) {
+                        while (p < end && is_ident_part(src[p])) ++p;
+                        p = skip_ws_comments(p);
+                    }
+                    if (p < end && src[p] == '<') {
+                        const size_t ag = skip_angle_group(p, false);
+                        if (ag != SIZE_MAX && ag <= end) {
+                            erase_span(p, ag);
+                            p = skip_ws_comments(ag);
+                        }
+                    }
+                    if (p < end && src[p] == '(') {
+                        p = strip_param_list(p);
+                        const size_t col = skip_ws_comments(p);
+                        if (col < end && src[col] == ':') {
+                            const size_t tend = skip_type_expr(col + 1u, false, true, true);
+                            erase_span(col, tend);
+                            p = tend;
+                        }
+                        i = p;
+                    }
+                    expr_expected = false;
+                    stmt_start = false;
+                    prev_control_kw = false;
+                    continue;
+                }
+
+                // `class Name<T> [extends Base<U>] [implements I, J] { ... }`
+                if (is_ts_ident_kw(id, id_len, "class")) {
+                    size_t p = skip_ws_comments(i);
+                    if (p < end && is_ident_start(src[p])) {
+                        while (p < end && is_ident_part(src[p])) ++p;
+                        p = skip_ws_comments(p);
+                    }
+                    if (p < end && src[p] == '<') {
+                        const size_t ag = skip_angle_group(p, false);
+                        if (ag != SIZE_MAX && ag <= end) {
+                            erase_span(p, ag);
+                            p = skip_ws_comments(ag);
+                        }
+                    }
+                    while (p < end && src[p] != '{') {
+                        if (is_ident_start(src[p])) {
+                            const size_t ks = p;
+                            while (p < end && is_ident_part(src[p])) ++p;
+                            if (is_ts_ident_kw(src + ks, p - ks, "implements")) {
+                                size_t imp_end = p;
+                                while (imp_end < end && src[imp_end] != '{') {
+                                    if (src[imp_end] == '<') {
+                                        const size_t ag = skip_angle_group(imp_end, false);
+                                        imp_end = (ag != SIZE_MAX) ? ag : (imp_end + 1u);
+                                    } else {
+                                        ++imp_end;
+                                    }
+                                }
+                                erase_span(ks, imp_end);
+                                p = imp_end;
+                                break;
+                            }
+                            continue;
+                        }
+                        if (src[p] == '<') {
+                            const size_t ag = skip_angle_group(p, false);
+                            if (ag != SIZE_MAX && ag <= end) {
+                                erase_span(p, ag);
+                                p = ag;
+                                continue;
+                            }
+                        }
+                        ++p;
+                    }
+                    if (p < end && src[p] == '{') {
+                        const size_t cend = skip_balanced(p, '{', '}');
+                        if (cend > p + 2u && cend <= end && depth < 64u) {
+                            ++depth;
+                            strip_range(p + 1u, cend - 1u, true, false);
+                            --depth;
+                        }
+                        i = cend < end ? cend : end;
+                    } else {
+                        i = p;
+                    }
+                    expr_expected = false;
+                    stmt_start = false;
+                    prev_control_kw = false;
+                    continue;
+                }
+
+                // `const` / `let` / `var` variable declarations
+                if (is_ts_ident_kw(id, id_len, "const") || is_ts_ident_kw(id, id_len, "let") ||
+                    is_ts_ident_kw(id, id_len, "var")) {
+                    i = strip_var_binding(i, end);
+                    active_var_decl = true;
+                    var_decl_brace = brace_depth;
+                    var_decl_paren = paren_depth;
+                    expr_expected = false;
+                    stmt_start = false;
+                    prev_control_kw = false;
+                    continue;
+                }
+
+                // `as Type` / `satisfies Type` in expression postfix position
+                if (!expr_expected &&
+                    (is_ts_ident_kw(id, id_len, "as") || is_ts_ident_kw(id, id_len, "satisfies"))) {
+                    const size_t nxt = skip_ws_comments(i);
+                    if (nxt < end && src[nxt] != ':' && src[nxt] != '(' && src[nxt] != '=' && src[nxt] != ';') {
+                        const size_t tend = skip_type_expr(nxt, true, true, true);
+                        if (tend > nxt) {
+                            erase_span(id_start, tend);
+                            i = tend;
+                            expr_expected = false;
+                            continue;
+                        }
+                    }
+                }
+
+                // Generic function/constructor call `fn<TypeArgs>(...)`
+                const bool is_prefix = is_expr_prefix_kw(id, id_len);
+                const bool is_ctrl = is_control_kw(id, id_len);
+                if (!is_prefix && !is_ctrl) {
+                    const size_t ag_p = skip_ws_comments(i);
+                    if (ag_p < end && src[ag_p] == '<') {
+                        const size_t ag_end = skip_angle_group(ag_p, true);
+                        if (ag_end != SIZE_MAX && ag_end <= end) {
+                            const size_t after_ag = skip_ws_comments(ag_end);
+                            if (after_ag < end && (src[after_ag] == '(' || src[after_ag] == '`')) {
+                                erase_span(ag_p, ag_end);
+                                i = ag_end;
+                            }
+                        }
+                    }
+                }
+
+                expr_expected = is_prefix;
+                prev_control_kw = is_ctrl;
+                prev_was_arrow = false;
+                if (is_ts_ident_kw(id, id_len, "async") || is_ts_ident_kw(id, id_len, "default")) {
+                    // Keep `stmt_start` for `async function` / `export default function`
+                } else {
+                    stmt_start = false;
+                }
+                continue;
+            }
+
+            // Numbers
+            if (is_ascii_digit(c)) {
+                i = scan_number_end(src, end, i);
+                expr_expected = false;
+                stmt_start = false;
+                after_dot = false;
+                prev_control_kw = false;
+                continue;
+            }
+
+            // Punctuation
+            if (c == '(') {
+                if (paren_sp < kMaxParenStack) paren_ctrl[paren_sp++] = prev_control_kw ? 1u : 0u;
+                ++paren_depth;
+                expr_expected = true;
+                stmt_start = false;
+                after_dot = false;
+                prev_control_kw = false;
+                prev_was_arrow = false;
+                ++i;
+                continue;
+            }
+            if (c == ')') {
+                if (paren_depth > 0) --paren_depth;
+                const bool was_ctrl = (paren_sp > 0u) ? (paren_ctrl[--paren_sp] != 0u) : false;
+                expr_expected = was_ctrl;
+                stmt_start = false;
+                after_dot = false;
+                prev_control_kw = false;
+                ++i;
+                continue;
+            }
+            if (c == '{') {
+                const bool obj_lit = expr_expected && !stmt_start && !prev_was_arrow;
+                if (brace_sp < kMaxParenStack) brace_is_expr[brace_sp++] = obj_lit ? 1u : 0u;
+                ++brace_depth;
+                expr_expected = true;
+                stmt_start = true;
+                after_dot = false;
+                prev_control_kw = false;
+                prev_was_arrow = false;
+                ++i;
+                continue;
+            }
+            if (c == '}') {
+                if (brace_depth > 0) --brace_depth;
+                if (active_var_decl && brace_depth < var_decl_brace) active_var_decl = false;
+                const bool was_obj = (brace_sp > 0u) ? (brace_is_expr[--brace_sp] != 0u) : false;
+                expr_expected = !was_obj;
+                stmt_start = !was_obj;
+                after_dot = false;
+                prev_control_kw = false;
+                prev_was_arrow = false;
+                ++i;
+                continue;
+            }
+            if (c == '[') {
+                ++bracket_depth;
+                expr_expected = true;
+                stmt_start = false;
+                after_dot = false;
+                prev_control_kw = false;
+                ++i;
+                continue;
+            }
+            if (c == ']') {
+                if (bracket_depth > 0) --bracket_depth;
+                expr_expected = false;
+                stmt_start = false;
+                after_dot = false;
+                prev_control_kw = false;
+                ++i;
+                continue;
+            }
+            if (c == ';') {
+                active_var_decl = false;
+                expr_expected = true;
+                stmt_start = true;
+                after_dot = false;
+                prev_control_kw = false;
+                ++i;
+                continue;
+            }
+            if (c == ',' && active_var_decl && brace_depth == var_decl_brace && paren_depth == var_decl_paren && bracket_depth == 0) {
+                ++i;
+                i = strip_var_binding(i, end);
+                expr_expected = false;
+                stmt_start = false;
+                after_dot = false;
+                prev_control_kw = false;
+                continue;
+            }
+            if (c == '.') {
+                if (i + 2u < end && src[i + 1u] == '.' && src[i + 2u] == '.') {
+                    i += 3u;
+                    expr_expected = true;
+                    after_dot = false;
+                } else {
+                    ++i;
+                    expr_expected = false;
+                    after_dot = true;
+                }
+                stmt_start = false;
+                prev_control_kw = false;
+                continue;
+            }
+            if (c == '=' && i + 1u < end && src[i + 1u] == '>') {
+                i += 2u;
+                expr_expected = true;
+                stmt_start = false;
+                after_dot = false;
+                prev_control_kw = false;
+                prev_was_arrow = true;
+                continue;
+            }
+            if ((c == '+' || c == '-') && i + 1u < end && src[i + 1u] == c) {
+                i += 2u;
+                stmt_start = false;
+                after_dot = false;
+                prev_control_kw = false;
+                prev_was_arrow = false;
+                continue;
+            }
+            expr_expected = true;
+            stmt_start = false;
+            after_dot = false;
+            prev_control_kw = false;
+            prev_was_arrow = false;
+            ++i;
+        }
+    }
+};
+
 } // namespace
 
 bool inlay_jsx_transpile(const char* src, size_t src_len,
@@ -1407,22 +2708,77 @@ bool inlay_jsx_transpile(const char* src, size_t src_len,
         return false;
     }
     *out_len = 0u;
-    if (src_len == 0u || !has_jsx_candidate(src, src_len)) {
+    if (src_len == 0u) {
+        return true;
+    }
+
+    // Stage 1: Line-preserving TypeScript type erasure (zero-allocation fast path when no TS candidates exist).
+    char* ts_tmp = nullptr;
+    const char* eff_src = src;
+    size_t eff_len = src_len;
+    bool ts_modified = false;
+    if (has_ts_candidate(src, src_len)) {
+        ts_tmp = static_cast<char*>(SDL_malloc(src_len + 1u));
+        if (!ts_tmp) {
+            if (err_buf && err_cap) {
+                std::snprintf(err_buf, err_cap, "JSXSyntaxError: Out of memory during TypeScript erasure");
+            }
+            return false;
+        }
+        std::memcpy(ts_tmp, src, src_len);
+        ts_tmp[src_len] = '\0';
+        TsStripper ts = {};
+        ts.src = src;
+        ts.len = src_len;
+        ts.out = ts_tmp;
+        ts.strip_range(0u, src_len, false, false);
+        if (ts.modified) {
+            eff_src = ts_tmp;
+            eff_len = src_len;
+            ts_modified = true;
+        } else {
+            SDL_free(ts_tmp);
+            ts_tmp = nullptr;
+        }
+    }
+
+    // Stage 2: JSX transpilation (or direct copy if only TS erasure occurred).
+    if (!has_jsx_candidate(eff_src, eff_len)) {
+        if (!ts_modified) {
+            SDL_free(ts_tmp);
+            return true;
+        }
+        if (*io_cap < eff_len + 1u) {
+            auto* nb = static_cast<char*>(SDL_realloc(*io_buf, eff_len + 1u));
+            if (!nb) {
+                SDL_free(ts_tmp);
+                if (err_buf && err_cap) {
+                    std::snprintf(err_buf, err_cap, "JSXSyntaxError: Out of memory");
+                }
+                return false;
+            }
+            *io_buf = nb;
+            *io_cap = eff_len + 1u;
+        }
+        std::memcpy(*io_buf, eff_src, eff_len + 1u);
+        *out_len = eff_len;
+        SDL_free(ts_tmp);
         return true;
     }
 
     JsxTranspiler tp = {};
-    tp.src = src;
-    tp.len = src_len;
+    tp.src = eff_src;
+    tp.len = eff_len;
     tp.filename = (filename && filename[0]) ? filename : "<surface>";
     tp.line = 1u;
     tp.out.io_buf = io_buf;
     tp.out.io_cap = io_cap;
-    tp.out.initial_cap = src_len + (src_len / 2u) + 256u;
+    tp.out.initial_cap = eff_len + (eff_len / 2u) + 256u;
     tp.err_buf = err_buf;
     tp.err_cap = err_cap;
 
     tp.parse_js_block(false);
+    SDL_free(ts_tmp);
     if (tp.failed) {
         *out_len = 0u;
         return false;

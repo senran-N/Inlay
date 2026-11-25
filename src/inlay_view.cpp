@@ -24,6 +24,8 @@ struct InlayDiagramCache {
   InlayDiagramSubgraph* subgraphs;
   InlayDiagramEdgePath* edge_paths;
   EtchVec2* waypoints;
+  InlayDiagramPieSlice* pie_slices;
+  InlayDiagramGanttBar* gantt_bars;
   char* str_buf;
   uint32_t str_len;
  };
@@ -65,6 +67,8 @@ void free_diagram_cache_entry(InlayDiagramCache::Entry* e) noexcept {
  SDL_free(e->subgraphs);
  SDL_free(e->edge_paths);
  SDL_free(e->waypoints);
+ SDL_free(e->pie_slices);
+ SDL_free(e->gantt_bars);
  SDL_free(e->str_buf);
  *e = {};
 }
@@ -112,6 +116,13 @@ bool diagram_cache_store(InlayDiagramCache* cache, const DiagramCacheKey& k,
  for (uint32_t i = 0u; i < meta.subgraph_count; ++i) {
   total_str += meta.subgraphs[i].title.length;
  }
+ total_str += meta.title.length;
+ for (uint32_t i = 0u; i < meta.pie_slice_count; ++i) {
+  total_str += meta.pie_slices[i].label.length;
+ }
+ for (uint32_t i = 0u; i < meta.gantt_bar_count; ++i) {
+  total_str += meta.gantt_bars[i].section.length;
+ }
 
  InlayDiagramCache::Entry e = {};
  bool ok = true;
@@ -142,6 +153,14 @@ bool diagram_cache_store(InlayDiagramCache* cache, const DiagramCacheKey& k,
  if (ok && meta.waypoint_count > 0u && meta.waypoints) {
   e.waypoints = static_cast<EtchVec2*>(SDL_malloc(size_t(meta.waypoint_count) * sizeof(EtchVec2)));
   if (!e.waypoints) ok = false;
+ }
+ if (ok && meta.pie_slice_count > 0u && meta.pie_slices) {
+  e.pie_slices = static_cast<InlayDiagramPieSlice*>(SDL_malloc(size_t(meta.pie_slice_count) * sizeof(InlayDiagramPieSlice)));
+  if (!e.pie_slices) ok = false;
+ }
+ if (ok && meta.gantt_bar_count > 0u && meta.gantt_bars) {
+  e.gantt_bars = static_cast<InlayDiagramGanttBar*>(SDL_malloc(size_t(meta.gantt_bar_count) * sizeof(InlayDiagramGanttBar)));
+  if (!e.gantt_bars) ok = false;
  }
  if (ok && total_str > 0u) {
   e.str_buf = static_cast<char*>(SDL_malloc(total_str));
@@ -178,6 +197,18 @@ bool diagram_cache_store(InlayDiagramCache* cache, const DiagramCacheKey& k,
   e.subgraphs[i].title = copy_str(meta.subgraphs[i].title);
  }
  if (e.waypoints) std::memcpy(e.waypoints, meta.waypoints, size_t(meta.waypoint_count) * sizeof(EtchVec2));
+ if (e.pie_slices) {
+  for (uint32_t i = 0u; i < meta.pie_slice_count; ++i) {
+   e.pie_slices[i] = meta.pie_slices[i];
+   e.pie_slices[i].label = copy_str(meta.pie_slices[i].label);
+  }
+ }
+ if (e.gantt_bars) {
+  for (uint32_t i = 0u; i < meta.gantt_bar_count; ++i) {
+   e.gantt_bars[i] = meta.gantt_bars[i];
+   e.gantt_bars[i].section = copy_str(meta.gantt_bars[i].section);
+  }
+ }
 
  e.str_len = soff;
  e.occupied = true;
@@ -191,11 +222,15 @@ bool diagram_cache_store(InlayDiagramCache* cache, const DiagramCacheKey& k,
  e.result.nodes = e.nodes;
  e.result.edges = e.edges;
  e.meta = meta;
+ e.meta.title = copy_str(meta.title);
  e.meta.shapes = e.shapes;
  e.meta.edge_styles = e.edge_styles;
  e.meta.subgraphs = e.subgraphs;
  e.meta.edge_paths = e.edge_paths;
  e.meta.waypoints = e.waypoints;
+ e.meta.pie_slices = e.pie_slices;
+ e.meta.gantt_bars = e.gantt_bars;
+ e.str_len = soff;
 
  if (replacing) free_diagram_cache_entry(&cache->entries[slot]);
  else ++cache->entry_count;
@@ -274,6 +309,27 @@ bool diagram_cache_materialize(EtchContext* ctx, const InlayDiagramCache::Entry&
   if (!a_wp) return false;
   std::memcpy(a_wp, e.waypoints, size_t(e.meta.waypoint_count) * sizeof(EtchVec2));
   out_meta->waypoints = a_wp;
+ }
+ out_meta->title = remap(e.meta.title);
+ if (e.meta.pie_slice_count > 0u && e.pie_slices) {
+  auto* a_ps = static_cast<InlayDiagramPieSlice*>(
+   etch_frame_arena_alloc(ctx, size_t(e.meta.pie_slice_count) * sizeof(InlayDiagramPieSlice), alignof(InlayDiagramPieSlice)));
+  if (!a_ps) return false;
+  for (uint32_t i = 0u; i < e.meta.pie_slice_count; ++i) {
+   a_ps[i] = e.pie_slices[i];
+   a_ps[i].label = remap(e.pie_slices[i].label);
+  }
+  out_meta->pie_slices = a_ps;
+ }
+ if (e.meta.gantt_bar_count > 0u && e.gantt_bars) {
+  auto* a_gb = static_cast<InlayDiagramGanttBar*>(
+   etch_frame_arena_alloc(ctx, size_t(e.meta.gantt_bar_count) * sizeof(InlayDiagramGanttBar), alignof(InlayDiagramGanttBar)));
+  if (!a_gb) return false;
+  for (uint32_t i = 0u; i < e.meta.gantt_bar_count; ++i) {
+   a_gb[i] = e.gantt_bars[i];
+   a_gb[i].section = remap(e.gantt_bars[i].section);
+  }
+  out_meta->gantt_bars = a_gb;
  }
  return true;
 }
@@ -439,7 +495,13 @@ float baseline_top_lead(uint16_t font_id, float font_size, float line_h) noexcep
 }
 
 InlayDocStyle resolved_style(const InlayDocViewDesc& view) noexcept {
- return view.style ? *view.style : inlay_doc_style_default();
+ InlayDocStyle out = inlay_doc_style_default();
+ if (!view.style) return out;
+ const uint32_t copy_n = (view.style->struct_size > 0u && view.style->struct_size < sizeof(InlayDocStyle))
+  ? view.style->struct_size : uint32_t(sizeof(InlayDocStyle));
+ std::memcpy(&out, view.style, copy_n);
+ out.struct_size = uint32_t(sizeof(InlayDocStyle));
+ return out;
 }
 float effective_line_scale(const InlayDocStyle& style) noexcept {
  return style.line_height_scale > 0.f ? style.line_height_scale : 1.5f;
@@ -546,7 +608,7 @@ bool skipped_row(const InlayMeasure& m, const InlayRow& row) noexcept {
 }
 
 constexpr float collapsed_height = -1.f;
-constexpr uint32_t inline_open = 1u << 10, inline_close = 1u << 11;
+constexpr uint32_t inline_open = 1u << 30, inline_close = 1u << 31;
 
 bool append_inline(InlayMeasure* m, InlayInline token) noexcept {
  if (!inlay_grow_pod(m->tokens, m->token_capacity, m->token_count + 1u, 64u, 16u * 1024u * 1024u)) return false;
@@ -555,6 +617,29 @@ bool append_inline(InlayMeasure* m, InlayInline token) noexcept {
 }
 
 bool inline_space(char c) noexcept { return c == ' ' || c == '\t' || c == '\r'; }
+bool inline_space_at(const char* text, uint32_t pos, uint32_t end) noexcept {
+ if (pos >= end) return false;
+ if (inline_space(text[pos])) return true;
+ // UTF-8 ideographic space U+3000 (\xE3\x80\x80)
+ return pos + 2u < end &&
+        static_cast<uint8_t>(text[pos]) == 0xE3u &&
+        static_cast<uint8_t>(text[pos + 1u]) == 0x80u &&
+        static_cast<uint8_t>(text[pos + 2u]) == 0x80u;
+}
+bool inline_space_before(const char* text, uint32_t pos, uint32_t line_start) noexcept {
+ if (pos <= line_start) return false;
+ if (inline_space(text[pos - 1u])) return true;
+ return pos >= line_start + 3u &&
+        static_cast<uint8_t>(text[pos - 3u]) == 0xE3u &&
+        static_cast<uint8_t>(text[pos - 2u]) == 0x80u &&
+        static_cast<uint8_t>(text[pos - 1u]) == 0x80u;
+}
+bool inline_cjk_stop(const char* text, uint32_t p, uint32_t end) noexcept {
+ const uint8_t b0 = static_cast<uint8_t>(text[p]);
+ if (b0 < 0xE3u || p + 2u >= end) return false;
+ const uint8_t b1 = static_cast<uint8_t>(text[p + 1u]);
+ return (b0 == 0xE3u && b1 == 0x80u) || (b0 >= 0xE4u && b0 <= 0xE9u) || (b0 == 0xEFu && b1 >= 0xBCu);
+}
 bool inline_alnum(char c) noexcept { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'); }
 
 bool scan_balanced_paren_url(const char* text, uint32_t url_start, uint32_t end, uint32_t* out_close) noexcept {
@@ -590,7 +675,8 @@ bool match_autolink_url(const char* text, uint32_t pos, uint32_t end, uint32_t* 
  else if (rem >= 5u && !std::memcmp(text + pos, "www.", 4)) ok_scheme = true;
  if (!ok_scheme) return false;
  uint32_t p = pos;
- while (p < end && !inline_space(text[p]) && text[p] != '<' && text[p] != '>' && text[p] != '"' && text[p] != '\'') ++p;
+ while (p < end && !inline_space(text[p]) && !inline_cjk_stop(text, p, end) &&
+        text[p] != '<' && text[p] != '>' && text[p] != '"' && text[p] != '\'') ++p;
  while (p > pos && (text[p - 1u] == '.' || text[p - 1u] == ',' || text[p - 1u] == ';' ||
                     text[p - 1u] == ':' || text[p - 1u] == '!' || text[p - 1u] == '?')) --p;
  if (p > pos && text[p - 1u] == ')') {
@@ -604,7 +690,8 @@ bool match_autolink_url(const char* text, uint32_t pos, uint32_t end, uint32_t* 
 }
 
 bool inline_line(InlayMeasure* m, const char* text, uint32_t pos, uint32_t end,
-                 uint32_t base_flags = 0, uint32_t link_url_off = 0, uint32_t link_url_len = 0) noexcept {
+                 uint32_t base_flags = 0, uint32_t link_url_off = 0, uint32_t link_url_len = 0,
+                 bool streaming_repair = false, uint32_t html_depth = 0u) noexcept {
  const uint32_t first = m->token_count, line_start = pos;
  uint32_t opens[6], depth = 0;
  bool no_paren_math = false;
@@ -613,18 +700,21 @@ bool inline_line(InlayMeasure* m, const char* text, uint32_t pos, uint32_t end,
   const uint32_t start = pos;
   InlayInline token = {pos, 1, link_url_off, link_url_len, base_flags};
   const char c = text[pos];
-  if (c == '$' && pos + 1u < end && text[pos + 1u] != '$' && !inline_space(text[pos + 1u])) {
+  if (c == '$' && pos + 1u < end && text[pos + 1u] != '$' && !inline_space_at(text, pos + 1u, end)) {
    uint32_t close = pos + 1u;
    while (close < end) {
     if (text[close] == '\\' && close + 1u < end) { close += 2u; continue; }
     if (text[close] == '$') break;
     ++close;
    }
-   const bool valid_close = close < end && close > pos + 1u && !inline_space(text[close - 1u]) &&
+   const bool valid_close = close < end && close > pos + 1u && !inline_space_before(text, close, line_start) &&
                             (close + 1u >= end || text[close + 1u] < '0' || text[close + 1u] > '9');
    if (valid_close) {
     token = {pos + 1u, close - pos - 1u, pos, close + 1u - pos, InlayInlineMath | base_flags};
     pos = close + 1u;
+   } else if (streaming_repair && close == end && end > pos + 1u && !inline_space_before(text, end, line_start)) {
+    token = {pos + 1u, end - pos - 1u, pos, end - pos, InlayInlineMath | base_flags};
+    pos = end;
    }
   } else if (!no_paren_math && c == '\\' && pos + 1u < end && text[pos + 1u] == '(') {
    uint32_t close = pos + 2u;
@@ -656,19 +746,156 @@ bool inline_line(InlayMeasure* m, const char* text, uint32_t pos, uint32_t end,
     const uint32_t span_len = in_link ? link_url_len : (match_pos + ticks - pos);
     token = {cs, ce - cs, span_off, span_len, InlayInlineCode | base_flags};
     pos = match_pos + ticks;
+   } else if (streaming_repair) {
+    if (pos + ticks < end) {
+     const uint32_t span_off = in_link ? link_url_off : pos;
+     const uint32_t span_len = in_link ? link_url_len : (end - pos);
+     token = {pos + ticks, end - (pos + ticks), span_off, span_len, InlayInlineCode | base_flags};
+     pos = end;
+    } else {
+     pos = end;
+     continue;
+    }
    } else {
     token = {pos, ticks, link_url_off, link_url_len, base_flags};
     pos += ticks;
    }
-  } else if (!in_link && c == '<') {
+  } else if (c == '<') {
    uint32_t close = pos + 1u;
-   while (close < end && text[close] != '>' && !inline_space(text[close])) ++close;
-   if (close < end && text[close] == '>' && close > pos + 4u) {
-    const uint32_t ulen = close - (pos + 1u);
-    if ((ulen >= 8u && (!std::memcmp(text + pos + 1u, "https://", 8) || !std::memcmp(text + pos + 1u, "http://", 7))) ||
-        (ulen >= 8u && !std::memcmp(text + pos + 1u, "mailto:", 7))) {
-     token = {pos + 1u, ulen, pos + 1u, ulen, InlayInlineLink};
+   while (close < end && text[close] != '>') ++close;
+   if (close < end && text[close] == '>') {
+    const uint32_t inner_len = close - (pos + 1u);
+    const char* inner = text + pos + 1u;
+    auto tag_ci = [&](const char* s, uint32_t n, const char* lit) noexcept -> bool {
+     const size_t ln = std::strlen(lit);
+     if (n != ln) return false;
+     for (size_t k = 0u; k < ln; ++k) {
+      char a = s[k];
+      if (a >= 'A' && a <= 'Z') a = static_cast<char>(a + ('a' - 'A'));
+      if (a != lit[k]) return false;
+     }
+     return true;
+    };
+    auto find_close_tag = [&](const char* tag_name, uint32_t from, uint32_t* out_close_start, uint32_t* out_after) noexcept -> bool {
+     const uint32_t tn = static_cast<uint32_t>(std::strlen(tag_name));
+     uint32_t nest = 0u;
+     for (uint32_t k = from; k + tn + 2u <= end; ++k) {
+      if (text[k] != '<') continue;
+      if (k + tn + 3u <= end && text[k + 1u] == '/' && tag_ci(text + k + 2u, tn, tag_name)) {
+       uint32_t gt = k + 2u + tn;
+       while (gt < end && (text[gt] == ' ' || text[gt] == '\t')) ++gt;
+       if (gt < end && text[gt] == '>') {
+        if (nest == 0u) {
+         *out_close_start = k;
+         *out_after = gt + 1u;
+         return true;
+        }
+        --nest;
+        k = gt;
+       }
+      } else if (tag_ci(text + k + 1u, tn, tag_name)) {
+       const uint32_t nxt = k + 1u + tn;
+       if (nxt < end && (text[nxt] == '>' || text[nxt] == ' ' || text[nxt] == '\t')) {
+        ++nest;
+       }
+      }
+     }
+     return false;
+    };
+    auto parse_attr = [&](uint32_t name_len_v, const char* attr, uint32_t* out_off, uint32_t* out_len) noexcept -> bool {
+     const uint32_t al = static_cast<uint32_t>(std::strlen(attr));
+     for (uint32_t k = name_len_v; k + al + 2u < inner_len; ++k) {
+      if (tag_ci(inner + k, al, attr) && inner[k + al] == '=') {
+       uint32_t v = k + al + 1u;
+       if (v < inner_len && (inner[v] == '"' || inner[v] == '\'')) {
+        const char q = inner[v++];
+        const uint32_t vs = v;
+        while (v < inner_len && inner[v] != q) ++v;
+        if (v < inner_len) { *out_off = pos + 1u + vs; *out_len = v - vs; return true; }
+       }
+      }
+     }
+     return false;
+    };
+    // 1. Autolink <https://...>, <http://...>, <mailto:...>
+    bool no_ws = true;
+    for (uint32_t k = 0u; k < inner_len; ++k) if (inline_space(inner[k])) { no_ws = false; break; }
+    if (!in_link && no_ws && inner_len >= 8u &&
+        (!std::memcmp(inner, "https://", 8) || !std::memcmp(inner, "http://", 7) || !std::memcmp(inner, "mailto:", 7))) {
+     token = {pos + 1u, inner_len, pos + 1u, inner_len, InlayInlineLink};
      pos = close + 1u;
+    } else {
+     // Extract tag name (letters only)
+     uint32_t name_len = 0u;
+     while (name_len < inner_len && ((inner[name_len] >= 'a' && inner[name_len] <= 'z') || (inner[name_len] >= 'A' && inner[name_len] <= 'Z'))) {
+      ++name_len;
+     }
+     uint32_t cs = 0u, after = 0u;
+     uint32_t nested_flag = 0u;
+     bool is_html_a = false;
+     uint32_t a_href_off = 0u, a_href_len = 0u;
+     if (tag_ci(inner, name_len, "br")) {
+      token = {pos, close + 1u - pos, link_url_off, link_url_len, InlayInlineBreak | base_flags};
+      pos = close + 1u;
+     } else if (!in_link && tag_ci(inner, name_len, "img")) {
+      uint32_t src_off = 0u, src_len = 0u, alt_off = pos + 1u, alt_len = 0u;
+      if (parse_attr(name_len, "src", &src_off, &src_len) && src_len > 0u) {
+       (void)parse_attr(name_len, "alt", &alt_off, &alt_len);
+       token = {alt_off, alt_len, src_off, src_len, InlayInlineImage};
+       pos = close + 1u;
+      }
+     } else if (!in_link && tag_ci(inner, name_len, "a") && parse_attr(name_len, "href", &a_href_off, &a_href_len) &&
+                a_href_len > 0u && find_close_tag("a", close + 1u, &cs, &after)) {
+      is_html_a = true;
+      nested_flag = InlayInlineLink;
+     } else if (tag_ci(inner, name_len, "code") && find_close_tag("code", close + 1u, &cs, &after)) {
+      token = {close + 1u, cs - (close + 1u), in_link ? link_url_off : pos, in_link ? link_url_len : (after - pos), InlayInlineCode | base_flags};
+      pos = after;
+     } else if (tag_ci(inner, name_len, "kbd") && find_close_tag("kbd", close + 1u, &cs, &after)) {
+      nested_flag = InlayInlineKbd;
+     } else if (tag_ci(inner, name_len, "sub") && find_close_tag("sub", close + 1u, &cs, &after)) {
+      nested_flag = InlayInlineSub;
+     } else if (tag_ci(inner, name_len, "sup") && find_close_tag("sup", close + 1u, &cs, &after)) {
+      nested_flag = InlayInlineSup;
+     } else if (tag_ci(inner, name_len, "mark") && find_close_tag("mark", close + 1u, &cs, &after)) {
+      nested_flag = InlayInlineHighlight;
+     } else if ((tag_ci(inner, name_len, "u") && find_close_tag("u", close + 1u, &cs, &after)) ||
+                (tag_ci(inner, name_len, "ins") && find_close_tag("ins", close + 1u, &cs, &after))) {
+      nested_flag = InlayInlineUnderline;
+     } else if ((tag_ci(inner, name_len, "del") && find_close_tag("del", close + 1u, &cs, &after)) ||
+                (tag_ci(inner, name_len, "s") && find_close_tag("s", close + 1u, &cs, &after))) {
+      nested_flag = InlayInlineStrike;
+     } else if ((tag_ci(inner, name_len, "b") && find_close_tag("b", close + 1u, &cs, &after)) ||
+                (tag_ci(inner, name_len, "strong") && find_close_tag("strong", close + 1u, &cs, &after))) {
+      nested_flag = InlayInlineBold;
+     } else if ((tag_ci(inner, name_len, "i") && find_close_tag("i", close + 1u, &cs, &after)) ||
+                (tag_ci(inner, name_len, "em") && find_close_tag("em", close + 1u, &cs, &after))) {
+      nested_flag = InlayInlineEmphasis;
+     }
+     if (nested_flag != 0u) {
+      const uint32_t body_start = close + 1u;
+      const uint32_t eff_url_off = is_html_a ? a_href_off : link_url_off;
+      const uint32_t eff_url_len = is_html_a ? a_href_len : link_url_len;
+      bool has_nested_markup = false;
+      if (html_depth < 8u) {
+       for (uint32_t k = body_start; k < cs; ++k) {
+        const char ch = text[k];
+        if (ch == '<' || ch == '*' || ch == '_' || ch == '`' || ch == '~' || ch == '[' || ch == '$') {
+         has_nested_markup = true;
+         break;
+        }
+       }
+      }
+      if (has_nested_markup) {
+       if (!inline_line(m, text, body_start, cs, base_flags | nested_flag, eff_url_off, eff_url_len, streaming_repair, html_depth + 1u)) {
+        return false;
+       }
+       pos = after;
+       continue;
+      }
+      token = {body_start, cs - body_start, eff_url_off, eff_url_len, nested_flag | base_flags};
+      pos = after;
+     }
     }
    }
   } else if (!in_link && (c == 'h' || c == 'w') && (pos == line_start || inline_space(text[pos - 1u]) || text[pos - 1u] == '(')) {
@@ -703,6 +930,11 @@ bool inline_line(InlayMeasure* m, const char* text, uint32_t pos, uint32_t end,
       url_off = bracket + 2u;
       url_len = paren - url_off;
       next_pos = paren + 1u;
+      matched_link = true;
+     } else if (streaming_repair && bracket + 1u < end && text[bracket + 1u] == '(') {
+      url_off = bracket + 2u;
+      url_len = end - url_off;
+      next_pos = end;
       matched_link = true;
      } else if (m->doc && m->doc->ref_def_count > 0u) {
       // Full [text][label], collapsed [label][], or shortcut [label] reference link!
@@ -746,8 +978,13 @@ bool inline_line(InlayMeasure* m, const char* text, uint32_t pos, uint32_t end,
    while (stop < end && text[stop] == c) ++stop;
    const uint32_t run = stop - pos;
    const bool under = c == '_';
-   const bool can_close = pos > line_start && !inline_space(text[pos - 1u]) && (!under || stop == end || !inline_alnum(text[stop]));
-   const bool can_open = stop < end && !inline_space(text[stop]) && (!under || pos == line_start || !inline_alnum(text[pos - 1u]));
+   const bool can_close = pos > line_start && !inline_space_before(text, pos, line_start) && (!under || stop == end || !inline_alnum(text[stop]));
+   const bool can_open = stop < end && !inline_space_at(text, stop, end) && (!under || pos == line_start || !inline_alnum(text[pos - 1u]));
+   if (streaming_repair && !can_close && !can_open && stop == end && run <= 3u &&
+       (pos == line_start || inline_space_before(text, pos, line_start))) {
+    pos = stop;
+    continue;
+   }
    if (can_close || (can_open && (((c == '*' || under) && run <= 3u) || ((c == '~' || c == '=') && run == 2u)))) {
     while (pos < stop) {
      const uint32_t left = stop - pos;
@@ -819,7 +1056,19 @@ bool inline_line(InlayMeasure* m, const char* text, uint32_t pos, uint32_t end,
   }
   if (!append_inline(m, token)) return false;
  }
- while (depth) m->tokens[opens[--depth]].flags = base_flags;
+ if (streaming_repair) {
+  while (depth) {
+   auto& op = m->tokens[opens[--depth]];
+   if (op.offset + op.length < end) {
+    op.flags |= inline_open;
+   } else {
+    op.length = 0u;
+    op.flags = base_flags;
+   }
+  }
+ } else {
+  while (depth) m->tokens[opens[--depth]].flags = base_flags;
+ }
  uint32_t active = 0, out = first;
  for (uint32_t i = first; i < m->token_count; ++i) {
   auto t = m->tokens[i];
@@ -962,7 +1211,7 @@ float block_height(uint32_t index, void* user) {
  return height == 0 ? m.rows[index].estimate : height;
 }
 
-bool cache_inline(InlayMeasure* m, EtchStr source) noexcept {
+bool cache_inline(InlayMeasure* m, EtchStr source, bool streaming_repair) noexcept {
  const uint32_t tail = m->width == 0 ? 0u : m->parsed_tail;
  while (m->token_count && m->tokens[m->token_count - 1u].offset >= tail) --m->token_count;
  const uint32_t frozen = m->token_count;
@@ -983,16 +1232,18 @@ bool cache_inline(InlayMeasure* m, EtchStr source) noexcept {
    while (end < last && source.chars[end] != '\n') ++end;
    uint32_t lpos = pos;
    if (b.quote_depth > 0u) lpos += strip_quote_prefix(source.chars + lpos, end - lpos, b.quote_depth);
+   const bool repair_line = streaming_repair && (i + 1u == m->doc->block_count) && (end == last);
    if (b.kind == INLAY_TABLE) {
     auto line = slice(source, lpos, end - lpos);
     uint32_t start = 0;
     table_row_range(&line, &start);
     while (start < line.length) {
      const uint32_t stop = table_cell_end(line, start);
-     if (!inline_line(m, source.chars, lpos + start, lpos + stop)) { m->token_count = frozen; return false; }
+     const bool repair_cell = repair_line && stop >= line.length;
+     if (!inline_line(m, source.chars, lpos + start, lpos + stop, 0u, 0u, 0u, repair_cell)) { m->token_count = frozen; return false; }
      start = stop + 1u;
     }
-   } else if (!inline_line(m, source.chars, lpos, end)) { m->token_count = frozen; return false; }
+   } else if (!inline_line(m, source.chars, lpos, end, 0u, 0u, 0u, repair_line)) { m->token_count = frozen; return false; }
    pos = end < last ? end + 1u : end;
   }
  }
@@ -1423,20 +1674,29 @@ void build_plain_text_index(InlayMeasure* m) noexcept {
     pos = next < end ? next + 1u : end;
    }
   } else if (full_blk.kind == INLAY_TABLE) {
-   EtchStr line = table_line(source, row, full_blk.quote_depth);
+   const bool synth_t = (full_blk.flags & INLAY_BLOCK_FLAG_SYNTHETIC) != 0;
+   const EtchStr tsrc = synth_t ? block_code_str(doc, row.block) : source;
+   EtchStr line = table_line(tsrc, row, synth_t ? 0u : full_blk.quote_depth);
    const uint32_t columns = m->rows[row.table_header].table_columns;
    uint32_t start = 0;
    table_row_range(&line, &start);
    for (uint32_t col = 0; col < columns && start < line.length; ++col) {
     const uint32_t stop = table_cell_end(line, start);
     if (col > 0u) append_plain_bytes(m, "\t", 1u);
-    const uint32_t abs_a = uint32_t((line.chars + start) - source.chars);
-    const uint32_t abs_b = uint32_t((line.chars + stop) - source.chars);
-    const uint32_t need = extract_inline_range_plain(m, source, abs_a, abs_b, true, nullptr);
-    if (need > 0u) {
-     const uint32_t dst_off = m->plain_len;
-     if (append_plain_bytes(m, source.chars, need)) {
-      extract_inline_range_plain(m, source, abs_a, abs_b, true, m->plain_text + dst_off);
+    if (synth_t) {
+     uint32_t a = start, b = stop;
+     while (a < b && (line.chars[a] == ' ' || line.chars[a] == '\t')) ++a;
+     while (b > a && (line.chars[b - 1u] == ' ' || line.chars[b - 1u] == '\t')) --b;
+     if (b > a) append_plain_bytes(m, line.chars + a, b - a);
+    } else {
+     const uint32_t abs_a = uint32_t((line.chars + start) - source.chars);
+     const uint32_t abs_b = uint32_t((line.chars + stop) - source.chars);
+     const uint32_t need = extract_inline_range_plain(m, source, abs_a, abs_b, true, nullptr);
+     if (need > 0u) {
+      const uint32_t dst_off = m->plain_len;
+      if (append_plain_bytes(m, source.chars, need)) {
+       extract_inline_range_plain(m, source, abs_a, abs_b, true, m->plain_text + dst_off);
+      }
      }
     }
     start = stop + 1u;
@@ -1562,6 +1822,32 @@ void begin_inline_row(InlineRowBox& row) {
  }
 }
 
+bool detect_first_strong_rtl(EtchStr s) noexcept {
+ if (!s.chars || s.length == 0u) return false;
+ size_t p = 0u;
+ while (p < s.length) {
+  const uint32_t cp = inlay_utf8_next(s.chars, s.length, &p);
+  if ((cp >= 0x0590u && cp <= 0x05FFu) || // Hebrew
+      (cp >= 0x0600u && cp <= 0x06FFu) || // Arabic
+      (cp >= 0x0700u && cp <= 0x074Fu) || // Syriac
+      (cp >= 0x0750u && cp <= 0x07BFu) || // Arabic Supplement / Thaana
+      (cp >= 0x08A0u && cp <= 0x08FFu) || // Arabic Extended-A
+      (cp >= 0xFB50u && cp <= 0xFDFFu) || // Arabic Presentation Forms-A
+      (cp >= 0xFE70u && cp <= 0xFEFFu)) { // Arabic Presentation Forms-B
+   return true;
+  }
+  if ((cp >= 'A' && cp <= 'Z') || (cp >= 'a' && cp <= 'z') ||
+      (cp >= 0x00C0u && cp <= 0x02AFu) || // Latin Extended
+      (cp >= 0x0370u && cp <= 0x052Fu) || // Greek / Cyrillic
+      (cp >= 0x0900u && cp <= 0x109Fu) || // Indic / Southeast Asian
+      (cp >= 0x3040u && cp <= 0x9FFFu) || // CJK / Kana
+      (cp >= 0xAC00u && cp <= 0xD7AFu)) { // Hangul
+   return false;
+  }
+ }
+ return false;
+}
+
 float rich_line(InlayMeasure* m, EtchStr line, uint32_t base_id, float font, InlayDocResult* result, const EtchTheme& theme,
                 const InlayDocStyle& style, uint32_t range_start, uint32_t range_end, float width, bool estimate, InlineRowBox& row_box,
                 uint32_t row_index, uint32_t block_index, uint32_t* io_doc_cursor,
@@ -1602,6 +1888,24 @@ float rich_line(InlayMeasure* m, EtchStr line, uint32_t base_id, float font, Inl
   if (t.flags & InlayInlineEmphasis) span.font_id = ETCH_FONT_ITALIC;
   if (t.flags & InlayInlineBold) span.font_id = bold_font;
   span.strikethrough = (t.flags & InlayInlineStrike) != 0;
+  if (t.flags & InlayInlineUnderline) span.underline = true;
+  if (t.flags & InlayInlineBreak) {
+   span.text = ETCH_STR_LIT("\n");
+  }
+  if (t.flags & (InlayInlineSub | InlayInlineSup)) {
+   span.font_size_px = std::fmax(9.f, font * 0.76f);
+   span.color = style.muted_color.a != 0 ? style.muted_color : theme.text_secondary;
+  }
+  if (t.flags & InlayInlineKbd) {
+   span.font_id = mono_font;
+   span.font_size_px = std::fmax(10.f, font * 0.84f);
+   span.color = style.text_color.a != 0 ? style.text_color : theme.text_primary;
+   span.background = theme.bg_elevated;
+   span.border_color = theme.border_control;
+   span.padding_x = 5.5f;
+   span.padding_y = 1.0f;
+   span.bg_radius = 4.0f;
+  }
   if (t.flags & InlayInlineHighlight) {
    span.background = style.highlight_bg.a != 0 ? style.highlight_bg : EtchColor{theme.accent.r, theme.accent.g, theme.accent.b, 56};
    span.padding_x = 4;
@@ -1706,7 +2010,8 @@ float rich_line(InlayMeasure* m, EtchStr line, uint32_t base_id, float font, Inl
  desc.font_id = base_font;
  desc.font_size_px = font;
  desc.line_height_px = line_height;
- desc.align_x = align;
+ desc.align_x = (!table && align == ETCH_ALIGN_X_LEFT && detect_first_strong_rtl(slice(source, start, end - start)))
+  ? ETCH_ALIGN_X_RIGHT : align;
  if (color_override.a != 0) desc.color = color_override;
  else if (style.text_color.a != 0) desc.color = style.text_color;
  if (style.selection_color.a != 0) desc.selection_color = style.selection_color;
@@ -1973,7 +2278,9 @@ uint8_t advance_code_lex_state(EtchStr line, EtchStr language, uint8_t state) no
 
 void code_line(InlayMeasure* m, EtchStr line, EtchStr language, uint32_t id, float font, const EtchTheme& theme,
                const InlayDocStyle& style, uint32_t row_index, uint32_t block_index, uint32_t* io_doc_cursor,
-               bool wrap_lines = false, uint8_t* io_lex_state = nullptr) {
+               bool wrap_lines = false, uint8_t* io_lex_state = nullptr,
+               InlayCodeHighlightFn custom_hl = nullptr, void* custom_hl_user = nullptr,
+               uint32_t code_line_idx = 0u) {
  const uint16_t mono_font = effective_mono_font(style);
  const float code_font = effective_code_font_size(font, style);
  const float line_height = code_font * effective_line_scale(style);
@@ -1985,6 +2292,68 @@ void code_line(InlayMeasure* m, EtchStr line, EtchStr language, uint32_t id, flo
  }
  const uint32_t seg_start = io_doc_cursor ? *io_doc_cursor : 0u;
  const EtchColor base_code_color = style.code_color.a != 0 ? style.code_color : theme.text_code;
+ if (custom_hl) {
+  InlayCodeHighlightToken toks[128];
+  const uint32_t raw_n = custom_hl(language, line, code_line_idx, toks, 128u, custom_hl_user);
+  const uint32_t n = raw_n <= 128u ? raw_n : 128u;
+  if (n > 0u) {
+   uint32_t span_cap = n * 2u + 1u;
+   auto* hl_spans = static_cast<EtchTextSpan*>(
+       etch_frame_arena_alloc(etch_current_context(), size_t(span_cap) * sizeof(EtchTextSpan), alignof(EtchTextSpan)));
+   if (hl_spans) {
+    uint32_t out_n = 0u;
+    uint32_t cur = 0u;
+    for (uint32_t ti = 0u; ti < n && cur < line.length; ++ti) {
+     const auto& tk = toks[ti];
+     if (tk.length_bytes == 0u || tk.start_byte >= line.length) continue;
+     const uint32_t st = tk.start_byte < cur ? cur : tk.start_byte;
+     const uint32_t end_raw = tk.start_byte + tk.length_bytes;
+     const uint32_t en = (end_raw < tk.start_byte || end_raw > line.length) ? line.length : end_raw;
+     if (en <= st) continue;
+     if (st > cur) {
+      auto gap = etch_text_span_default();
+      gap.font_id = mono_font;
+      gap.font_size_px = code_font;
+      gap.color = base_code_color;
+      gap.text = {line.chars + cur, st - cur, false};
+      hl_spans[out_n++] = gap;
+     }
+     auto sp = etch_text_span_default();
+     sp.font_id = (tk.font_id != 0u && tk.font_id != ETCH_INVALID_FONT) ? tk.font_id : mono_font;
+     sp.font_size_px = code_font;
+     sp.color = tk.color.a != 0u ? tk.color : base_code_color;
+     sp.text = {line.chars + st, en - st, false};
+     hl_spans[out_n++] = sp;
+     cur = en;
+    }
+    if (cur < line.length) {
+     auto tail = etch_text_span_default();
+     tail.font_id = mono_font;
+     tail.font_size_px = code_font;
+     tail.color = base_code_color;
+     tail.text = {line.chars + cur, line.length - cur, false};
+     hl_spans[out_n++] = tail;
+    }
+    if (out_n > 0u) {
+     auto desc = etch_rich_text_desc_default();
+     desc.id = id;
+     desc.selectable = true;
+     desc.font_id = mono_font;
+     desc.font_size_px = code_font;
+     desc.line_height_px = line_height;
+     desc.wrap = wrap_lines;
+     if (style.selection_color.a != 0) desc.selection_color = style.selection_color;
+     etch_text_spans(hl_spans, out_n, &desc);
+     if (io_doc_cursor) {
+      apply_segment_selection(m, id, seg_start, line.length);
+      record_vis_seg(m, {id, row_index, block_index, seg_start, line.length, mono_font, 0, code_font, line_height, wrap_lines});
+      *io_doc_cursor += line.length;
+     }
+     return;
+    }
+   }
+  }
+ }
  if (ascii_ieq(language, "diff") || ascii_ieq(language, "patch")) {
   auto span = etch_text_span_default();
   span.font_id = mono_font;
@@ -2403,11 +2772,15 @@ float block_lines(InlayMeasure* measure, const InlayBlock& b, EtchStr source, ui
     cbox.height = etch_sizing_fit(0, 0);
     cbox.shrink_width = true;
     etch_begin_box(&cbox);
-    code_line(measure, line, lang, line_id, font, theme, style, row_index, info.block, &doc_cursor, true, &lex_state);
+    code_line(measure, line, lang, line_id, font, theme, style, row_index, info.block, &doc_cursor, true, &lex_state,
+              view.code_highlight_fn, view.code_highlight_user_data,
+              (code_start_line > 0u ? code_start_line - 1u : 0u) + (line_index - 1u));
     etch_end_box();
     etch_end_box();
    } else {
-    code_line(measure, line, lang, line_id, font, theme, style, row_index, info.block, &doc_cursor, wrap_code, &lex_state);
+    code_line(measure, line, lang, line_id, font, theme, style, row_index, info.block, &doc_cursor, wrap_code, &lex_state,
+              view.code_highlight_fn, view.code_highlight_user_data,
+              (code_start_line > 0u ? code_start_line - 1u : 0u) + (line_index - 1u));
    }
    pos = next < end ? next + 1u : end;
   }
@@ -2474,13 +2847,13 @@ float block_lines(InlayMeasure* measure, const InlayBlock& b, EtchStr source, ui
    uint32_t rule_start = 0;
    if (info.table_header + 1u < measure->count && measure->rows[info.table_header + 1u].separator &&
        measure->rows[info.table_header + 1u].block == info.block) {
-    rule = table_line(source, measure->rows[info.table_header + 1u], full_blk.quote_depth);
+    rule = table_line(blk_buf, measure->rows[info.table_header + 1u], synth_blk ? 0u : full_blk.quote_depth);
     table_row_range(&rule, &rule_start);
    }
    float col_widths_stack[32] = {};
    float* col_widths = columns <= 32u ? col_widths_stack : nullptr;
    const float total_table_w = col_widths
-    ? get_table_col_widths(measure, source, info, columns, width, font, style, view, col_widths)
+    ? get_table_col_widths(measure, blk_buf, info, columns, width, font, style, view, col_widths)
     : std::fmax(width, float(columns) * 88.f);
    const bool table_hscroll = total_table_w > width + 0.5f;
    if (table_hscroll) {
@@ -2515,8 +2888,9 @@ float block_lines(InlayMeasure* measure, const InlayBlock& b, EtchStr source, ui
    const EtchColor zebra_bg = style.table_zebra_bg.a != 0 ? style.table_zebra_bg : etch_color_blend_over(tbl_bg, theme.zebra_row);
    row.background = info.first ? hdr_bg : (info.zebra ? zebra_bg : tbl_bg);
    row.border_color = style.table_border.a != 0 ? style.table_border : theme.border_subtle;
+   const float tbw = style.table_border_width > 0.f ? style.table_border_width : 1.f;
    const bool has_vlist_sep = (view.height_px > 0.f) && info.first && !info.last_in_block;
-   row.border_sides = {1, 1, info.first ? 1.f : 0.f, has_vlist_sep ? 0.f : 1.f};
+   row.border_sides = {tbw, tbw, info.first ? tbw : 0.f, has_vlist_sep ? 0.f : tbw};
    const float radius = view.table_radius_px;
    const float top = info.first ? radius : 0.f, bottom = info.last_in_block ? radius : 0.f;
    row.radius = {top, top, bottom, bottom};
@@ -2548,9 +2922,29 @@ float block_lines(InlayMeasure* measure, const InlayBlock& b, EtchStr source, ui
       else if (style.heading_color.a != 0) cell_col = style.heading_color;
       else if (style.text_color.a != 0) cell_col = style.text_color;
      }
-     const float cell_height = rich_line(measure, {line.chars + start, stop - start, false}, etch_id_index(line_id, column + 1u),
-                                         cell_font, result, theme, style, 0, stop - start, std::fmax(1.f, cell_width - 2 * pad_x),
-                                         estimate, row_box, row_index, info.block, &doc_cursor, true, info.first, align, cell_col);
+     float cell_height = 0.f;
+     if (synth_blk) {
+      uint32_t ca = start, cb = stop;
+      while (ca < cb && (line.chars[ca] == ' ' || line.chars[ca] == '\t')) ++ca;
+      while (cb > ca && (line.chars[cb - 1u] == ' ' || line.chars[cb - 1u] == '\t')) --cb;
+      EtchStr ctxt = table_text({line.chars + ca, cb - ca, false}, etch_current_context());
+      auto td = etch_text_desc_default();
+      td.id = etch_id_index(line_id, column + 1u);
+      td.font_id = info.first ? effective_bold_font(style) : effective_sans_font(style);
+      td.font_size_px = cell_font;
+      td.line_height_px = cell_font * effective_line_scale(style);
+      td.align_x = align;
+      if (cell_col.a != 0) td.color = cell_col;
+      else if (style.text_color.a != 0) td.color = style.text_color;
+      td.wrap = true;
+      etch_text(ctxt, &td);
+      doc_cursor += cb - ca;
+      cell_height = td.line_height_px;
+     } else {
+      cell_height = rich_line(measure, {line.chars + start, stop - start, false}, etch_id_index(line_id, column + 1u),
+                              cell_font, result, theme, style, 0, stop - start, std::fmax(1.f, cell_width - 2 * pad_x),
+                              estimate, row_box, row_index, info.block, &doc_cursor, true, info.first, align, cell_col);
+     }
      tallest = std::fmax(tallest, cell_height);
      start = stop + 1u;
     }
@@ -2751,6 +3145,12 @@ uint32_t row_end(const InlayMeasure* m, const InlayBlock& b, uint32_t block, uin
  if (b.flags & INLAY_BLOCK_FLAG_SYNTHETIC) {
   const auto& meta = doc->block_meta[block];
   const uint32_t end = meta.pool_length;
+  if (b.kind == INLAY_TABLE) {
+   uint32_t stop = pos;
+   while (stop < end && doc->ast_text[meta.pool_offset + stop] != '\n') ++stop;
+   if (stop < end && doc->ast_text[meta.pool_offset + stop] == '\n') ++stop;
+   return stop;
+  }
   if (b.kind != INLAY_CODE_BLOCK || diagram_block(doc, b) || is_custom_fence) return end;
   uint32_t stop = pos;
   for (uint32_t line = 0; line < 16u && stop < end; ++line) {
@@ -2770,10 +3170,12 @@ uint32_t row_end(const InlayMeasure* m, const InlayBlock& b, uint32_t block, uin
   }
   return stop;
  }
- while (stop < end && doc->source[stop] != '\n' && (b.kind == INLAY_TABLE || stop - pos < limit)) ++stop;
- while (stop < end && (uint8_t(doc->source[stop]) & 0xc0u) == 0x80u) ++stop;
- if (b.kind != INLAY_TABLE && stop < end) stop = finish_inline_row(m, pos, stop, limit, decorate);
- if (stop < end && doc->source[stop] == '\n') ++stop;
+ const bool synth_r = (b.flags & INLAY_BLOCK_FLAG_SYNTHETIC) != 0;
+ const char* rbuf = synth_r ? (doc->ast_text + doc->block_meta[block].pool_offset) : doc->source;
+ while (stop < end && rbuf[stop] != '\n' && (b.kind == INLAY_TABLE || stop - pos < limit)) ++stop;
+ while (stop < end && (uint8_t(rbuf[stop]) & 0xc0u) == 0x80u) ++stop;
+ if (!synth_r && b.kind != INLAY_TABLE && stop < end) stop = finish_inline_row(m, pos, stop, limit, decorate);
+ if (stop < end && rbuf[stop] == '\n') ++stop;
  return stop;
 }
 
@@ -2790,23 +3192,24 @@ bool prepare_view(InlayDoc* doc, InlayMeasure* measure, const InlayDocViewDesc& 
  if (doc->block_count > measure->open_capacity) {
   constexpr uint32_t kMaxBlocks = 64u * 1024u * 1024u;
   const uint32_t old_cap = measure->open_capacity;
-  uint32_t c0 = old_cap, c1 = old_cap, c2 = old_cap, c3 = old_cap, c4 = old_cap, c5 = old_cap;
+  uint32_t c0 = old_cap, c1 = old_cap, c2 = old_cap, c3 = old_cap, c4 = old_cap, c5 = old_cap, c6 = old_cap;
   if (!inlay_grow_pod(measure->details, c0, doc->block_count, 64u, kMaxBlocks) ||
       !inlay_grow_pod(measure->open, c1, c0, 64u, kMaxBlocks) ||
       !inlay_grow_pod(measure->code_wrap, c2, c0, 64u, kMaxBlocks) ||
       !inlay_grow_pod(measure->code_scroll_x, c3, c0, 64u, kMaxBlocks) ||
       !inlay_grow_pod(measure->diagram_full_scale, c4, c0, 64u, kMaxBlocks) ||
+      !inlay_grow_pod(measure->diagram_zoom, c6, c0, 64u, kMaxBlocks) ||
       !inlay_grow_pod(measure->copied_until_ms, c5, c0, 64u, kMaxBlocks)) return false;
   for (uint32_t i = old_cap; i < c5; ++i) {
    measure->open[i] = true; measure->code_wrap[i] = false; measure->code_scroll_x[i] = 0.f;
-   measure->diagram_full_scale[i] = false; measure->copied_until_ms[i] = 0u;
+   measure->diagram_full_scale[i] = false; measure->diagram_zoom[i] = 1.f; measure->copied_until_ms[i] = 0u;
   }
   measure->open_capacity = c5;
  }
  if (measure->width == 0) {
   for (uint32_t i = 0; i < measure->open_capacity; ++i) {
    measure->open[i] = true; measure->code_wrap[i] = false; measure->code_scroll_x[i] = 0.f;
-   measure->diagram_full_scale[i] = false; measure->copied_until_ms[i] = 0u;
+   measure->diagram_full_scale[i] = false; measure->diagram_zoom[i] = 1.f; measure->copied_until_ms[i] = 0u;
   }
   measure->doc_sel_active = false;
   measure->doc_sel_dragging = false;
@@ -2821,7 +3224,7 @@ bool prepare_view(InlayDoc* doc, InlayMeasure* measure, const InlayDocViewDesc& 
    details_range(source, doc->blocks[block], &r.summary, &r.summary_end, &r.body, &r.end);
   }
  }
- if (!cache_inline(measure, source)) return false;
+ if (!cache_inline(measure, source, view.streaming_repair)) return false;
  const uint32_t limit = uint32_t(std::fmin(2048.f, std::fmax(32.f, (row_width - 48) / (view.font_size_px + 12) * 24)));
  const bool decorate = view.inline_decorator_fn != nullptr;
  const bool has_custom_fence_cb = view.custom_fence_estimate_fn && view.custom_fence_render_fn;
@@ -2880,9 +3283,10 @@ bool prepare_view(InlayDoc* doc, InlayMeasure* measure, const InlayDocViewDesc& 
    const uint32_t stop = row_end(measure, b, block, pos, limit, decorate, is_custom);
    const bool first = pos == (synth ? 0u : b.content_offset);
    bool separator = false;
+   const EtchStr tbl_src = (b.kind == INLAY_TABLE && synth) ? block_code_str(doc, block) : source;
    if (need_separator && !first) {
-    const uint32_t qskip = b.quote_depth ? strip_quote_prefix(source.chars + pos, stop - pos, b.quote_depth) : 0u;
-    separator = inlay_table_rule(source.chars + pos + qskip, (stop - pos) - qskip);
+    const uint32_t qskip = (!synth && b.quote_depth) ? strip_quote_prefix(tbl_src.chars + pos, stop - pos, b.quote_depth) : 0u;
+    separator = inlay_table_rule(tbl_src.chars + pos + qskip, (stop - pos) - qskip);
    }
    const uint32_t li_idx = (b.kind == INLAY_LIST || b.kind == INLAY_TASK_LIST) ? find_list_item_for_offset(doc, block, pos) : UINT32_MAX;
    InlayRow next = {block, pos, stop - pos, header, 0, code_line_num, 1, 0, 0, li_idx, 0.f, 0.f, 0.f, lex_st, first, zebra, separator, false, is_custom, b.kind};
@@ -2900,7 +3304,7 @@ bool prepare_view(InlayDoc* doc, InlayMeasure* measure, const InlayDocViewDesc& 
     }
    }
    if (first && b.kind == INLAY_TABLE) {
-    const uint32_t columns = table_columns(table_line(source, next, b.quote_depth));
+    const uint32_t columns = table_columns(table_line(tbl_src, next, synth ? 0u : b.quote_depth));
     next.table_columns = columns ? columns : 1u;
    }
    if (!first) need_separator = false;
@@ -3421,14 +3825,16 @@ INLAY_API float inlay_doc_measure_height(InlayDoc* doc, uint32_t view_id, float 
    total += estimate_row(view, style, width, b, body, true, true, diagram_block(doc, b), 1, img_src, i);
    continue;
   }
-  uint32_t pos = b.content_offset, end = pos + b.content_length, columns = 1;
+  const bool synth_t = (b.flags & INLAY_BLOCK_FLAG_SYNTHETIC) != 0;
+  const EtchStr tsrc = synth_t ? block_code_str(doc, i) : source;
+  uint32_t pos = synth_t ? 0u : b.content_offset, end = synth_t ? tsrc.length : (pos + b.content_length), columns = 1;
   bool first = true, rule = false;
   while (pos < end) {
    uint32_t stop = pos;
-   while (stop < end && source.chars[stop] != '\n') ++stop;
+   while (stop < end && tsrc.chars[stop] != '\n') ++stop;
    const uint32_t next = stop < end ? stop + 1u : stop;
-   EtchStr line = slice(source, pos, stop - pos);
-   if (b.quote_depth) {
+   EtchStr line = slice(tsrc, pos, stop - pos);
+   if (!synth_t && b.quote_depth) {
     const uint32_t qskip = strip_quote_prefix(line.chars, line.length, b.quote_depth);
     line.chars += qskip;
     line.length -= qskip;
@@ -3438,8 +3844,8 @@ INLAY_API float inlay_doc_measure_height(InlayDoc* doc, uint32_t view_id, float 
     if (!columns) columns = 1;
    }
    const bool separator = rule && inlay_table_rule(line.chars, line.length);
-   const bool last = next == end || (first && !std::memchr(source.chars + next, '\n', end - next - 1u) &&
-                                     inlay_table_rule(source.chars + next, end - next));
+   const bool last = next == end || (first && !std::memchr(tsrc.chars + next, '\n', end - next - 1u) &&
+                                     inlay_table_rule(tsrc.chars + next, end - next));
    if (separator) total += view.height_px == 0 ? 0.f : 1.f;
    else total += estimate_row(view, style, width, b, line, first, last, false, columns);
    rule = first;
@@ -3467,6 +3873,36 @@ INLAY_API InlayDocSelection inlay_doc_view_selection(const InlayDoc* doc, uint32
  s.total_bytes = m->plain_len;
  s.active = m->doc_sel_active && m->doc_sel_anchor != m->doc_sel_focus;
  return s;
+}
+
+INLAY_API bool inlay_doc_view_selection_rect(const InlayDoc* doc, uint32_t view_id, EtchRect* out_rect) {
+ if (!out_rect) return false;
+ *out_rect = {};
+ const InlayMeasure* m = find_view(doc, view_id);
+ if (!m || !m->doc_sel_active || m->doc_sel_anchor == m->doc_sel_focus) return false;
+ const uint32_t lo = m->doc_sel_anchor < m->doc_sel_focus ? m->doc_sel_anchor : m->doc_sel_focus;
+ const uint32_t hi = m->doc_sel_anchor > m->doc_sel_focus ? m->doc_sel_anchor : m->doc_sel_focus;
+ bool any = false;
+ float min_x = 0.f, min_y = 0.f, max_x = 0.f, max_y = 0.f;
+ for (uint32_t i = 0u; i < m->vis_seg_count; ++i) {
+  const auto& seg = m->vis_segs[i];
+  const uint32_t s_hi = seg.doc_start + seg.doc_len;
+  if (s_hi <= lo || seg.doc_start >= hi) continue;
+  const EtchRect b = etch_element_bounds(seg.element_id);
+  if (b.w <= 0.f || b.h <= 0.f) continue;
+  if (!any) {
+   min_x = b.x; min_y = b.y; max_x = b.x + b.w; max_y = b.y + b.h;
+   any = true;
+  } else {
+   if (b.x < min_x) min_x = b.x;
+   if (b.y < min_y) min_y = b.y;
+   if (b.x + b.w > max_x) max_x = b.x + b.w;
+   if (b.y + b.h > max_y) max_y = b.y + b.h;
+  }
+ }
+ if (!any) return false;
+ *out_rect = {min_x, min_y, max_x - min_x, max_y - min_y};
+ return true;
 }
 
 INLAY_API InlayDocSelection inlay_doc_view_find_text(
@@ -3902,11 +4338,13 @@ INLAY_API InlayDocResult inlay_doc_view(InlayDoc* doc, const InlayDocViewDesc* i
   old.show_code_line_numbers != view.show_code_line_numbers ||
   old.diagram_header_fn != view.diagram_header_fn ||
   old.diagram_header_user_data != view.diagram_header_user_data ||
+  old.streaming_repair != view.streaming_repair ||
   (measure->width != 0 && style_reflow_changed(measure->style, style));
  const bool refresh = reflow || measure->revision != doc->revision;
  float previous_height = flow && !refresh ? etch_element_bounds(view.id).h : 0.f;
  measure->layout_settled = previous_height > 0;
  if (refresh) {
+  if (old.streaming_repair != view.streaming_repair) measure->parsed_tail = 0u;
   if (!prepare_view(doc, measure, view, row_width, reflow)) return result;
   if (!flow) etch_virtual_list_invalidate_heights(view.id);
   if (measure->doc_sel_active) measure->doc_sel_sync_needed = true;
@@ -4056,7 +4494,8 @@ INLAY_API InlayDocResult inlay_doc_view(InlayDoc* doc, const InlayDocViewDesc* i
    qw.border_color = b.alert_kind != INLAY_ALERT_NONE
     ? alert_accent_from_kind(b.alert_kind, style, theme)
     : (style.quote_border.a != 0 ? style.quote_border : (theme.border_control.a != 0 ? theme.border_control : theme.border_subtle));
-   qw.border_sides = {2.5f, 0.f, 0.f, 0.f};
+   const float qbw = style.quote_border_width > 0.f ? style.quote_border_width : 2.5f;
+   qw.border_sides = {qbw, 0.f, 0.f, 0.f};
    etch_begin_box(&qw);
    ++open_wrappers;
   }
@@ -4085,12 +4524,13 @@ INLAY_API InlayDocResult inlay_doc_view(InlayDoc* doc, const InlayDocViewDesc* i
    box.padding.bottom += 4.f;
   }
   if (is_code_card) {
-   const float r = theme.radius_panel_px;
+   const float r = style.code_radius_px > 0.f ? style.code_radius_px : theme.radius_panel_px;
+   const float cbw = style.code_border_width > 0.f ? style.code_border_width : 1.f;
    box.background = style.code_bg.a != 0 ? style.code_bg : theme.bg_elevated;
    box.border_color = style.code_border.a != 0 ? style.code_border
     : ((is_mermaid && !inlay_is_dark_theme(theme)) ? etch_rgba8(15, 23, 42, 42) : theme.border_subtle);
    box.border_width = 0.f;
-   box.border_sides = {1.f, 1.f, info.first ? 1.f : 0.f, info.last_in_block ? 1.f : 0.f};
+   box.border_sides = {cbw, cbw, info.first ? cbw : 0.f, info.last_in_block ? cbw : 0.f};
    box.radius = {info.first ? r : 0.f, info.first ? r : 0.f, info.last_in_block ? r : 0.f, info.last_in_block ? r : 0.f};
    box.continuous_corners = true;
    if (info.first && inlay_is_dark_theme(theme)) box.top_rim_alpha = 0.06f;
@@ -4112,12 +4552,16 @@ INLAY_API InlayDocResult inlay_doc_view(InlayDoc* doc, const InlayDocViewDesc* i
    box.continuous_corners = true;
    box.padding = {padding + 4.f, padding, info.first ? padding * 0.85f : 2.f, info.last_in_block ? padding * 0.85f : 2.f};
   } else if (b.kind == INLAY_BLOCKQUOTE) {
-   box.background = style.quote_bg.a != 0 ? style.quote_bg : theme.bg_elevated;
+   const float qbw = style.quote_border_width > 0.f ? style.quote_border_width : 2.5f;
+   box.background = style.quote_no_bg ? etch_color_transparent() : (style.quote_bg.a != 0 ? style.quote_bg : theme.bg_elevated);
    box.border_color = style.quote_border.a != 0 ? style.quote_border : (theme.border_control.a != 0 ? theme.border_control : theme.border_subtle);
-   box.border_sides = {2.5f, 0.f, 0.f, 0.f};
-   box.radius = {info.first ? 3.f : 0.f, info.first ? 8.f : 0.f, info.last_in_block ? 8.f : 0.f, info.last_in_block ? 3.f : 0.f};
-   box.continuous_corners = true;
-   box.padding = {padding + 4.f, padding, info.first ? padding * 0.85f : 2.f, info.last_in_block ? padding * 0.85f : 2.f};
+   box.border_sides = {qbw, 0.f, 0.f, 0.f};
+   box.radius = style.quote_no_bg ? etch_corners_all(0.f)
+    : EtchCorners{info.first ? 3.f : 0.f, info.first ? 8.f : 0.f, info.last_in_block ? 8.f : 0.f, info.last_in_block ? 3.f : 0.f};
+   box.continuous_corners = !style.quote_no_bg;
+   box.padding = style.quote_no_bg
+    ? EtchPadding{10.f, 0.f, info.first ? 2.f : 0.f, info.last_in_block ? 2.f : 0.f}
+    : EtchPadding{padding + 4.f, padding, info.first ? padding * 0.85f : 2.f, info.last_in_block ? padding * 0.85f : 2.f};
   }
 
   const float inner_w = is_code_card
@@ -4173,14 +4617,28 @@ INLAY_API InlayDocResult inlay_doc_view(InlayDoc* doc, const InlayDocViewDesc* i
    const float code_font = effective_code_font_size(view.font_size_px, style);
    const EtchColor muted_col = style.muted_color.a != 0 ? style.muted_color : theme.text_muted;
    const bool full_scale = info.block < measure->open_capacity && measure->diagram_full_scale && measure->diagram_full_scale[info.block];
+   const float zoom_raw = (info.block < measure->open_capacity && measure->diagram_zoom) ? measure->diagram_zoom[info.block] : 1.0f;
+   const float zoom = std::fmax(0.5f, std::fmin(3.0f, zoom_raw > 0.f ? zoom_raw : 1.0f));
+   const auto set_diagram_zoom = [&](float nz) {
+    if (info.block >= measure->open_capacity || !measure->diagram_zoom) return;
+    const float cz = std::fmax(0.5f, std::fmin(3.0f, nz));
+    if (std::fabs(cz - measure->diagram_zoom[info.block]) < 0.005f) return;
+    measure->diagram_zoom[info.block] = cz;
+    measure->heights[i] = 0;
+    measure->rows[i].estimate = 0;
+    if (!flow) etch_virtual_list_invalidate_heights(view.id);
+    etch_request_redraw(doc->context);
+   };
 
    EtchStr copied = body;
    InlayDiagramResult diagram_result = {};
    InlayDiagramMeta diagram_meta = {};
    InlayDiagramDesc ddesc = inlay_diagram_desc_default();
    if (full.complete) {
-    ddesc.font_size_px = view.font_size_px;
-    ddesc.max_width_px = full_scale ? 0.f : inner_w;
+    ddesc.font_size_px = std::fmax(7.f, std::fmin(96.f, view.font_size_px * zoom));
+    ddesc.node_gap_px *= zoom;
+    ddesc.rank_gap_px *= zoom;
+    ddesc.max_width_px = (full_scale || zoom > 1.01f) ? 0.f : inner_w;
     if (style.font_id != ETCH_INVALID_FONT || style.bold_font_id != ETCH_INVALID_FONT) {
      ddesc.has_custom_fonts = true;
      ddesc.font_id = style.font_id;
@@ -4235,6 +4693,37 @@ INLAY_API InlayDocResult inlay_doc_view(InlayDoc* doc, const InlayDocViewDesc* i
     sp.height = etch_sizing_fixed(1);
     sp.shrink_width = true;
     etch_box(&sp);
+    if (full.complete && diagram_result.valid && info.block < measure->open_capacity && measure->diagram_zoom) {
+     const float zbtn_font = std::fmax(11.f, view.font_size_px * 0.78f);
+     auto zminus = etch_button_desc_default();
+     zminus.id = etch_id_index(row_id, 9);
+     zminus.variant = ETCH_BUTTON_GHOST;
+     zminus.label = ETCH_STR_LIT("-");
+     zminus.font_size_px = zbtn_font;
+     zminus.padding = etch_padding_xy(5, 2);
+     push_u32(&measure->vis_ctrl_ids, &measure->vis_ctrl_count, &measure->vis_ctrl_cap, zminus.id);
+     if (etch_button(&zminus)) set_diagram_zoom(zoom / 1.2f);
+
+     char zbuf[16];
+     const int zn = std::snprintf(zbuf, sizeof(zbuf), "%u%%", static_cast<unsigned>(std::round(zoom * 100.f)));
+     auto zreset = etch_button_desc_default();
+     zreset.id = etch_id_index(row_id, 10);
+     zreset.variant = ETCH_BUTTON_GHOST;
+     zreset.label = zn > 0 ? etch_frame_arena_push_str(doc->context, zbuf, static_cast<uint32_t>(zn)) : ETCH_STR_LIT("100%");
+     zreset.font_size_px = zbtn_font;
+     zreset.padding = etch_padding_xy(5, 2);
+     push_u32(&measure->vis_ctrl_ids, &measure->vis_ctrl_count, &measure->vis_ctrl_cap, zreset.id);
+     if (etch_button(&zreset)) set_diagram_zoom(1.0f);
+
+     auto zplus = etch_button_desc_default();
+     zplus.id = etch_id_index(row_id, 11);
+     zplus.variant = ETCH_BUTTON_GHOST;
+     zplus.label = ETCH_STR_LIT("+");
+     zplus.font_size_px = zbtn_font;
+     zplus.padding = etch_padding_xy(5, 2);
+     push_u32(&measure->vis_ctrl_ids, &measure->vis_ctrl_count, &measure->vis_ctrl_cap, zplus.id);
+     if (etch_button(&zplus)) set_diagram_zoom(zoom * 1.2f);
+    }
     if (full.complete && diagram_result.valid && diagram_result.natural_width > inner_w + 0.5f &&
         info.block < measure->open_capacity && measure->diagram_full_scale) {
      const uint32_t fit_id = etch_id_index(row_id, 4);
@@ -4299,14 +4788,61 @@ INLAY_API InlayDocResult inlay_doc_view(InlayDoc* doc, const InlayDocViewDesc* i
     etch_begin_box(&dbox);
     {
      char fig_summary[128];
-     const int n = diagram_result.sequence
-      ? std::snprintf(fig_summary, sizeof(fig_summary), "Sequence diagram: %u participants, %u messages",
-                      diagram_result.node_count, diagram_result.edge_count)
-      : std::snprintf(fig_summary, sizeof(fig_summary), "Flowchart: %u nodes, %u edges",
-                      diagram_result.node_count, diagram_result.edge_count);
+     int n = 0;
+     if (diagram_result.sequence) {
+      n = std::snprintf(fig_summary, sizeof(fig_summary), "Sequence diagram: %u participants, %u messages",
+                        diagram_result.node_count, diagram_result.edge_count);
+     } else if (diagram_meta.diagram_kind == InlayDiagramGitGraph) {
+      n = std::snprintf(fig_summary, sizeof(fig_summary), "Git graph: %u commits, %u branches",
+                        diagram_result.node_count, diagram_meta.subgraph_count);
+     } else if (diagram_meta.diagram_kind == InlayDiagramMindmap) {
+      n = std::snprintf(fig_summary, sizeof(fig_summary), "Mindmap: %u nodes", diagram_result.node_count);
+     } else if (diagram_meta.diagram_kind == InlayDiagramTimeline) {
+      n = std::snprintf(fig_summary, sizeof(fig_summary), "Timeline: %u entries", diagram_result.node_count);
+     } else {
+      n = std::snprintf(fig_summary, sizeof(fig_summary), "Flowchart: %u nodes, %u edges",
+                        diagram_result.node_count, diagram_result.edge_count);
+     }
      const EtchStr fig_val = n > 0 ? EtchStr{fig_summary, static_cast<uint32_t>(n), false} : EtchStr{};
      etch_emit_a11y_node(dbox.id, ETCH_A11Y_FIGURE, ETCH_STR_LIT("Diagram"), fig_val,
                          ETCH_A11Y_STATE_NONE, 0u, 0.f, {});
+    }
+    // Interactive Ctrl+Wheel zoom, drag-to-pan, and diagram node click hit-testing.
+    if (etch_hovered(dbox.id)) {
+     const float wy = etch_scroll_delta().y;
+     if (std::fabs(wy) > 0.01f && (etch_key_mods() & (ETCH_MOD_CTRL | ETCH_MOD_SUPER)) != 0u) {
+      set_diagram_zoom(wy > 0.f ? (zoom * 1.15f) : (zoom / 1.15f));
+     }
+    }
+    if ((needs_hscroll || needs_vscroll) && etch_dragging(dbox.id, 3.0f)) {
+     const EtchVec2 md = etch_pointer_delta();
+     if (std::fabs(md.x) > 0.1f || std::fabs(md.y) > 0.1f) {
+      const EtchVec2 cur_off = etch_scroll_offset(dbox.id);
+      etch_set_scroll_offset(dbox.id, {std::fmax(0.f, cur_off.x - md.x), std::fmax(0.f, cur_off.y - md.y)}, true);
+      etch_request_redraw(doc->context);
+     }
+    }
+    if (etch_clicked_without_drag(dbox.id, 4.0f) && diagram_result.nodes && diagram_result.node_count > 0u) {
+     EtchVec2 local = {};
+     if (etch_screen_to_element_local(dbox.id, etch_pointer_pos(), &local)) {
+      const EtchVec2 soff = etch_scroll_offset(dbox.id);
+      const float lx = local.x + soff.x;
+      const float ly = local.y + soff.y;
+      for (uint32_t ni = 0u; ni < diagram_result.node_count; ++ni) {
+       const auto& dn = diagram_result.nodes[ni];
+       if (lx >= dn.bounds.x && lx <= dn.bounds.x + dn.bounds.w &&
+           ly >= dn.bounds.y && ly <= dn.bounds.y + dn.bounds.h) {
+        const EtchStr nid = dn.id.length ? dn.id : dn.label;
+        if (nid.length > 0u) {
+         result.clicked_diagram_node = etch_frame_arena_push_str(doc->context, nid.chars, nid.length);
+         result.clicked_block_index = info.block;
+         result.clicked_bounds = dn.bounds;
+         result.clicked_mods = etch_key_mods();
+        }
+        break;
+       }
+      }
+     }
     }
     if (needs_hscroll || needs_vscroll) {
      auto dcontent = etch_box_desc_default();

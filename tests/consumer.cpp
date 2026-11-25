@@ -15,13 +15,28 @@ void render_cpp_slot(inlay::Surface*,uint32_t,float width_px,float height_px,Etc
 
 int main() {
  if(inlay::abi_version()!=INLAY_ABI_VERSION)return 1;
- static_assert(INLAY_VERSION_MAJOR==0 && INLAY_VERSION_MINOR==13);
+ static_assert(INLAY_VERSION_MAJOR==0 && INLAY_VERSION_MINOR==14);
  static_assert(INLAY_UI_DOC>INLAY_UI_SLOT && INLAY_UI_TERMINAL>INLAY_UI_DOC &&
                INLAY_UI_VIRTUAL_LIST>INLAY_UI_TERMINAL && INLAY_UI_TABLE>INLAY_UI_VIRTUAL_LIST &&
                INLAY_UI_TREE>INLAY_UI_TABLE && INLAY_UI_TREE_ITEM>INLAY_UI_TREE &&
                INLAY_UI_MENU>INLAY_UI_TREE_ITEM && INLAY_UI_CONTEXT_MENU>INLAY_UI_MENU &&
                INLAY_UI_AVATAR>INLAY_UI_CONTEXT_MENU && INLAY_UI_TOAST>INLAY_UI_AVATAR &&
-               INLAY_UI_ACCORDION>INLAY_UI_TOAST && INLAY_UI_SKELETON>INLAY_UI_ACCORDION);
+               INLAY_UI_ACCORDION>INLAY_UI_TOAST && INLAY_UI_SKELETON>INLAY_UI_ACCORDION &&
+               INLAY_UI_PORTAL>INLAY_UI_FORM && INLAY_UI_VIEW_ZONE>INLAY_UI_PORTAL &&
+               INLAY_UI_DIFF_VIEW>INLAY_UI_VIEW_ZONE);
+ const inlay::TerminalSnapshot tsnap=inlay::terminal_snapshot_default();
+ if(tsnap.struct_size!=sizeof(inlay::TerminalSnapshot) || !tsnap.cursor_visible)return 1;
+ const inlay::PortalState pstate=inlay::portal_state_default();
+ if(pstate.struct_size!=sizeof(inlay::PortalState) || pstate.zoom_factor!=1.0f)return 1;
+ const inlay::PortalFindResult pfind=inlay::portal_find_result_default();
+ if(pfind.struct_size!=sizeof(inlay::PortalFindResult) || pfind.active ||
+    inlay::portal_macos_options_default().struct_size!=sizeof(inlay::PortalMacOSOptions) ||
+    inlay::portal_gtk_options_default().struct_size!=sizeof(inlay::PortalGtkOptions))return 1;
+ (void)inlay::portal_native_backend();
+ inlay::surface_set_console_callback(nullptr,nullptr);
+ inlay::surface_set_code_tokenizer(nullptr,nullptr);
+ inlay::surface_set_doc_hooks(nullptr,nullptr);
+ (void)inlay::surface_bind_stream(nullptr,ETCH_STR_LIT("s"),nullptr);
  const inlay::PortalDesc portal=inlay_portal_desc_default();
  const inlay::SurfaceDesc surface=inlay_surface_desc_default();
  if(portal.struct_size!=sizeof(inlay::PortalDesc) || surface.struct_size!=sizeof(inlay::SurfaceDesc) ||
@@ -64,6 +79,9 @@ int main() {
  cpp_view.style=&style;
  ok &= cpp_doc && cpp_portal && inlay::surface_next_timer_ms(nullptr)==-1 &&
        !inlay::surface_bind_slot(nullptr,ETCH_STR_LIT("slot"),render_cpp_slot) &&
+       inlay::portal_eval_script(cpp_portal,ETCH_STR_LIT("1")) &&
+       inlay::portal_add_init_script(cpp_portal,ETCH_STR_LIT("2")) &&
+       inlay::portal_open_devtools(cpp_portal) &&
        inlay_doc_set_utf8(cpp_doc,ETCH_STR_LIT("Zero-cast ==C++20== wrapper"));
  bool cpp_slot_called=false;
  if(cpp_surf) {

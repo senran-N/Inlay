@@ -228,10 +228,22 @@ enum CoreExtraFlags : uint32_t {
     CefInputRequired       = 1u << 13,
     CefStopPropagation     = 1u << 14,
     CefButtonSubmit        = 1u << 15,
-    CefEditorHasGhost      = 1u << 16,
-    CefEditorHasSearch     = 1u << 17,
-    CefInputHasMinLen      = 1u << 18,
-    CefInputHasMaxLen      = 1u << 19
+    CefEditorHasGhost        = 1u << 16,
+    CefEditorHasSearch       = 1u << 17,
+    CefInputHasMinLen        = 1u << 18,
+    CefInputHasMaxLen        = 1u << 19,
+    CefSwitchHasTrackR       = 1u << 20,
+    CefSwitchHasThumbR       = 1u << 21,
+    CefSwitchHasThumbPad     = 1u << 22,
+    CefInputHasSubmitEnter   = 1u << 23,
+    CefInputSubmitEnterVal   = 1u << 24,
+    CefWindowDragPassthrough = 1u << 25,
+    CefSplitHasDividerSz     = 1u << 26,
+    CefSplitHasDividerHit    = 1u << 27,
+    CefSplitHideGrip         = 1u << 28,
+    CefIconHasSecondaryCol   = 1u << 29,
+    CefInputAutoGrow         = 1u << 30,
+    CefInputHasAutoGrowRange = 1u << 31
 };
 
 // Sparse per-node extra spec allocated lazily only for core widgets using extended props.
@@ -251,10 +263,13 @@ struct CoreNodeExtra {
     uint32_t invalid_handler; // Form onInvalid handler (INLAY_UI_NONE if none)
     uint32_t min_length;      // Input minLength
     uint32_t max_length;      // Input maxLength
-    ColorRef color_a;         // Text selection_color OR Switch off_color
+    ColorRef color_a;         // Text selection_color, Switch off_color, OR Icon secondary_color
     ColorRef color_b;         // Switch thumb_color
-    float aux_f0;             // Switch track_width OR Progress ring thickness
-    float aux_f1;             // Switch track_height
+    float aux_f0;             // Switch track_width, Progress ring thickness, OR Split divider_size_px
+    float aux_f1;             // Switch track_height OR Split divider_hit_px
+    float aux_f2;             // Switch track_radius
+    float aux_f3;             // Switch thumb_radius
+    float aux_f4;             // Switch thumb_padding_px
 };
 
 struct SplitSyncEntry {
@@ -363,6 +378,23 @@ struct AsyncActionName {
     char value[64];
 };
 
+struct RegisteredModule {
+    char name[128];
+    char* source;
+    uint32_t length;
+};
+
+struct PendingDialogSlot {
+    uint32_t tag;
+    JSValue settle[2];
+    bool active;
+};
+
+struct CommandNameEntry {
+    uint32_t id;
+    char name[64];
+};
+
 struct AsyncActionSlot {
     JSValue settle[2];
     char* payload;
@@ -432,6 +464,31 @@ struct SurfaceStorage {
     uint8_t* bootstrap_bc;
     size_t bootstrap_bc_len;
     InlaySurface* host_surface;
+    // Sandboxed in-memory ES modules (no host filesystem reads)
+    RegisteredModule* modules;
+    uint32_t module_count;
+    uint32_t module_cap;
+    // Round 3/4: Async file dialogs, dynamic command name map, host storage hooks & last root view ID
+    PendingDialogSlot pending_dialogs[8];
+    uint32_t next_dialog_tag;
+    CommandNameEntry* command_names;
+    uint32_t command_name_count;
+    uint32_t command_name_cap;
+    uint32_t pending_cmds[8];
+    uint32_t pending_cmd_count;
+    uint32_t last_view_id;
+    InlayStorageGetFn storage_get_fn;
+    InlayStorageSetFn storage_set_fn;
+    InlayStorageRemoveFn storage_remove_fn;
+    void* storage_user;
+    struct LocalStorageEntry {
+        char* key;
+        char* value;
+    };
+    LocalStorageEntry* ls_entries;
+    uint32_t ls_count;
+    uint32_t ls_cap;
+    uint64_t uuid_seq;
 };
 static_assert(std::is_standard_layout_v<SurfaceStorage>);
 static_assert(offsetof(SurfaceStorage, pub) == 0);
@@ -519,6 +576,7 @@ bool is_container_kind(InlayUiKind kind) noexcept {
         case INLAY_UI_TOOLTIP:
         case INLAY_UI_SPLIT:
         case INLAY_UI_SLOT:
+        case INLAY_UI_PORTAL:
         case INLAY_UI_TABS:
         case INLAY_UI_COMBOBOX:
         case INLAY_UI_DIVIDER:
@@ -535,6 +593,17 @@ bool is_container_kind(InlayUiKind kind) noexcept {
         case INLAY_UI_TABLE:
         case INLAY_UI_AVATAR:
         case INLAY_UI_SKELETON:
+        case INLAY_UI_CODE_EDITOR:
+        case INLAY_UI_DOCK_SPACE:
+        case INLAY_UI_DOCK_PANE:
+        case INLAY_UI_SHEET:
+        case INLAY_UI_HOVER_CARD:
+        case INLAY_UI_RADIO_GROUP:
+        case INLAY_UI_TOGGLE_GROUP:
+        case INLAY_UI_COLOR_PICKER:
+        case INLAY_UI_CHART:
+        case INLAY_UI_VIEW_ZONE:
+        case INLAY_UI_DIFF_VIEW:
             return true;
         default:
             return false;
@@ -542,8 +611,9 @@ bool is_container_kind(InlayUiKind kind) noexcept {
 }
 
 JSValue parse_json(InlaySurface* s, EtchStr json) {
-    if (json.length > 65536u) {
-        return JS_ThrowRangeError(s->js, "Event payload exceeds 64 KiB");
+    const uint32_t limit = s->desc.max_state_bytes ? s->desc.max_state_bytes : 65536u;
+    if (json.length > limit) {
+        return JS_ThrowRangeError(s->js, "JSON payload exceeds max_state_bytes");
     }
     if (json.length > 0u) {
         std::memcpy(s->json_scratch, json.chars, json.length);
@@ -586,11 +656,13 @@ int interrupt(JSContext*, void* opaque) {
     return 0;
 }
 
-void begin_tick(InlaySurface* s) {
+void begin_tick(InlaySurface* s, double budget_scale = 1.0) {
     s->running = true;
     s->timed_out = false;
+    double ms = double(s->desc.max_tick_ms) * budget_scale;
+    if (budget_scale > 1.0 && ms > 50.0) ms = 50.0;
     s->deadline =
-        SDL_GetPerformanceCounter() + uint64_t(double(s->desc.max_tick_ms) * s->frequency / 1000.0);
+        SDL_GetPerformanceCounter() + uint64_t(ms * s->frequency / 1000.0);
     ++s->stats.js_ticks;
 }
 
@@ -806,7 +878,10 @@ bool finish_tick(InlaySurface* s, uint64_t start) {
         for (auto& timer : s->timers) {
             JS_FreeValue(s->js, timer.function);
             timer.function = JS_UNDEFINED;
+            timer.due = 0.0;
+            timer.interval_ms = 0.0;
             timer.id = 0u;
+            timer.is_raf = false;
         }
         s->state_dirty = false;
         s->loaded = false;
@@ -818,8 +893,9 @@ bool finish_tick(InlaySurface* s, uint64_t start) {
 }
 
 bool save_state(InlaySurface* s, const char* bytes, size_t length) {
-    if (length > 65536u) {
-        record_error(s, "State JSON exceeds 64KiB");
+    const uint32_t limit = s->desc.max_state_bytes ? s->desc.max_state_bytes : 65536u;
+    if (length > limit) {
+        record_error(s, "State JSON exceeds max_state_bytes");
         return false;
     }
     if (length + 1u > s->state_capacity) {
@@ -1846,20 +1922,220 @@ void parse_clickable_events(InlaySurface* s, JSValueConst props, NodeStyle& st, 
     if (clickable) st.flags |= NfClickable;
 }
 
-bool has_only_class_style(JSContext* js, JSValueConst props) {
+void parse_dnd_and_keys(InlaySurface* s, JSValueConst props, NodeStyle& st) {
+    if (JS_HasException(s->js)) return;
+    TextSlice key_act = {};
+    uint32_t key_h = INLAY_UI_NONE;
+    if (inlay_ui_parse_event_prop(s, props, "onKeyDown", &key_act, &key_h)) {
+        if (auto* cold = inlay_ui_ensure_cold(s, st)) {
+            cold->on_key_action = key_act;
+            cold->on_key_handler = key_h;
+            cold->global_keys = inlay_ui_bool_prop(s, props, "globalKeys");
+            cold->consume_keys = inlay_ui_bool_prop(s, props, "consumeKeys");
+        }
+        st.flags |= NfClickable;
+    }
+    TextSlice txt_act = {};
+    uint32_t txt_h = INLAY_UI_NONE;
+    if (!JS_HasException(s->js) && inlay_ui_parse_event_prop(s, props, "onTextInput", &txt_act, &txt_h)) {
+        if (auto* cold = inlay_ui_ensure_cold(s, st)) {
+            cold->on_text_action = txt_act;
+            cold->on_text_handler = txt_h;
+            if (!cold->global_keys) cold->global_keys = inlay_ui_bool_prop(s, props, "globalKeys");
+        }
+        st.flags |= NfClickable;
+    }
+    if (JS_HasException(s->js)) return;
+    const bool draggable = inlay_ui_bool_prop(s, props, "draggable");
+    const TextSlice drag_kind = draggable ? inlay_ui_string_slice_prop(s, props, "dragKind") : TextSlice{};
+    const TextSlice drag_label = draggable ? inlay_ui_string_slice_prop(s, props, "dragLabel") : TextSlice{};
+    TextSlice drag_data = {};
+    if (draggable && !JS_HasException(s->js)) {
+        const JSValue dv = JS_GetPropertyStr(s->js, props, "dragData");
+        if (!JS_IsUndefined(dv) && !JS_IsNull(dv)) {
+            if (JS_IsString(dv)) {
+                drag_data = inlay_ui_copy_text_slice(s, dv);
+            } else {
+                const JSValue js_str = JS_JSONStringify(s->js, dv, JS_UNDEFINED, JS_UNDEFINED);
+                if (!JS_IsException(js_str) && !JS_IsUndefined(js_str)) {
+                    drag_data = inlay_ui_copy_text_slice(s, js_str);
+                }
+                JS_FreeValue(s->js, js_str);
+            }
+        }
+        JS_FreeValue(s->js, dv);
+    }
+    const TextSlice drop_accept = !JS_HasException(s->js) ? inlay_ui_string_slice_prop(s, props, "dropAccept") : TextSlice{};
+    TextSlice drop_act = {}, fdrop_act = {}, dhover_act = {};
+    uint32_t drop_h = INLAY_UI_NONE, fdrop_h = INLAY_UI_NONE, dhover_h = INLAY_UI_NONE;
+    if (!JS_HasException(s->js)) inlay_ui_parse_event_prop(s, props, "onDrop", &drop_act, &drop_h);
+    if (!JS_HasException(s->js)) inlay_ui_parse_event_prop(s, props, "onFileDrop", &fdrop_act, &fdrop_h);
+    if (!JS_HasException(s->js)) inlay_ui_parse_event_prop(s, props, "onDragHover", &dhover_act, &dhover_h);
+    if (JS_HasException(s->js)) return;
+
+    if (draggable || drop_accept.len > 0u || has_event(drop_act, drop_h) ||
+        has_event(fdrop_act, fdrop_h) || has_event(dhover_act, dhover_h)) {
+        const uint32_t dnd_idx = inlay_ui_alloc_pool(s, s->dnd_specs, s->dnd_spec_count,
+                                                     s->dnd_spec_cap, 1u, s->desc.max_nodes);
+        if (dnd_idx != INLAY_UI_NONE) {
+            s->dnd_specs[dnd_idx] = {
+                draggable, drag_kind, drag_label, drag_data, drop_accept,
+                drop_act, drop_h, fdrop_act, fdrop_h, dhover_act, dhover_h
+            };
+            if (auto* cold = inlay_ui_ensure_cold(s, st)) cold->dnd_idx = dnd_idx;
+        }
+    }
+}
+
+enum StylePropMask : uint32_t {
+    PmNone        = 0u,
+    PmAxis        = 1u << 0,
+    PmCls         = 1u << 1,
+    PmOpacity     = 1u << 2,
+    PmTransform   = 1u << 3,
+    PmComposite   = 1u << 4,
+    PmColor       = 1u << 5,
+    PmTextExtras  = 1u << 6,
+    PmSizing      = 1u << 7,
+    PmBorderPad   = 1u << 8,
+    PmVisualCraft = 1u << 9,
+    PmFont        = 1u << 10,
+    PmDisabled    = 1u << 11,
+    PmClick       = 1u << 12,
+    PmDndKeys     = 1u << 13,
+    PmAll         = 0x3FFFu
+};
+
+uint32_t scan_style_prop_mask(JSContext* js, JSValueConst props) {
     JSPropertyEnum* names = nullptr;
     uint32_t count = 0u;
-    if (JS_GetOwnPropertyNames(js, &names, &count, props, JS_GPN_STRING_MASK) < 0) return false;
-    bool only_classes = count <= 6u;
-    for (uint32_t i = 0u; i < count && only_classes; ++i) {
-        const char* name = JS_AtomToCString(js, names[i].atom);
-        only_classes = name && (std::strcmp(name, "axis") == 0 || std::strcmp(name, "cls") == 0 ||
-            std::strcmp(name, "className") == 0 || std::strcmp(name, "id") == 0 ||
-            std::strcmp(name, "key") == 0 || std::strcmp(name, "text") == 0);
-        if (name) JS_FreeCString(js, name);
+    if (JS_GetOwnPropertyNames(js, &names, &count, props, JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY) < 0) {
+        return PmAll;
+    }
+    uint32_t mask = PmNone;
+    auto sw = [](const char* s, const char* pre) noexcept -> bool {
+        return std::strncmp(s, pre, std::strlen(pre)) == 0;
+    };
+    for (uint32_t i = 0u; i < count; ++i) {
+        const char* k = JS_AtomToCString(js, names[i].atom);
+        if (!k) continue;
+        switch (k[0]) {
+            case 'a':
+                if (std::strcmp(k, "axis") == 0) mask |= PmAxis | PmBorderPad;
+                else if (std::strcmp(k, "action") == 0) mask |= PmClick;
+                else if (std::strcmp(k, "alphaMask") == 0) mask |= PmComposite;
+                else if (sw(k, "align")) mask |= PmBorderPad | PmTextExtras;
+                else if (sw(k, "active") || sw(k, "aspect") || sw(k, "attach") ||
+                         sw(k, "anchor") || std::strcmp(k, "animateLayout") == 0) mask |= PmVisualCraft;
+                break;
+            case 'b':
+                if (std::strcmp(k, "bg") == 0 || std::strcmp(k, "background") == 0) mask |= PmSizing;
+                else if (sw(k, "border")) mask |= PmBorderPad;
+                else if (sw(k, "backdrop")) mask |= PmVisualCraft;
+                else if (std::strcmp(k, "blendMode") == 0) mask |= PmComposite;
+                else if (std::strcmp(k, "bold") == 0) mask |= PmFont | PmTextExtras;
+                break;
+            case 'c':
+                if (std::strcmp(k, "cls") == 0 || std::strcmp(k, "className") == 0) mask |= PmCls;
+                else if (std::strcmp(k, "color") == 0) mask |= PmColor;
+                else if (std::strcmp(k, "cursor") == 0) mask |= PmComposite;
+                else if (std::strcmp(k, "continuousCorners") == 0) mask |= PmBorderPad;
+                else if (std::strcmp(k, "consumeKeys") == 0) mask |= PmDndKeys;
+                else if (std::strcmp(k, "colSpan") == 0 || std::strcmp(k, "clipChildren") == 0 ||
+                         std::strcmp(k, "clampToViewport") == 0) mask |= PmVisualCraft;
+                break;
+            case 'd':
+                if (std::strcmp(k, "disabled") == 0) mask |= PmDisabled;
+                else if (sw(k, "drag") || sw(k, "drop")) mask |= PmDndKeys;
+                break;
+            case 'e':
+                if (std::strcmp(k, "ellipsis") == 0) mask |= PmTextExtras;
+                else if (std::strcmp(k, "elevation") == 0) mask |= PmVisualCraft;
+                break;
+            case 'f':
+                if (std::strcmp(k, "fontSize") == 0) mask |= PmSizing | PmTextExtras;
+                else if (std::strcmp(k, "fontWeight") == 0 || std::strcmp(k, "fontFeatures") == 0) mask |= PmFont | PmTextExtras;
+                else if (std::strcmp(k, "flexGrow") == 0) mask |= PmSizing | PmVisualCraft | PmTextExtras;
+                else if (std::strcmp(k, "flexShrink") == 0) mask |= PmSizing | PmVisualCraft;
+                else if (sw(k, "focus") || std::strcmp(k, "flipOnOverflow") == 0) mask |= PmVisualCraft;
+                break;
+            case 'g':
+                if (std::strcmp(k, "gap") == 0) mask |= PmBorderPad;
+                else if (std::strcmp(k, "globalKeys") == 0) mask |= PmDndKeys;
+                else if (std::strcmp(k, "gradient") == 0 || sw(k, "grid")) mask |= PmVisualCraft;
+                break;
+            case 'h':
+                if (std::strcmp(k, "height") == 0) mask |= PmSizing;
+                else if (sw(k, "hover")) mask |= PmVisualCraft | PmTextExtras;
+                break;
+            case 'i':
+                if (std::strcmp(k, "italic") == 0) mask |= PmFont | PmTextExtras;
+                else if (std::strcmp(k, "insetShadow") == 0) mask |= PmVisualCraft;
+                break;
+            case 'j':
+                if (sw(k, "justify")) mask |= PmBorderPad;
+                break;
+            case 'l':
+                if (std::strcmp(k, "lineHeight") == 0 || std::strcmp(k, "letterSpacing") == 0) mask |= PmTextExtras;
+                break;
+            case 'm':
+                if (sw(k, "margin")) mask |= PmSizing | PmTextExtras;
+                else if (std::strcmp(k, "mono") == 0) mask |= PmFont | PmTextExtras;
+                else if (std::strcmp(k, "maxLines") == 0) mask |= PmTextExtras;
+                else if (sw(k, "min") || sw(k, "max")) mask |= PmSizing;
+                break;
+            case 'n':
+                if (std::strcmp(k, "noLiga") == 0) mask |= PmFont | PmTextExtras;
+                break;
+            case 'o':
+                if (std::strcmp(k, "opacity") == 0) mask |= PmOpacity;
+                else if (std::strcmp(k, "opentype") == 0) mask |= PmFont | PmTextExtras;
+                else if (std::strcmp(k, "offsetX") == 0 || std::strcmp(k, "offsetY") == 0) mask |= PmVisualCraft;
+                else if (std::strcmp(k, "onKeyDown") == 0 || std::strcmp(k, "onTextInput") == 0 ||
+                         std::strcmp(k, "onDrop") == 0 || std::strcmp(k, "onFileDrop") == 0 ||
+                         std::strcmp(k, "onDragHover") == 0) mask |= PmDndKeys;
+                else if (std::strcmp(k, "onClick") == 0 || std::strcmp(k, "onDoubleClick") == 0 ||
+                         std::strcmp(k, "onRightClick") == 0 || std::strcmp(k, "onHover") == 0 ||
+                         std::strcmp(k, "onFocus") == 0) mask |= PmClick;
+                break;
+            case 'p':
+                if (sw(k, "padding")) mask |= PmBorderPad;
+                else if (sw(k, "press") || std::strcmp(k, "pointerPassthrough") == 0) mask |= PmVisualCraft;
+                break;
+            case 'r':
+                if (std::strcmp(k, "radius") == 0 || std::strcmp(k, "rowGap") == 0) mask |= PmBorderPad;
+                else if (sw(k, "rotate")) mask |= PmTransform;
+                else if (std::strcmp(k, "rowSpan") == 0) mask |= PmVisualCraft;
+                break;
+            case 's':
+                if (std::strcmp(k, "stopPropagation") == 0) mask |= PmOpacity;
+                else if (std::strcmp(k, "size") == 0) mask |= PmSizing;
+                else if (sw(k, "scale")) mask |= PmTransform;
+                else if (std::strcmp(k, "smallCaps") == 0 || std::strcmp(k, "slashedZero") == 0) mask |= PmFont | PmTextExtras;
+                else if (std::strcmp(k, "selectable") == 0 || std::strcmp(k, "selectionColor") == 0) mask |= PmTextExtras;
+                else if (sw(k, "shadow") || sw(k, "shrink") || sw(k, "scroll")) mask |= PmVisualCraft;
+                break;
+            case 't':
+                if (sw(k, "translate")) mask |= PmTransform;
+                else if (std::strcmp(k, "transition") == 0) mask |= PmComposite;
+                else if (std::strcmp(k, "tabularNums") == 0) mask |= PmFont | PmTextExtras;
+                else if (std::strcmp(k, "topRimAlpha") == 0) mask |= PmVisualCraft;
+                break;
+            case 'w':
+                if (std::strcmp(k, "width") == 0) mask |= PmSizing;
+                else if (std::strcmp(k, "wrap") == 0) mask |= PmVisualCraft | PmTextExtras;
+                else if (std::strcmp(k, "windowDragPassthrough") == 0) mask |= PmVisualCraft;
+                break;
+            case 'z':
+                if (std::strcmp(k, "zIndex") == 0) mask |= PmVisualCraft;
+                break;
+            default:
+                break;
+        }
+        JS_FreeCString(js, k);
     }
     JS_FreePropertyEnum(js, names, count);
-    return only_classes;
+    return mask;
 }
 
 void parse_style(InlaySurface* s, JSValueConst props, InlayUiKind kind,
@@ -1870,43 +2146,52 @@ void parse_style(InlaySurface* s, JSValueConst props, InlayUiKind kind,
         kind == INLAY_UI_POPOVER || kind == INLAY_UI_TREE || kind == INLAY_UI_ACCORDION ||
         kind == INLAY_UI_DOC || kind == INLAY_UI_TERMINAL;
     if (default_col) st.flags |= NfColumn;
+
+    const uint32_t pm = scan_style_prop_mask(s->js, props);
+
     // Pre-apply explicit `axis` before `cls` so axis-dependent utilities (`items-*`, `gap-y-*`) resolve accurately.
-    peek_str_prop(s, props, "axis", [&](const char* c, size_t n) noexcept {
-        if (inlay_ui_str_eq(c, n, "row")) st.flags &= ~NfColumn;
-        else if (inlay_ui_str_eq(c, n, "column") || inlay_ui_str_eq(c, n, "col")) st.flags |= NfColumn;
-        return true;
-    });
+    if (pm & PmAxis) {
+        peek_str_prop(s, props, "axis", [&](const char* c, size_t n) noexcept {
+            if (inlay_ui_str_eq(c, n, "row")) st.flags &= ~NfColumn;
+            else if (inlay_ui_str_eq(c, n, "column") || inlay_ui_str_eq(c, n, "col")) st.flags |= NfColumn;
+            return true;
+        });
+    }
 
     // 1. Utility classes (`cls` / `className`) run FIRST so explicit props override them.
-    const bool applied_cls = peek_str_prop(s, props, "cls", [&](const char* c, size_t n) {
-        if (n > 0u) inlay_ui_apply_cls(s, c, n, kind, st);
-        return n > 0u;
-    });
-    if (!applied_cls && !JS_HasException(s->js)) {
-        peek_str_prop(s, props, "className", [&](const char* c, size_t n) {
+    if (pm & PmCls) {
+        const bool applied_cls = peek_str_prop(s, props, "cls", [&](const char* c, size_t n) {
             if (n > 0u) inlay_ui_apply_cls(s, c, n, kind, st);
             return n > 0u;
         });
+        if (!applied_cls && !JS_HasException(s->js)) {
+            peek_str_prop(s, props, "className", [&](const char* c, size_t n) {
+                if (n > 0u) inlay_ui_apply_cls(s, c, n, kind, st);
+                return n > 0u;
+            });
+        }
     }
     if (JS_HasException(s->js)) return;
-    if ((kind == INLAY_UI_TEXT || kind == INLAY_UI_BOX) && has_only_class_style(s->js, props)) return;
+    if ((kind == INLAY_UI_TEXT || kind == INLAY_UI_BOX) && (pm & ~(PmAxis | PmCls)) == 0u) return;
 
     // 2. Shared opacity, transforms, compositing, transitions & event scoping
-    float op = st.opacity;
-    if (inlay_ui_opt_number_prop(s, props, "opacity", &op)) {
-        st.opacity = std::fmin(1.f, std::fmax(0.f, op));
-        st.flags |= NfHasOpacity;
+    if (pm & PmOpacity) {
+        float op = st.opacity;
+        if (inlay_ui_opt_number_prop(s, props, "opacity", &op)) {
+            st.opacity = std::fmin(1.f, std::fmax(0.f, op));
+            st.flags |= NfHasOpacity;
+        }
+        if (inlay_ui_bool_prop(s, props, "stopPropagation")) {
+            if (auto* cx = ensure_core_extra(s, node_index)) cx->flags |= CefStopPropagation;
+        }
     }
-    parse_transform_props(s, props, st);
-    parse_compositing_and_transition_props(s, props, st);
-    if (inlay_ui_bool_prop(s, props, "stopPropagation")) {
-        if (auto* cx = ensure_core_extra(s, node_index)) cx->flags |= CefStopPropagation;
-    }
-
-    parse_color_prop(s, props, "color", &st.color);
+    if (pm & PmTransform) parse_transform_props(s, props, st);
+    if (pm & PmComposite) parse_compositing_and_transition_props(s, props, st);
+    if (pm & PmColor) parse_color_prop(s, props, "color", &st.color);
     if (JS_HasException(s->js)) return;
 
     if (kind == INLAY_UI_TEXT) {
+        if ((pm & PmTextExtras) == 0u) return;
         float fs = st.font_size;
         if (inlay_ui_opt_number_prop(s, props, "fontSize", &fs)) {
             st.font_size = fs;
@@ -1989,54 +2274,61 @@ void parse_style(InlaySurface* s, JSValueConst props, InlayUiKind kind,
         return;
     }
 
-    parse_sizing_prop(s, props, "width", &st.w_kind, &st.w_val, &st.flags2, Nf2WExplicit);
-    parse_sizing_prop(s, props, "height", &st.h_kind, &st.h_val, &st.flags2, Nf2HExplicit);
-    parse_sizing_limits(s, props, st);
+    if (pm & PmSizing) {
+        parse_sizing_prop(s, props, "width", &st.w_kind, &st.w_val, &st.flags2, Nf2WExplicit);
+        parse_sizing_prop(s, props, "height", &st.h_kind, &st.h_val, &st.flags2, Nf2HExplicit);
+        parse_sizing_limits(s, props, st);
 
-    if (!parse_color_prop(s, props, "bg", &st.bg)) {
-        parse_color_prop(s, props, "background", &st.bg);
-    }
-    float fs = st.font_size;
-    if (inlay_ui_opt_number_prop(s, props, "fontSize", &fs)) {
-        st.font_size = fs;
-        st.flags |= NfHasSize;
-    }
+        if (!parse_color_prop(s, props, "bg", &st.bg)) {
+            parse_color_prop(s, props, "background", &st.bg);
+        }
+        float fs = st.font_size;
+        if (inlay_ui_opt_number_prop(s, props, "fontSize", &fs)) {
+            st.font_size = fs;
+            st.flags |= NfHasSize;
+        }
 
-    const ColdVisualStyle* existing_m = inlay_ui_get_cold(s, st);
-    EtchPadding marg = (existing_m && (existing_m->cflags & CfHasMargin)) ? existing_m->margin : EtchPadding{};
-    if (parse_edges_prop(s, props, "margin", "marginX", "marginY",
-                         "marginTop", "marginRight", "marginBottom", "marginLeft", &marg, true)) {
-        if (auto* c = inlay_ui_ensure_cold(s, st)) {
-            c->margin = marg;
-            c->cflags |= CfHasMargin;
+        const ColdVisualStyle* existing_m = inlay_ui_get_cold(s, st);
+        EtchPadding marg = (existing_m && (existing_m->cflags & CfHasMargin)) ? existing_m->margin : EtchPadding{};
+        if (parse_edges_prop(s, props, "margin", "marginX", "marginY",
+                             "marginTop", "marginRight", "marginBottom", "marginLeft", &marg, true)) {
+            if (auto* c = inlay_ui_ensure_cold(s, st)) {
+                c->margin = marg;
+                c->cflags |= CfHasMargin;
+            }
         }
     }
 
     if (kind == INLAY_UI_SPACER) {
-        float sp_sz = 0.f;
-        if (inlay_ui_opt_number_prop(s, props, "size", &sp_sz, false, 0.0)) {
-            st.value = sp_sz;
-            st.flags2 |= Nf2HasSpacerSize;
-        }
-        if (inlay_ui_opt_number_prop(s, props, "flexGrow", &st.flex_grow, false, 0.0)) {
-            st.flags |= NfHasFlexGrow;
-        }
-        if (inlay_ui_opt_number_prop(s, props, "flexShrink", &st.flex_shrink, false, 0.0)) {
-            st.flags |= NfHasFlexShrink;
+        if (pm & PmSizing) {
+            float sp_sz = 0.f;
+            if (inlay_ui_opt_number_prop(s, props, "size", &sp_sz, false, 0.0)) {
+                st.value = sp_sz;
+                st.flags2 |= Nf2HasSpacerSize;
+            }
+            if (inlay_ui_opt_number_prop(s, props, "flexGrow", &st.flex_grow, false, 0.0)) {
+                st.flags |= NfHasFlexGrow;
+            }
+            if (inlay_ui_opt_number_prop(s, props, "flexShrink", &st.flex_shrink, false, 0.0)) {
+                st.flags |= NfHasFlexShrink;
+            }
         }
         return;
     }
 
     if (kind == INLAY_UI_DIVIDER) {
-        peek_str_prop(s, props, "axis", [&](const char* c, size_t n) noexcept {
-            if (inlay_ui_str_eq(c, n, "column") || inlay_ui_str_eq(c, n, "col")) st.flags |= NfColumn;
-            else if (inlay_ui_str_eq(c, n, "row")) st.flags &= ~NfColumn;
-            return true;
-        });
+        if (pm & PmAxis) {
+            peek_str_prop(s, props, "axis", [&](const char* c, size_t n) noexcept {
+                if (inlay_ui_str_eq(c, n, "column") || inlay_ui_str_eq(c, n, "col")) st.flags |= NfColumn;
+                else if (inlay_ui_str_eq(c, n, "row")) st.flags &= ~NfColumn;
+                return true;
+            });
+        }
         return;
     }
 
     // Shared visual & container styling props
+    if (pm & PmBorderPad) {
     parse_color_prop(s, props, "borderColor", &st.border_color);
     if (inlay_ui_opt_number_prop(s, props, "borderWidth", &st.border_width)) {
         st.flags |= NfHasBorderWidth;
@@ -2133,13 +2425,15 @@ void parse_style(InlaySurface* s, JSValueConst props, InlayUiKind kind,
         else if (inlay_ui_str_eq(c, n, "column") || inlay_ui_str_eq(c, n, "col")) st.flags |= NfColumn;
         return true;
     });
+    } // end PmBorderPad
 
     // Visual craft, state overrides & layout props for containers, buttons, widgets, and extended widgets
-    if (kind == INLAY_UI_BOX || kind == INLAY_UI_CARD || kind == INLAY_UI_FORM || kind == INLAY_UI_SCROLL ||
-        kind == INLAY_UI_POPOVER || kind == INLAY_UI_BADGE || kind == INLAY_UI_BUTTON ||
-        kind == INLAY_UI_SLOT || kind == INLAY_UI_TABS || kind == INLAY_UI_MATH ||
-        kind == INLAY_UI_DIAGRAM || kind == INLAY_UI_IMAGE || kind == INLAY_UI_MODAL ||
-        kind == INLAY_UI_INPUT || kind == INLAY_UI_COMBOBOX || inlay_ui_is_ext_widget(kind)) {
+    if ((pm & PmVisualCraft) &&
+        (kind == INLAY_UI_BOX || kind == INLAY_UI_CARD || kind == INLAY_UI_FORM || kind == INLAY_UI_SCROLL ||
+         kind == INLAY_UI_POPOVER || kind == INLAY_UI_BADGE || kind == INLAY_UI_BUTTON ||
+         kind == INLAY_UI_SLOT || kind == INLAY_UI_TABS || kind == INLAY_UI_MATH ||
+         kind == INLAY_UI_DIAGRAM || kind == INLAY_UI_IMAGE || kind == INLAY_UI_MODAL ||
+         kind == INLAY_UI_INPUT || kind == INLAY_UI_COMBOBOX || inlay_ui_is_ext_widget(kind))) {
         EtchElevation elev = ETCH_ELEVATION_NONE;
         if (peek_str_prop(s, props, "elevation", [&](const char* c, size_t n) noexcept {
                 return parse_elevation_token(c, n, &elev);
@@ -2312,6 +2606,9 @@ void parse_style(InlaySurface* s, JSValueConst props, InlayUiKind kind,
         if (inlay_ui_bool_prop(s, props, "pointerPassthrough")) {
             if (auto* c = inlay_ui_ensure_cold(s, st)) c->cflags |= CfPointerPassthrough;
         }
+        if (inlay_ui_bool_prop(s, props, "windowDragPassthrough")) {
+            if (auto* cx = ensure_core_extra(s, node_index)) cx->flags |= CefWindowDragPassthrough;
+        }
         if (inlay_ui_opt_bool_prop(s, props, "clampToViewport", &btmp)) {
             if (auto* c = inlay_ui_ensure_cold(s, st)) {
                 c->cflags |= CfHasClampToViewport;
@@ -2338,22 +2635,31 @@ void parse_style(InlaySurface* s, JSValueConst props, InlayUiKind kind,
     }
 
     // Widget-specific properties
-    if (kind == INLAY_UI_BUTTON || kind == INLAY_UI_BADGE || kind == INLAY_UI_INPUT ||
-        kind == INLAY_UI_CHECKBOX || kind == INLAY_UI_TOGGLE || kind == INLAY_UI_TABS ||
-        inlay_ui_is_ext_widget(kind)) {
+    if ((pm & PmFont) &&
+        (kind == INLAY_UI_BUTTON || kind == INLAY_UI_BADGE || kind == INLAY_UI_INPUT ||
+         kind == INLAY_UI_CHECKBOX || kind == INLAY_UI_TOGGLE || kind == INLAY_UI_TABS ||
+         inlay_ui_is_ext_widget(kind))) {
         parse_font_props(s, props, st);
         parse_opentype_props(s, props, st);
     }
 
-    if (kind == INLAY_UI_BUTTON || kind == INLAY_UI_INPUT || kind == INLAY_UI_CHECKBOX ||
-        kind == INLAY_UI_TOGGLE || kind == INLAY_UI_SLIDER || kind == INLAY_UI_COMBOBOX ||
-        kind == INLAY_UI_BOX || kind == INLAY_UI_CARD || kind == INLAY_UI_MENU) {
+    if ((pm & PmDisabled) &&
+        (kind == INLAY_UI_BUTTON || kind == INLAY_UI_INPUT || kind == INLAY_UI_CHECKBOX ||
+         kind == INLAY_UI_TOGGLE || kind == INLAY_UI_SLIDER || kind == INLAY_UI_COMBOBOX ||
+         kind == INLAY_UI_BOX || kind == INLAY_UI_CARD || kind == INLAY_UI_MENU)) {
         if (inlay_ui_bool_prop(s, props, "disabled")) st.flags |= NfDisabled;
     }
 
-    if (kind == INLAY_UI_BOX || kind == INLAY_UI_CARD || kind == INLAY_UI_SCROLL ||
-        kind == INLAY_UI_BADGE || kind == INLAY_UI_IMAGE || kind == INLAY_UI_AVATAR) {
+    if ((pm & PmClick) &&
+        (kind == INLAY_UI_BOX || kind == INLAY_UI_CARD || kind == INLAY_UI_SCROLL ||
+         kind == INLAY_UI_BADGE || kind == INLAY_UI_IMAGE || kind == INLAY_UI_AVATAR)) {
         parse_clickable_events(s, props, st, node_index);
+    }
+    if ((pm & PmDndKeys) &&
+        (kind == INLAY_UI_BOX || kind == INLAY_UI_CARD || kind == INLAY_UI_BUTTON ||
+         kind == INLAY_UI_SCROLL || kind == INLAY_UI_INPUT || kind == INLAY_UI_CODE_EDITOR ||
+         kind == INLAY_UI_TERMINAL || kind == INLAY_UI_TREE_ITEM || kind == INLAY_UI_DOCK_PANE)) {
+        parse_dnd_and_keys(s, props, st);
     }
 
     if (kind == INLAY_UI_BUTTON) {
@@ -2371,7 +2677,8 @@ void parse_style(InlaySurface* s, JSValueConst props, InlayUiKind kind,
             }
             return false;
         });
-        parse_clickable_events(s, props, st, node_index);
+        if (pm & PmClick) parse_clickable_events(s, props, st, node_index);
+        else if (has_event(st.action, st.handler)) st.flags |= NfClickable;
     } else if (kind == INLAY_UI_FORM) {
         if (!inlay_ui_parse_event_prop(s, props, "onSubmit", &st.action, &st.handler)) {
             inlay_ui_parse_event_prop(s, props, "action", &st.action, &st.handler);
@@ -2419,6 +2726,211 @@ void parse_style(InlaySurface* s, JSValueConst props, InlayUiKind kind,
                 options->field_error = search_sl;
             }
         }
+        // Round 2 rich CodeEditor bridge (Diff / inlineHighlights / overviewMarkers / stickyHeader / autoHeight / ViewZones / Folds / scrollSync / gutterRange)
+        if (!JS_HasException(s->js)) {
+            CodeEditorRichSpec espec = {};
+            espec.on_scroll_handler = INLAY_UI_NONE;
+            espec.on_gutter_click_handler = INLAY_UI_NONE;
+            espec.on_gutter_range_handler = INLAY_UI_NONE;
+            espec.on_cursor_handler = INLAY_UI_NONE;
+            bool any_rich = false;
+            espec.language = inlay_ui_string_slice_prop(s, props, "language");
+            if (espec.language.len > 0u) any_rich = true;
+            if (inlay_ui_opt_bool_prop(s, props, "highlightBrackets", &espec.highlight_brackets)) {
+                espec.has_highlight_brackets = true; any_rich = true;
+            }
+            if (inlay_ui_opt_bool_prop(s, props, "showIndentGuides", &espec.indent_guides)) {
+                espec.has_indent_guides = true; any_rich = true;
+            }
+            if (inlay_ui_opt_bool_prop(s, props, "showDiagnosticTooltips", &espec.diag_tooltips)) {
+                espec.has_diag_tooltips = true; any_rich = true;
+            }
+            if (inlay_ui_parse_event_prop(s, props, "onCursorChange", &espec.on_cursor_action, &espec.on_cursor_handler)) {
+                any_rich = true;
+            }
+            if (inlay_ui_bool_prop(s, props, "autoHeight")) { espec.auto_height = true; any_rich = true; }
+            if (inlay_ui_bool_prop(s, props, "showOverviewRuler")) { espec.show_overview_ruler = true; any_rich = true; }
+            if (inlay_ui_bool_prop(s, props, "showMinimap")) { espec.show_minimap = true; any_rich = true; }
+            if (inlay_ui_opt_bool_prop(s, props, "showLineNumbers", &espec.show_line_numbers)) {
+                espec.has_show_line_numbers = true; any_rich = true;
+            }
+            if (inlay_ui_opt_number_prop(s, props, "gutterTagWidth", &espec.gutter_tag_width, false, 0.0, 256.0)) any_rich = true;
+            if (inlay_ui_opt_number_prop(s, props, "scrollX", &espec.scroll_x, false, 0.0, 1e7)) { espec.has_scroll_x = true; any_rich = true; }
+            if (inlay_ui_opt_number_prop(s, props, "scrollY", &espec.scroll_y, false, 0.0, 1e7)) { espec.has_scroll_y = true; any_rich = true; }
+            espec.sticky_header = inlay_ui_string_slice_prop(s, props, "stickyHeader");
+            if (espec.sticky_header.len > 0u) any_rich = true;
+            if (inlay_ui_parse_event_prop(s, props, "onScroll", &espec.on_scroll_action, &espec.on_scroll_handler)) any_rich = true;
+            if (inlay_ui_parse_event_prop(s, props, "onGutterClick", &espec.on_gutter_click_action, &espec.on_gutter_click_handler)) any_rich = true;
+            if (inlay_ui_parse_event_prop(s, props, "onGutterRange", &espec.on_gutter_range_action, &espec.on_gutter_range_handler)) any_rich = true;
+
+            auto read_len = [&](JSValueConst arr, uint32_t cap) -> uint32_t {
+                if (!JS_IsArray(arr)) return 0u;
+                const JSValue lv = JS_GetPropertyStr(s->js, arr, "length");
+                uint32_t n = 0u;
+                (void)JS_ToUint32(s->js, &n, lv);
+                JS_FreeValue(s->js, lv);
+                return n > cap ? cap : n;
+            };
+            // inlayHints
+            {
+                const JSValue arr = JS_GetPropertyStr(s->js, props, "inlayHints");
+                const uint32_t n = read_len(arr, 256u);
+                if (n > 0u) {
+                    const uint32_t off = inlay_ui_alloc_pool(s, s->editor_hints, s->editor_hint_count, s->editor_hint_cap, n, 4096u);
+                    if (off != INLAY_UI_NONE) {
+                        espec.hint_off = off; espec.hint_cnt = n; any_rich = true;
+                        for (uint32_t i = 0u; i < n; ++i) {
+                            EditorInlayHintItem it = {};
+                            const JSValue el = JS_GetPropertyUint32(s->js, arr, i);
+                            if (JS_IsObject(el) && !JS_IsNull(el)) {
+                                inlay_ui_opt_uint_prop(s, el, "line", 10000000u, &it.line);
+                                inlay_ui_opt_uint_prop(s, el, "col", 1000000u, &it.col);
+                                it.text = inlay_ui_string_slice_prop(s, el, "text");
+                                parse_color_prop(s, el, "color", &it.color);
+                                parse_color_prop(s, el, "bg", &it.bg);
+                                parse_color_prop(s, el, "borderColor", &it.border_color);
+                                inlay_ui_opt_number_prop(s, el, "radius", &it.radius, false, 0.0, 32.0);
+                            }
+                            JS_FreeValue(s->js, el);
+                            s->editor_hints[off + i] = it;
+                        }
+                    }
+                }
+                JS_FreeValue(s->js, arr);
+            }
+            // inlineHighlights
+            {
+                const JSValue arr = JS_GetPropertyStr(s->js, props, "inlineHighlights");
+                const uint32_t n = read_len(arr, 512u);
+                if (n > 0u) {
+                    const uint32_t off = inlay_ui_alloc_pool(s, s->editor_inline_hls, s->editor_inline_hl_count, s->editor_inline_hl_cap, n, 8192u);
+                    if (off != INLAY_UI_NONE) {
+                        espec.hl_off = off; espec.hl_cnt = n; any_rich = true;
+                        for (uint32_t i = 0u; i < n; ++i) {
+                            EditorInlineHlItem it = {};
+                            const JSValue el = JS_GetPropertyUint32(s->js, arr, i);
+                            if (JS_IsObject(el) && !JS_IsNull(el)) {
+                                inlay_ui_opt_uint_prop(s, el, "line", 10000000u, &it.line);
+                                inlay_ui_opt_uint_prop(s, el, "startCol", 1000000u, &it.start_col);
+                                inlay_ui_opt_uint_prop(s, el, "endCol", 1000000u, &it.end_col);
+                                parse_color_prop(s, el, "bg", &it.bg);
+                                parse_color_prop(s, el, "borderColor", &it.border_color);
+                                inlay_ui_opt_number_prop(s, el, "radius", &it.radius, false, 0.0, 32.0);
+                            }
+                            JS_FreeValue(s->js, el);
+                            s->editor_inline_hls[off + i] = it;
+                        }
+                    }
+                }
+                JS_FreeValue(s->js, arr);
+            }
+            // overviewMarkers
+            {
+                const JSValue arr = JS_GetPropertyStr(s->js, props, "overviewMarkers");
+                const uint32_t n = read_len(arr, 512u);
+                if (n > 0u) {
+                    const uint32_t off = inlay_ui_alloc_pool(s, s->editor_markers, s->editor_marker_count, s->editor_marker_cap, n, 8192u);
+                    if (off != INLAY_UI_NONE) {
+                        espec.marker_off = off; espec.marker_cnt = n; any_rich = true;
+                        for (uint32_t i = 0u; i < n; ++i) {
+                            EditorOverviewItem it = {};
+                            const JSValue el = JS_GetPropertyUint32(s->js, arr, i);
+                            if (JS_IsObject(el) && !JS_IsNull(el)) {
+                                inlay_ui_opt_uint_prop(s, el, "line", 10000000u, &it.line);
+                                parse_color_prop(s, el, "color", &it.color);
+                                uint32_t lane = 0u;
+                                if (inlay_ui_opt_uint_prop(s, el, "lane", 2u, &lane)) it.lane = uint8_t(lane);
+                            }
+                            JS_FreeValue(s->js, el);
+                            s->editor_markers[off + i] = it;
+                        }
+                    }
+                }
+                JS_FreeValue(s->js, arr);
+            }
+            // lineDecorations
+            {
+                const JSValue arr = JS_GetPropertyStr(s->js, props, "lineDecorations");
+                const uint32_t n = read_len(arr, 512u);
+                if (n > 0u) {
+                    const uint32_t off = inlay_ui_alloc_pool(s, s->editor_line_decos, s->editor_line_deco_count, s->editor_line_deco_cap, n, 8192u);
+                    if (off != INLAY_UI_NONE) {
+                        espec.deco_off = off; espec.deco_cnt = n; any_rich = true;
+                        for (uint32_t i = 0u; i < n; ++i) {
+                            EditorLineDecoItem it = {};
+                            const JSValue el = JS_GetPropertyUint32(s->js, arr, i);
+                            if (JS_IsObject(el) && !JS_IsNull(el)) {
+                                inlay_ui_opt_uint_prop(s, el, "line", 10000000u, &it.line);
+                                parse_color_prop(s, el, "rowBg", &it.row_bg);
+                                parse_color_prop(s, el, "gutterBar", &it.gutter_bar);
+                                parse_color_prop(s, el, "gutterTagColor", &it.gutter_tag_color);
+                                it.gutter_tag = inlay_ui_string_slice_prop(s, el, "gutterTag");
+                            }
+                            JS_FreeValue(s->js, el);
+                            s->editor_line_decos[off + i] = it;
+                        }
+                    }
+                }
+                JS_FreeValue(s->js, arr);
+            }
+            // folds
+            {
+                const JSValue arr = JS_GetPropertyStr(s->js, props, "folds");
+                const uint32_t n = read_len(arr, 256u);
+                if (n > 0u) {
+                    const uint32_t off = inlay_ui_alloc_pool(s, s->editor_folds, s->editor_fold_count, s->editor_fold_cap, n, 4096u);
+                    if (off != INLAY_UI_NONE) {
+                        espec.fold_off = off; espec.fold_cnt = n; any_rich = true;
+                        for (uint32_t i = 0u; i < n; ++i) {
+                            EditorFoldItem it = {};
+                            const JSValue el = JS_GetPropertyUint32(s->js, arr, i);
+                            if (JS_IsObject(el) && !JS_IsNull(el)) {
+                                inlay_ui_opt_uint_prop(s, el, "start", 10000000u, &it.start);
+                                inlay_ui_opt_uint_prop(s, el, "end", 10000000u, &it.end);
+                                it.collapsed = inlay_ui_bool_prop(s, el, "collapsed");
+                            }
+                            JS_FreeValue(s->js, el);
+                            s->editor_folds[off + i] = it;
+                        }
+                    }
+                }
+                JS_FreeValue(s->js, arr);
+            }
+            // viewZones
+            {
+                const JSValue arr = JS_GetPropertyStr(s->js, props, "viewZones");
+                const uint32_t n = read_len(arr, 64u);
+                if (n > 0u) {
+                    const uint32_t off = inlay_ui_alloc_pool(s, s->editor_view_zones, s->editor_view_zone_count, s->editor_view_zone_cap, n, 1024u);
+                    if (off != INLAY_UI_NONE) {
+                        espec.vz_off = off; espec.vz_cnt = n; any_rich = true;
+                        for (uint32_t i = 0u; i < n; ++i) {
+                            EditorViewZoneItem it = {};
+                            it.height = 60.f;
+                            const JSValue el = JS_GetPropertyUint32(s->js, arr, i);
+                            if (JS_IsObject(el) && !JS_IsNull(el)) {
+                                inlay_ui_opt_uint_prop(s, el, "id", UINT32_MAX, &it.id);
+                                inlay_ui_opt_uint_prop(s, el, "afterLine", 10000000u, &it.after_line);
+                                inlay_ui_opt_number_prop(s, el, "height", &it.height, false, 4.0, 2048.0);
+                                it.above_line = inlay_ui_bool_prop(s, el, "aboveLine");
+                                parse_color_prop(s, el, "fillColor", &it.fill_color);
+                            }
+                            JS_FreeValue(s->js, el);
+                            s->editor_view_zones[off + i] = it;
+                        }
+                    }
+                }
+                JS_FreeValue(s->js, arr);
+            }
+            if (any_rich && !JS_HasException(s->js)) {
+                const uint32_t eidx = inlay_ui_alloc_pool(s, s->editor_rich_specs, s->editor_rich_spec_count,
+                                                          s->editor_rich_spec_cap, 1u, s->desc.max_nodes);
+                if (eidx != INLAY_UI_NONE) {
+                    s->editor_rich_specs[eidx] = espec;
+                    st.ext_idx = eidx;
+                }
+            }
+        }
     } else if (kind == INLAY_UI_INPUT) {
         if (!inlay_ui_parse_event_prop(s, props, "onChange", &st.action, &st.handler)) {
             inlay_ui_parse_event_prop(s, props, "action", &st.action, &st.handler);
@@ -2433,6 +2945,17 @@ void parse_style(InlaySurface* s, JSValueConst props, InlayUiKind kind,
         if (inlay_ui_bool_prop(s, props, "readOnly")) flags |= CefInputReadOnly;
         if (inlay_ui_bool_prop(s, props, "wordWrap")) flags |= CefInputWordWrap;
         if (inlay_ui_bool_prop(s, props, "required")) flags |= CefInputRequired;
+        if (inlay_ui_bool_prop(s, props, "autoGrow") && !password) flags |= CefInputAutoGrow;
+        float min_h = 0.f;
+        float max_h = 0.f;
+        const bool has_min_h = !JS_HasException(s->js) && inlay_ui_opt_number_prop(s, props, "minHeight", &min_h, false, 16.0, 2048.0);
+        const bool has_max_h = !JS_HasException(s->js) && inlay_ui_opt_number_prop(s, props, "maxHeight", &max_h, false, 16.0, 4096.0);
+        if (has_min_h || has_max_h) flags |= CefInputHasAutoGrowRange;
+        bool submit_enter = false;
+        if (inlay_ui_opt_bool_prop(s, props, "submitOnEnter", &submit_enter)) {
+            flags |= CefInputHasSubmitEnter;
+            if (submit_enter) flags |= CefInputSubmitEnterVal;
+        }
         TextSlice submit_action = {};
         uint32_t submit_handler = INLAY_UI_NONE;
         if (!JS_HasException(s->js)) {
@@ -2457,6 +2980,61 @@ void parse_style(InlaySurface* s, JSValueConst props, InlayUiKind kind,
                 cx->field_error = ferr;
                 cx->min_length = min_len;
                 cx->max_length = max_len;
+                if (has_min_h) cx->aux_f0 = min_h;
+                if (has_max_h) cx->aux_f1 = max_h;
+            }
+        }
+        // Round 2 rich Input bridge (highlights/atomic chips, ghostText, onAcceptGhost, onPasteImage, onCaret)
+        if (!JS_HasException(s->js)) {
+            InputRichSpec ispec = {};
+            ispec.on_accept_ghost_handler = INLAY_UI_NONE;
+            ispec.on_paste_image_handler = INLAY_UI_NONE;
+            ispec.on_caret_handler = INLAY_UI_NONE;
+            bool any_rich = false;
+            ispec.ghost_text = inlay_ui_string_slice_prop(s, props, "ghostText");
+            if (ispec.ghost_text.len > 0u) any_rich = true;
+            if (parse_color_prop(s, props, "ghostColor", &ispec.ghost_color)) any_rich = true;
+            if (inlay_ui_bool_prop(s, props, "acceptGhostOnTab")) { ispec.accept_ghost_on_tab = true; any_rich = true; }
+            if (inlay_ui_parse_event_prop(s, props, "onAcceptGhost", &ispec.on_accept_ghost_action, &ispec.on_accept_ghost_handler)) any_rich = true;
+            if (inlay_ui_parse_event_prop(s, props, "onPasteImage", &ispec.on_paste_image_action, &ispec.on_paste_image_handler)) any_rich = true;
+            if (inlay_ui_parse_event_prop(s, props, "onCaret", &ispec.on_caret_action, &ispec.on_caret_handler)) any_rich = true;
+            const JSValue hl_arr = JS_GetPropertyStr(s->js, props, "highlights");
+            if (JS_IsArray(hl_arr)) {
+                const JSValue lv = JS_GetPropertyStr(s->js, hl_arr, "length");
+                uint32_t n = 0u;
+                (void)JS_ToUint32(s->js, &n, lv);
+                JS_FreeValue(s->js, lv);
+                if (n > 128u) n = 128u;
+                if (n > 0u) {
+                    const uint32_t off = inlay_ui_alloc_pool(s, s->input_highlights, s->input_highlight_count, s->input_highlight_cap, n, 4096u);
+                    if (off != INLAY_UI_NONE) {
+                        ispec.hl_offset = off; ispec.hl_count = n; any_rich = true;
+                        for (uint32_t i = 0u; i < n; ++i) {
+                            InputHighlightItem item = {};
+                            const JSValue el = JS_GetPropertyUint32(s->js, hl_arr, i);
+                            if (JS_IsObject(el) && !JS_IsNull(el)) {
+                                inlay_ui_opt_uint_prop(s, el, "offset", 65536u, &item.offset);
+                                inlay_ui_opt_uint_prop(s, el, "length", 65536u, &item.length);
+                                parse_color_prop(s, el, "color", &item.color);
+                                parse_color_prop(s, el, "bg", &item.bg);
+                                parse_color_prop(s, el, "borderColor", &item.border_color);
+                                inlay_ui_opt_number_prop(s, el, "radius", &item.radius, false, 0.0, 32.0);
+                                item.atomic = inlay_ui_bool_prop(s, el, "atomic");
+                            }
+                            JS_FreeValue(s->js, el);
+                            s->input_highlights[off + i] = item;
+                        }
+                    }
+                }
+            }
+            JS_FreeValue(s->js, hl_arr);
+            if (any_rich && !JS_HasException(s->js)) {
+                const uint32_t ridx = inlay_ui_alloc_pool(s, s->input_rich_specs, s->input_rich_spec_count,
+                                                          s->input_rich_spec_cap, 1u, s->desc.max_nodes);
+                if (ridx != INLAY_UI_NONE) {
+                    s->input_rich_specs[ridx] = ispec;
+                    st.ext_idx = ridx;
+                }
             }
         }
     } else if (kind == INLAY_UI_TOGGLE || kind == INLAY_UI_CHECKBOX) {
@@ -2479,14 +3057,21 @@ void parse_style(InlaySurface* s, JSValueConst props, InlayUiKind kind,
             });
             if (inlay_ui_opt_number_prop(s, props, "trackWidth", &tw, false, 16.0, 256.0)) has_tw = true;
             if (inlay_ui_opt_number_prop(s, props, "trackHeight", &th, false, 10.0, 128.0)) has_th = true;
+            float tr = 0.f, thr = 0.f, tpad = 0.f;
+            const bool has_tr = inlay_ui_opt_number_prop(s, props, "trackRadius", &tr, false, 0.0, 128.0);
+            const bool has_thr = inlay_ui_opt_number_prop(s, props, "thumbRadius", &thr, false, 0.0, 128.0);
+            const bool has_tpad = inlay_ui_opt_number_prop(s, props, "thumbPadding", &tpad, false, 0.0, 32.0);
             ColorRef off_col = {};
             const bool has_off = parse_color_prop(s, props, "offColor", &off_col);
             ColorRef thumb_col = {};
             const bool has_thumb = parse_color_prop(s, props, "thumbColor", &thumb_col);
-            if (has_tw || has_th || has_off || has_thumb) {
+            if (has_tw || has_th || has_tr || has_thr || has_tpad || has_off || has_thumb) {
                 if (auto* cx = ensure_core_extra(s, node_index)) {
                     if (has_tw) { cx->aux_f0 = tw; cx->flags |= CefSwitchHasTrackW; }
                     if (has_th) { cx->aux_f1 = th; cx->flags |= CefSwitchHasTrackH; }
+                    if (has_tr) { cx->aux_f2 = tr; cx->flags |= CefSwitchHasTrackR; }
+                    if (has_thr) { cx->aux_f3 = thr; cx->flags |= CefSwitchHasThumbR; }
+                    if (has_tpad) { cx->aux_f4 = tpad; cx->flags |= CefSwitchHasThumbPad; }
                     if (has_off) cx->color_a = off_col;
                     if (has_thumb) cx->color_b = thumb_col;
                 }
@@ -2582,6 +3167,13 @@ void parse_style(InlaySurface* s, JSValueConst props, InlayUiKind kind,
             st.flags2 |= Nf2HasIcon;
             st.icon_id = static_cast<uint16_t>(icon);
         }
+        ColorRef sec_col = {};
+        if (parse_color_prop(s, props, "secondaryColor", &sec_col)) {
+            if (auto* cx = ensure_core_extra(s, node_index)) {
+                cx->color_a = sec_col;
+                cx->flags |= CefIconHasSecondaryCol;
+            }
+        }
         peek_str_prop(s, props, "fit", [&](const char* c, size_t n) noexcept {
             if (inlay_ui_str_eq(c, n, "contain")) st.image_fit = uint8_t(ETCH_IMAGE_FIT_CONTAIN);
             else if (inlay_ui_str_eq(c, n, "cover")) st.image_fit = uint8_t(ETCH_IMAGE_FIT_COVER);
@@ -2632,6 +3224,18 @@ void parse_style(InlaySurface* s, JSValueConst props, InlayUiKind kind,
         if (inlay_ui_opt_number_prop(s, props, "maxRatio", &mv, false, 0.0, 1.0)) {
             if (auto* c = inlay_ui_ensure_cold(s, st)) { c->max_val = mv; st.flags2 |= Nf2HasMax; }
         }
+        float div_sz = 0.f, div_hit = 0.f;
+        const bool has_div_sz = inlay_ui_opt_number_prop(s, props, "dividerSize", &div_sz, false, 0.0, 64.0);
+        const bool has_div_hit = inlay_ui_opt_number_prop(s, props, "dividerHit", &div_hit, false, 1.0, 64.0);
+        bool show_grip = true;
+        const bool has_grip = inlay_ui_opt_bool_prop(s, props, "showGrip", &show_grip);
+        if (has_div_sz || has_div_hit || (has_grip && !show_grip)) {
+            if (auto* cx = ensure_core_extra(s, node_index)) {
+                if (has_div_sz) { cx->aux_f0 = div_sz; cx->flags |= CefSplitHasDividerSz; }
+                if (has_div_hit) { cx->aux_f1 = div_hit; cx->flags |= CefSplitHasDividerHit; }
+                if (has_grip && !show_grip) cx->flags |= CefSplitHideGrip;
+            }
+        }
         if (!inlay_ui_parse_event_prop(s, props, "onChange", &st.action, &st.handler)) {
             inlay_ui_parse_event_prop(s, props, "action", &st.action, &st.handler);
         }
@@ -2676,6 +3280,7 @@ bool parse_tag_kind(const char* chars, size_t len, InlayUiKind* out, bool* out_d
     if (inlay_ui_str_eq(chars, len, "math")) { *out = INLAY_UI_MATH; return true; }
     if (inlay_ui_str_eq(chars, len, "diagram")) { *out = INLAY_UI_DIAGRAM; return true; }
     if (inlay_ui_str_eq(chars, len, "slot")) { *out = INLAY_UI_SLOT; return true; }
+    if (inlay_ui_str_eq(chars, len, "portal")) { *out = INLAY_UI_PORTAL; return true; }
     if (inlay_ui_str_eq(chars, len, "doc") || inlay_ui_str_eq(chars, len, "markdown")) {
         *out = INLAY_UI_DOC; return true;
     }
@@ -2699,6 +3304,24 @@ bool parse_tag_kind(const char* chars, size_t len, InlayUiKind* out, bool* out_d
     if (inlay_ui_str_eq(chars, len, "toast")) { *out = INLAY_UI_TOAST; return true; }
     if (inlay_ui_str_eq(chars, len, "accordion")) { *out = INLAY_UI_ACCORDION; return true; }
     if (inlay_ui_str_eq(chars, len, "skeleton")) { *out = INLAY_UI_SKELETON; return true; }
+    if (inlay_ui_str_eq(chars, len, "dockSpace") || inlay_ui_str_eq(chars, len, "dock-space") ||
+        inlay_ui_str_eq(chars, len, "dockspace")) { *out = INLAY_UI_DOCK_SPACE; return true; }
+    if (inlay_ui_str_eq(chars, len, "dockPane") || inlay_ui_str_eq(chars, len, "dock-pane") ||
+        inlay_ui_str_eq(chars, len, "dockpane")) { *out = INLAY_UI_DOCK_PANE; return true; }
+    if (inlay_ui_str_eq(chars, len, "sheet")) { *out = INLAY_UI_SHEET; return true; }
+    if (inlay_ui_str_eq(chars, len, "hoverCard") || inlay_ui_str_eq(chars, len, "hover-card") ||
+        inlay_ui_str_eq(chars, len, "hovercard")) { *out = INLAY_UI_HOVER_CARD; return true; }
+    if (inlay_ui_str_eq(chars, len, "radioGroup") || inlay_ui_str_eq(chars, len, "radio-group") ||
+        inlay_ui_str_eq(chars, len, "radiogroup")) { *out = INLAY_UI_RADIO_GROUP; return true; }
+    if (inlay_ui_str_eq(chars, len, "toggleGroup") || inlay_ui_str_eq(chars, len, "toggle-group") ||
+        inlay_ui_str_eq(chars, len, "togglegroup")) { *out = INLAY_UI_TOGGLE_GROUP; return true; }
+    if (inlay_ui_str_eq(chars, len, "colorPicker") || inlay_ui_str_eq(chars, len, "color-picker") ||
+        inlay_ui_str_eq(chars, len, "colorpicker")) { *out = INLAY_UI_COLOR_PICKER; return true; }
+    if (inlay_ui_str_eq(chars, len, "chart")) { *out = INLAY_UI_CHART; return true; }
+    if (inlay_ui_str_eq(chars, len, "viewZone") || inlay_ui_str_eq(chars, len, "view-zone") ||
+        inlay_ui_str_eq(chars, len, "viewzone")) { *out = INLAY_UI_VIEW_ZONE; return true; }
+    if (inlay_ui_str_eq(chars, len, "diffView") || inlay_ui_str_eq(chars, len, "diff-view") ||
+        inlay_ui_str_eq(chars, len, "diffview")) { *out = INLAY_UI_DIFF_VIEW; return true; }
     return false;
 }
 
@@ -3033,6 +3656,11 @@ void store_memo_native(InlaySurface* s, uint32_t memo_key, uint32_t memo_rev,
         const auto& st = s->styles[ni];
         if (inlay_ui_is_ext_widget(nd.kind) || nd.kind == INLAY_UI_FORM) return;
         if (st.ext_idx != INLAY_UI_NONE || st.handler != INLAY_UI_NONE) return;
+        if (st.cold_idx != INLAY_UI_NONE && st.cold_idx < s->cold_visual_count) {
+            const auto& c = s->cold_visuals[st.cold_idx];
+            if (c.dnd_idx != INLAY_UI_NONE || c.on_key_handler != INLAY_UI_NONE || c.on_key_action.len > 0u ||
+                c.on_text_handler != INLAY_UI_NONE || c.on_text_action.len > 0u) return;
+        }
         if (nd.first_child != INLAY_UI_NONE && (nd.first_child < node_start || nd.first_child >= s->node_count)) return;
         if (i > 0u && nd.next_sibling != INLAY_UI_NONE &&
             (nd.next_sibling < node_start || nd.next_sibling >= s->node_count)) return;
@@ -3748,7 +4376,8 @@ JSValue js_action(JSContext* js, JSValueConst, int argc, JSValueConst* argv) {
     size_t length = 0u;
     const char* payload = JS_ToCStringLen(js, &length, json);
     bool allowed = false;
-    if (payload && length <= 65536u) {
+    const uint32_t max_payload = s->desc.max_state_bytes ? s->desc.max_state_bytes : 65536u;
+    if (payload && length <= max_payload) {
         const EtchStr name_str = {binding->name, static_cast<uint32_t>(std::strlen(binding->name)), true};
         const EtchStr payload_str = {payload, static_cast<uint32_t>(length), false};
         if (check_action_authorized(s, name_str, payload_str)) {
@@ -3757,7 +4386,7 @@ JSValue js_action(JSContext* js, JSValueConst, int argc, JSValueConst* argv) {
             binding->callback(target, payload_str, binding->user);
         }
     } else if (payload) {
-        JS_ThrowTypeError(js, "Action payload exceeds 64KiB");
+        JS_ThrowTypeError(js, "Action payload exceeds max_state_bytes");
     }
     if (payload) JS_FreeCString(js, payload);
     JS_FreeValue(js, json);
@@ -3876,23 +4505,43 @@ JSValue js_request_async_action(JSContext* js, JSValueConst, int argc, JSValueCo
     return promise;
 }
 
-JSValue js_set_timeout(JSContext* js, JSValueConst, int argc, JSValueConst* argv) {
+JSValue schedule_js_timer(JSContext* js, int argc, JSValueConst* argv, bool is_interval, bool is_raf) {
     auto* s = static_cast<InlaySurface*>(JS_GetContextOpaque(js));
     double delay = 0.0;
-    if (argc < 1 || !JS_IsFunction(js, argv[0]) ||
-        (argc > 1 && JS_ToFloat64(js, &delay, argv[1]) < 0) || !std::isfinite(delay) ||
-        delay < 0.0 || delay > 86400000.0) {
+    if (argc < 1 || !JS_IsFunction(js, argv[0])) {
         return JS_ThrowTypeError(js, "Invalid timer");
+    }
+    if (!is_raf) {
+        if ((argc > 1 && JS_ToFloat64(js, &delay, argv[1]) < 0) || !std::isfinite(delay) ||
+            delay < 0.0 || delay > 86400000.0) {
+            return JS_ThrowTypeError(js, "Invalid timer");
+        }
+        if (is_interval && delay < 1.0) delay = 1.0;
     }
     for (auto& timer : s->timers) {
         if (JS_IsUndefined(timer.function)) {
             timer.function = JS_DupValue(js, argv[0]);
-            timer.due = inlay_ui_now_ms(s) + delay;
+            timer.due = inlay_ui_now_ms(s) + (is_raf ? 0.0 : delay);
+            timer.interval_ms = is_interval ? delay : 0.0;
             timer.id = ++s->next_timer;
+            timer.is_raf = is_raf;
+            if (is_raf && s->etch) etch_request_redraw(s->etch);
             return JS_NewUint32(js, timer.id);
         }
     }
     return JS_ThrowInternalError(js, "Timer capacity exceeded");
+}
+
+JSValue js_set_timeout(JSContext* js, JSValueConst, int argc, JSValueConst* argv) {
+    return schedule_js_timer(js, argc, argv, false, false);
+}
+
+JSValue js_set_interval(JSContext* js, JSValueConst, int argc, JSValueConst* argv) {
+    return schedule_js_timer(js, argc, argv, true, false);
+}
+
+JSValue js_request_animation_frame(JSContext* js, JSValueConst, int argc, JSValueConst* argv) {
+    return schedule_js_timer(js, argc, argv, false, true);
 }
 
 JSValue js_clear_timeout(JSContext* js, JSValueConst, int argc, JSValueConst* argv) {
@@ -3900,13 +4549,785 @@ JSValue js_clear_timeout(JSContext* js, JSValueConst, int argc, JSValueConst* ar
     uint32_t id = 0u;
     if (argc) JS_ToUint32(js, &id, argv[0]);
     for (auto& timer : s->timers) {
-        if (timer.id == id) {
+        if (timer.id == id && id != 0u) {
             JS_FreeValue(js, timer.function);
             timer.function = JS_UNDEFINED;
+            timer.due = 0.0;
+            timer.interval_ms = 0.0;
             timer.id = 0u;
+            timer.is_raf = false;
         }
     }
     return JS_UNDEFINED;
+}
+
+JSValue js_console_emit(JSContext* js, JSValueConst, int argc, JSValueConst* argv, int magic) {
+    auto* s = static_cast<InlaySurface*>(JS_GetContextOpaque(js));
+    if (!s || !s->console_fn) return JS_UNDEFINED;
+    char stack_buf[1024];
+    char* heap_buf = nullptr;
+    char* dst = stack_buf;
+    size_t cap = sizeof(stack_buf);
+    size_t len = 0u;
+    auto append = [&](const char* p, size_t n) {
+        if (!p || n == 0u) return;
+        if (len + n + 1u > cap) {
+            size_t ncap = cap * 2u;
+            while (ncap < len + n + 1u) ncap *= 2u;
+            if (ncap > 65536u) ncap = 65536u;
+            if (len + 1u >= ncap) return;
+            auto* nb = static_cast<char*>(heap_buf ? SDL_realloc(heap_buf, ncap) : SDL_malloc(ncap));
+            if (!nb) return;
+            if (!heap_buf && len > 0u) std::memcpy(nb, stack_buf, len);
+            heap_buf = nb;
+            dst = heap_buf;
+            cap = ncap;
+        }
+        const size_t avail = cap - 1u - len;
+        const size_t take = n < avail ? n : avail;
+        if (take > 0u) {
+            std::memcpy(dst + len, p, take);
+            len += take;
+        }
+    };
+    for (int i = 0; i < argc; ++i) {
+        if (i > 0) append(" ", 1u);
+        JSValue str_v = JS_UNDEFINED;
+        bool use_json = JS_IsObject(argv[i]) && !JS_IsNull(argv[i]) && !JS_IsFunction(js, argv[i]);
+        if (use_json) {
+            str_v = JS_JSONStringify(js, argv[i], JS_UNDEFINED, JS_UNDEFINED);
+            if (JS_IsException(str_v)) {
+                JS_FreeValue(js, JS_GetException(js));
+                str_v = JS_UNDEFINED;
+                use_json = false;
+            } else if (JS_IsUndefined(str_v)) {
+                use_json = false;
+            }
+        }
+        size_t slen = 0u;
+        const char* cs = JS_ToCStringLen(js, &slen, use_json ? str_v : argv[i]);
+        if (cs) {
+            append(cs, slen);
+            JS_FreeCString(js, cs);
+        } else if (JS_HasException(js)) {
+            JS_FreeValue(js, JS_GetException(js));
+        }
+        if (use_json) JS_FreeValue(js, str_v);
+    }
+    dst[len] = '\0';
+    InlaySurface* target = ext(s)->host_surface ? ext(s)->host_surface : s;
+    s->console_fn(target, static_cast<InlayConsoleLevel>(magic),
+                  EtchStr{dst, static_cast<uint32_t>(len), false}, s->console_user_data);
+    SDL_free(heap_buf);
+    return JS_UNDEFINED;
+}
+
+uint32_t find_rendered_node_rec(const InlaySurface* s, uint32_t idx, uint32_t parent_id,
+                                uint32_t target_raw_id, uint32_t depth, uint32_t* out_node_idx) noexcept {
+    if (idx == INLAY_UI_NONE || idx >= s->node_count || depth > 64u) return 0u;
+    const auto& n = s->nodes[idx];
+    const uint32_t eid = etch_id_index(parent_id, n.id);
+    if (n.id == target_raw_id) {
+        if (out_node_idx) *out_node_idx = idx;
+        return eid;
+    }
+    for (uint32_t ch = n.first_child; ch != INLAY_UI_NONE; ch = s->nodes[ch].next_sibling) {
+        const uint32_t found = find_rendered_node_rec(s, ch, eid, target_raw_id, depth + 1u, out_node_idx);
+        if (found != 0u) return found;
+    }
+    return 0u;
+}
+
+uint32_t resolve_js_element_id(const InlaySurface* s, JSContext* js, JSValueConst val,
+                               uint32_t* out_node_idx = nullptr) noexcept {
+    if (out_node_idx) *out_node_idx = INLAY_UI_NONE;
+    if (!s || JS_IsUndefined(val) || JS_IsNull(val)) return 0u;
+    if (JS_IsNumber(val)) {
+        uint32_t u = 0u;
+        return JS_ToUint32(js, &u, val) == 0 ? u : 0u;
+    }
+    size_t n = 0u;
+    const char* chars = JS_ToCStringLen(js, &n, val);
+    if (!chars || n == 0u) {
+        if (chars) JS_FreeCString(js, chars);
+        return 0u;
+    }
+    const uint32_t h = inlay_fnv1a_32(chars, n, 2166136261u);
+    const uint32_t raw_id = h ? h : 1u;
+    JS_FreeCString(js, chars);
+    if (s->node_count > 0u && ext(s)->last_view_id != 0u) {
+        const uint32_t found = find_rendered_node_rec(s, 0u, ext(s)->last_view_id, raw_id, 0u, out_node_idx);
+        if (found != 0u) return found;
+    }
+    return raw_id;
+}
+
+JSValue js_focus_element(JSContext* js, JSValueConst, int argc, JSValueConst* argv) {
+    auto* s = static_cast<InlaySurface*>(JS_GetContextOpaque(js));
+    if (!s || !s->etch || argc < 1) return JS_NewBool(js, false);
+    uint32_t nidx = INLAY_UI_NONE;
+    uint32_t eid = resolve_js_element_id(s, js, argv[0], &nidx);
+    if (!eid) return JS_NewBool(js, false);
+    if (nidx != INLAY_UI_NONE && nidx < s->node_count && s->nodes[nidx].kind == INLAY_UI_TERMINAL) {
+        eid = etch_id_index(eid, 0x7E4Au);
+    }
+    EtchContext* prev = etch_current_context();
+    etch_set_current_context(s->etch);
+    etch_request_focus(eid);
+    etch_set_current_context(prev);
+    etch_request_redraw(s->etch);
+    return JS_NewBool(js, true);
+}
+
+JSValue js_blur_element(JSContext* js, JSValueConst, int, JSValueConst*) {
+    auto* s = static_cast<InlaySurface*>(JS_GetContextOpaque(js));
+    if (!s || !s->etch) return JS_UNDEFINED;
+    EtchContext* prev = etch_current_context();
+    etch_set_current_context(s->etch);
+    etch_request_focus(0u);
+    etch_set_current_context(prev);
+    etch_request_redraw(s->etch);
+    return JS_UNDEFINED;
+}
+
+JSValue js_scroll_to(JSContext* js, JSValueConst, int argc, JSValueConst* argv) {
+    auto* s = static_cast<InlaySurface*>(JS_GetContextOpaque(js));
+    if (!s || !s->etch || argc < 3) return JS_NewBool(js, false);
+    uint32_t nidx = INLAY_UI_NONE;
+    const uint32_t eid = resolve_js_element_id(s, js, argv[0], &nidx);
+    double x = 0.0, y = 0.0;
+    if (!eid || JS_ToFloat64(js, &x, argv[1]) < 0 || JS_ToFloat64(js, &y, argv[2]) < 0 ||
+        !std::isfinite(x) || !std::isfinite(y)) {
+        return JS_NewBool(js, false);
+    }
+    EtchContext* prev = etch_current_context();
+    etch_set_current_context(s->etch);
+    if (nidx != INLAY_UI_NONE && nidx < s->node_count && s->nodes[nidx].kind == INLAY_UI_VIRTUAL_LIST) {
+        etch_set_virtual_list_scroll_offset(eid, y < 0.0 ? 0.0 : y, true);
+    } else if (nidx != INLAY_UI_NONE && nidx < s->node_count && s->nodes[nidx].kind == INLAY_UI_CODE_EDITOR) {
+        etch_code_editor_set_scroll_offset(eid, {static_cast<float>(x), static_cast<float>(y)}, true);
+    } else {
+        etch_set_scroll_offset(eid, {static_cast<float>(x), static_cast<float>(y)}, true);
+    }
+    etch_set_current_context(prev);
+    etch_request_redraw(s->etch);
+    return JS_NewBool(js, true);
+}
+
+JSValue js_scroll_to_bottom(JSContext* js, JSValueConst, int argc, JSValueConst* argv) {
+    auto* s = static_cast<InlaySurface*>(JS_GetContextOpaque(js));
+    if (!s || !s->etch || argc < 1) return JS_NewBool(js, false);
+    uint32_t nidx = INLAY_UI_NONE;
+    const uint32_t eid = resolve_js_element_id(s, js, argv[0], &nidx);
+    if (!eid) return JS_NewBool(js, false);
+    EtchContext* prev = etch_current_context();
+    etch_set_current_context(s->etch);
+    if (nidx != INLAY_UI_NONE && nidx < s->node_count && s->nodes[nidx].kind == INLAY_UI_VIRTUAL_LIST) {
+        etch_virtual_list_scroll_to_bottom(eid, true);
+    } else if (nidx != INLAY_UI_NONE && nidx < s->node_count && s->nodes[nidx].kind == INLAY_UI_DOC) {
+        inlay_doc_view_scroll_to_bottom(etch_id_index(eid, 0xD0C0u), true);
+    } else {
+        const EtchVec2 mx = etch_scroll_max(eid);
+        const EtchVec2 cur = etch_scroll_offset(eid);
+        etch_set_scroll_offset(eid, {cur.x, mx.y}, true);
+        etch_set_scroll_stuck_to_bottom(eid, true);
+    }
+    etch_set_current_context(prev);
+    etch_request_redraw(s->etch);
+    return JS_NewBool(js, true);
+}
+
+JSValue js_scroll_into_view(JSContext* js, JSValueConst, int argc, JSValueConst* argv) {
+    auto* s = static_cast<InlaySurface*>(JS_GetContextOpaque(js));
+    if (!s || !s->etch || argc < 2) return JS_NewBool(js, false);
+    const uint32_t sc_id = resolve_js_element_id(s, js, argv[0]);
+    const uint32_t item_id = resolve_js_element_id(s, js, argv[1]);
+    double margin = 8.0;
+    if (argc > 2 && JS_ToFloat64(js, &margin, argv[2]) < 0) margin = 8.0;
+    if (!sc_id || !item_id || !std::isfinite(margin)) return JS_NewBool(js, false);
+    EtchContext* prev = etch_current_context();
+    etch_set_current_context(s->etch);
+    etch_scroll_into_view(sc_id, item_id, static_cast<float>(margin));
+    etch_set_current_context(prev);
+    etch_request_redraw(s->etch);
+    return JS_NewBool(js, true);
+}
+
+JSValue js_measure_element(JSContext* js, JSValueConst, int argc, JSValueConst* argv) {
+    auto* s = static_cast<InlaySurface*>(JS_GetContextOpaque(js));
+    if (!s || !s->etch || argc < 1) return JS_NULL;
+    const uint32_t eid = resolve_js_element_id(s, js, argv[0]);
+    if (!eid) return JS_NULL;
+    EtchContext* prev = etch_current_context();
+    etch_set_current_context(s->etch);
+    EtchElementGeometry geom = {};
+    const bool ok = etch_element_geometry(eid, &geom);
+    const EtchRect b = ok ? geom.bounds : etch_element_bounds(eid);
+    etch_set_current_context(prev);
+    if (!ok && b.w <= 0.f && b.h <= 0.f) return JS_NULL;
+    const JSValue obj = JS_NewObject(js);
+    if (JS_IsException(obj)) return obj;
+    JS_SetPropertyStr(js, obj, "x", JS_NewFloat64(js, double(b.x)));
+    JS_SetPropertyStr(js, obj, "y", JS_NewFloat64(js, double(b.y)));
+    JS_SetPropertyStr(js, obj, "w", JS_NewFloat64(js, double(b.w)));
+    JS_SetPropertyStr(js, obj, "h", JS_NewFloat64(js, double(b.h)));
+    JS_SetPropertyStr(js, obj, "visible", JS_NewBool(js, ok && geom.visible_bounds.w > 0.f && geom.visible_bounds.h > 0.f));
+    JS_SetPropertyStr(js, obj, "visibleX", JS_NewFloat64(js, double(geom.visible_bounds.x)));
+    JS_SetPropertyStr(js, obj, "visibleY", JS_NewFloat64(js, double(geom.visible_bounds.y)));
+    JS_SetPropertyStr(js, obj, "visibleW", JS_NewFloat64(js, double(geom.visible_bounds.w)));
+    JS_SetPropertyStr(js, obj, "visibleH", JS_NewFloat64(js, double(geom.visible_bounds.h)));
+    JS_SetPropertyStr(js, obj, "opacity", JS_NewFloat64(js, ok ? double(geom.opacity) : 1.0));
+    return obj;
+}
+
+JSValue js_open_url(JSContext* js, JSValueConst, int argc, JSValueConst* argv) {
+    if (argc < 1) return JS_NewBool(js, false);
+    size_t n = 0u;
+    const char* u = JS_ToCStringLen(js, &n, argv[0]);
+    if (!u) return JS_EXCEPTION;
+    const bool ok = etch_open_url({u, static_cast<uint32_t>(n), false});
+    JS_FreeCString(js, u);
+    return JS_NewBool(js, ok);
+}
+
+JSValue js_notify_desktop(JSContext* js, JSValueConst, int argc, JSValueConst* argv) {
+    auto* s = static_cast<InlaySurface*>(JS_GetContextOpaque(js));
+    if (!s || !s->etch || argc < 1) return JS_NewBool(js, false);
+    size_t tlen = 0u, blen = 0u;
+    const char* title = JS_ToCStringLen(js, &tlen, argv[0]);
+    const char* body = (argc > 1 && !JS_IsUndefined(argv[1]) && !JS_IsNull(argv[1]))
+        ? JS_ToCStringLen(js, &blen, argv[1]) : nullptr;
+    EtchDesktopNotificationDesc d = etch_desktop_notification_desc_default();
+    d.title = {title ? title : "", static_cast<uint32_t>(tlen), false};
+    d.body = {body ? body : "", static_cast<uint32_t>(blen), false};
+    if (argc > 2 && JS_IsObject(argv[2]) && !JS_IsNull(argv[2])) {
+        d.silent = inlay_ui_bool_prop(s, argv[2], "silent");
+        uint32_t tag = 0u;
+        if (inlay_ui_opt_uint_prop(s, argv[2], "tag", UINT32_MAX, &tag)) d.tag = tag;
+    }
+    const bool ok = etch_notify_desktop(s->etch, &d);
+    if (title) JS_FreeCString(js, title);
+    if (body) JS_FreeCString(js, body);
+    return JS_NewBool(js, ok);
+}
+
+JSValue start_js_file_dialog(JSContext* js, int argc, JSValueConst* argv, uint8_t kind) {
+    auto* s = static_cast<InlaySurface*>(JS_GetContextOpaque(js));
+    auto* stg = ext(s);
+    JSValue settle[2] = {JS_UNDEFINED, JS_UNDEFINED};
+    const JSValue promise = JS_NewPromiseCapability(js, settle);
+    if (JS_IsException(promise)) return promise;
+
+    auto resolve_failed = [&]() -> JSValue {
+        JSValue res = JS_NewObject(js);
+        JS_SetPropertyStr(js, res, "cancelled", JS_NewBool(js, true));
+        JS_SetPropertyStr(js, res, "error", JS_NewBool(js, true));
+        JS_SetPropertyStr(js, res, "paths", JS_NewArray(js));
+        const JSValue call = JS_Call(js, settle[0], JS_UNDEFINED, 1, &res);
+        JS_FreeValue(js, call);
+        JS_FreeValue(js, res);
+        JS_FreeValue(js, settle[0]);
+        JS_FreeValue(js, settle[1]);
+        return promise;
+    };
+
+    PendingDialogSlot* slot = nullptr;
+    for (auto& d : stg->pending_dialogs) {
+        if (!d.active) { slot = &d; break; }
+    }
+    if (!slot || !s || !s->etch) return resolve_failed();
+
+    const char* def_loc = nullptr;
+    bool allow_many = false;
+    EtchFileDialogFilter filters[8] = {};
+    const char* filter_strs[16] = {};
+    uint32_t filter_count = 0u;
+    if (argc > 0 && JS_IsObject(argv[0]) && !JS_IsNull(argv[0])) {
+        const JSValue dv = JS_GetPropertyStr(js, argv[0], "defaultLocation");
+        if (JS_IsString(dv)) def_loc = JS_ToCString(js, dv);
+        JS_FreeValue(js, dv);
+        allow_many = inlay_ui_bool_prop(s, argv[0], "multiple");
+        const JSValue fv = JS_GetPropertyStr(js, argv[0], "filters");
+        if (JS_IsArray(fv)) {
+            const JSValue lv = JS_GetPropertyStr(js, fv, "length");
+            uint32_t n = 0u;
+            (void)JS_ToUint32(js, &n, lv);
+            JS_FreeValue(js, lv);
+            if (n > 8u) n = 8u;
+            for (uint32_t i = 0u; i < n; ++i) {
+                const JSValue el = JS_GetPropertyUint32(js, fv, i);
+                if (JS_IsObject(el) && !JS_IsNull(el)) {
+                    const JSValue nv = JS_GetPropertyStr(js, el, "name");
+                    const JSValue pv = JS_GetPropertyStr(js, el, "pattern");
+                    const char* ns = JS_IsString(nv) ? JS_ToCString(js, nv) : nullptr;
+                    const char* ps = JS_IsString(pv) ? JS_ToCString(js, pv) : nullptr;
+                    if (ns && ps) {
+                        filter_strs[filter_count * 2u] = ns;
+                        filter_strs[filter_count * 2u + 1u] = ps;
+                        filters[filter_count++] = {ns, ps};
+                    } else {
+                        if (ns) JS_FreeCString(js, ns);
+                        if (ps) JS_FreeCString(js, ps);
+                    }
+                    JS_FreeValue(js, nv);
+                    JS_FreeValue(js, pv);
+                }
+                JS_FreeValue(js, el);
+            }
+        }
+        JS_FreeValue(js, fv);
+    }
+
+    const uint32_t tag = ++stg->next_dialog_tag;
+    bool started = false;
+    if (kind == 0u) {
+        started = etch_open_file_dialog(s->etch, nullptr, filter_count ? filters : nullptr, filter_count, def_loc, tag, allow_many);
+    } else if (kind == 1u) {
+        started = etch_open_folder_dialog(s->etch, nullptr, def_loc, tag, allow_many);
+    } else {
+        started = etch_open_save_file_dialog(s->etch, nullptr, filter_count ? filters : nullptr, filter_count, def_loc, tag);
+    }
+    if (def_loc) JS_FreeCString(js, def_loc);
+    for (uint32_t i = 0u; i < filter_count * 2u; ++i) {
+        if (filter_strs[i]) JS_FreeCString(js, filter_strs[i]);
+    }
+    if (!started) return resolve_failed();
+    slot->tag = tag;
+    slot->settle[0] = settle[0];
+    slot->settle[1] = settle[1];
+    slot->active = true;
+    return promise;
+}
+
+JSValue js_open_file_dialog(JSContext* js, JSValueConst, int argc, JSValueConst* argv) {
+    return start_js_file_dialog(js, argc, argv, 0u);
+}
+JSValue js_open_folder_dialog(JSContext* js, JSValueConst, int argc, JSValueConst* argv) {
+    return start_js_file_dialog(js, argc, argv, 1u);
+}
+JSValue js_save_file_dialog(JSContext* js, JSValueConst, int argc, JSValueConst* argv) {
+    return start_js_file_dialog(js, argc, argv, 2u);
+}
+
+JSValue js_clipboard_read_image(JSContext* js, JSValueConst, int, JSValueConst*) {
+    EtchArena arena = etch_arena_create(2u * 1024u * 1024u);
+    const EtchClipboardImageData img = etch_get_clipboard_image(&arena);
+    if (!img.bytes || img.size_bytes == 0u) {
+        etch_arena_destroy(&arena);
+        return JS_NULL;
+    }
+    static constexpr char kB64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const size_t enc_len = ((size_t(img.size_bytes) + 2u) / 3u) * 4u;
+    auto* b64 = static_cast<char*>(SDL_malloc(enc_len + 1u));
+    if (!b64) {
+        etch_arena_destroy(&arena);
+        return JS_ThrowOutOfMemory(js);
+    }
+    size_t oi = 0u;
+    for (uint32_t i = 0u; i < img.size_bytes; i += 3u) {
+        const uint32_t b0 = img.bytes[i];
+        const uint32_t b1 = (i + 1u < img.size_bytes) ? img.bytes[i + 1u] : 0u;
+        const uint32_t b2 = (i + 2u < img.size_bytes) ? img.bytes[i + 2u] : 0u;
+        const uint32_t trip = (b0 << 16) | (b1 << 8) | b2;
+        b64[oi++] = kB64[(trip >> 18) & 63u];
+        b64[oi++] = kB64[(trip >> 12) & 63u];
+        b64[oi++] = (i + 1u < img.size_bytes) ? kB64[(trip >> 6) & 63u] : '=';
+        b64[oi++] = (i + 2u < img.size_bytes) ? kB64[trip & 63u] : '=';
+    }
+    b64[oi] = '\0';
+    const JSValue obj = JS_NewObject(js);
+    if (!JS_IsException(obj)) {
+        JS_SetPropertyStr(js, obj, "mime", JS_NewStringLen(js, img.mime_type.chars ? img.mime_type.chars : "image/png",
+                                                           img.mime_type.chars ? img.mime_type.length : 9u));
+        JS_SetPropertyStr(js, obj, "sizeBytes", JS_NewUint32(js, img.size_bytes));
+        JS_SetPropertyStr(js, obj, "base64", JS_NewStringLen(js, b64, oi));
+    }
+    SDL_free(b64);
+    etch_arena_destroy(&arena);
+    return obj;
+}
+
+bool parse_shortcut_token(const char* str, size_t len, uint16_t* out_mods, uint32_t* out_key) noexcept {
+    *out_mods = 0u;
+    *out_key = 0u;
+    if (!str || len == 0u) return false;
+    size_t p = 0u;
+    while (p < len) {
+        size_t s = p;
+        while (p < len && str[p] != '+') ++p;
+        size_t tlen = p - s;
+        if (p < len && str[p] == '+') ++p;
+        while (tlen > 0u && str[s] == ' ') { ++s; --tlen; }
+        while (tlen > 0u && str[s + tlen - 1u] == ' ') --tlen;
+        if (tlen == 0u) continue;
+        const char* tok = str + s;
+        auto eq_ci = [&](const char* lit) noexcept -> bool {
+            const size_t ln = std::strlen(lit);
+            if (tlen != ln) return false;
+            for (size_t i = 0u; i < ln; ++i) {
+                char a = tok[i]; if (a >= 'A' && a <= 'Z') a = char(a - 'A' + 'a');
+                char b = lit[i]; if (b >= 'A' && b <= 'Z') b = char(b - 'A' + 'a');
+                if (a != b) return false;
+            }
+            return true;
+        };
+        if (eq_ci("ctrl") || eq_ci("control")) *out_mods |= ETCH_MOD_CTRL;
+        else if (eq_ci("shift")) *out_mods |= ETCH_MOD_SHIFT;
+        else if (eq_ci("alt") || eq_ci("option")) *out_mods |= ETCH_MOD_ALT;
+        else if (eq_ci("cmd") || eq_ci("meta") || eq_ci("super")) *out_mods |= ETCH_MOD_SUPER;
+        else if (eq_ci("primary") || eq_ci("mod")) *out_mods |= ETCH_MOD_PRIMARY;
+        else if (eq_ci("escape") || eq_ci("esc")) *out_key = SDLK_ESCAPE;
+        else if (eq_ci("enter") || eq_ci("return")) *out_key = SDLK_RETURN;
+        else if (eq_ci("tab")) *out_key = SDLK_TAB;
+        else if (eq_ci("space")) *out_key = SDLK_SPACE;
+        else if (eq_ci("backspace")) *out_key = SDLK_BACKSPACE;
+        else if (eq_ci("delete") || eq_ci("del")) *out_key = SDLK_DELETE;
+        else if (eq_ci("arrowup") || eq_ci("up")) *out_key = SDLK_UP;
+        else if (eq_ci("arrowdown") || eq_ci("down")) *out_key = SDLK_DOWN;
+        else if (eq_ci("arrowleft") || eq_ci("left")) *out_key = SDLK_LEFT;
+        else if (eq_ci("arrowright") || eq_ci("right")) *out_key = SDLK_RIGHT;
+        else if (eq_ci("home")) *out_key = SDLK_HOME;
+        else if (eq_ci("end")) *out_key = SDLK_END;
+        else if (eq_ci("pageup")) *out_key = SDLK_PAGEUP;
+        else if (eq_ci("pagedown")) *out_key = SDLK_PAGEDOWN;
+        else if (tlen == 2u && (tok[0] == 'F' || tok[0] == 'f') && tok[1] >= '1' && tok[1] <= '9') {
+            *out_key = SDLK_F1 + uint32_t(tok[1] - '1');
+        } else if (tlen == 3u && (tok[0] == 'F' || tok[0] == 'f') && tok[1] == '1' && tok[2] >= '0' && tok[2] <= '2') {
+            *out_key = SDLK_F10 + uint32_t(tok[2] - '0');
+        } else if (tlen == 1u) {
+            char c = tok[0];
+            if (c >= 'A' && c <= 'Z') c = char(c - 'A' + 'a');
+            *out_key = static_cast<uint32_t>(static_cast<uint8_t>(c));
+        }
+    }
+    return *out_key != 0u;
+}
+
+uint32_t resolve_command_id(SurfaceStorage* stg, JSContext* js, JSValueConst val, bool record_name) noexcept {
+    if (JS_IsNumber(val)) {
+        uint32_t u = 0u;
+        return JS_ToUint32(js, &u, val) == 0 ? u : 0u;
+    }
+    size_t n = 0u;
+    const char* str = JS_ToCStringLen(js, &n, val);
+    if (!str || n == 0u) {
+        if (str) JS_FreeCString(js, str);
+        return 0u;
+    }
+    const uint32_t h = inlay_fnv1a_32(str, n, 2166136261u);
+    const uint32_t cid = h ? h : 1u;
+    if (record_name && stg && n < sizeof(CommandNameEntry::name)) {
+        bool found = false;
+        for (uint32_t i = 0u; i < stg->command_name_count; ++i) {
+            if (stg->command_names[i].id == cid) {
+                std::memcpy(stg->command_names[i].name, str, n);
+                stg->command_names[i].name[n] = '\0';
+                found = true;
+                break;
+            }
+        }
+        if (!found && inlay_grow_pod(stg->command_names, stg->command_name_cap, stg->command_name_count + 1u, 16u, 512u)) {
+            auto& ent = stg->command_names[stg->command_name_count++];
+            ent.id = cid;
+            std::memcpy(ent.name, str, n);
+            ent.name[n] = '\0';
+        }
+    }
+    JS_FreeCString(js, str);
+    return cid;
+}
+
+JSValue js_register_command(JSContext* js, JSValueConst, int argc, JSValueConst* argv) {
+    auto* s = static_cast<InlaySurface*>(JS_GetContextOpaque(js));
+    if (!s || !s->etch || argc < 1 || !JS_IsObject(argv[0]) || JS_IsNull(argv[0])) {
+        return JS_NewBool(js, false);
+    }
+    const JSValue id_v = JS_GetPropertyStr(js, argv[0], "id");
+    const uint32_t cid = resolve_command_id(ext(s), js, id_v, true);
+    JS_FreeValue(js, id_v);
+    if (!cid) return JS_NewBool(js, false);
+    EtchCommandDesc desc = etch_command_desc_default();
+    desc.id = cid;
+    size_t nlen = 0u, tlen = 0u, clen = 0u;
+    const JSValue nv = JS_GetPropertyStr(js, argv[0], "name");
+    const JSValue tv = JS_GetPropertyStr(js, argv[0], "title");
+    const JSValue cv = JS_GetPropertyStr(js, argv[0], "category");
+    const char* ns = JS_IsString(nv) ? JS_ToCStringLen(js, &nlen, nv) : nullptr;
+    const char* ts = JS_IsString(tv) ? JS_ToCStringLen(js, &tlen, tv) : nullptr;
+    const char* cs = JS_IsString(cv) ? JS_ToCStringLen(js, &clen, cv) : nullptr;
+    if (ns) desc.name = {ns, static_cast<uint32_t>(nlen), false};
+    if (ts) desc.title = {ts, static_cast<uint32_t>(tlen), false};
+    if (cs) desc.category = {cs, static_cast<uint32_t>(clen), false};
+    if (!desc.name.length && desc.title.length) desc.name = desc.title;
+    bool en = true;
+    if (inlay_ui_opt_bool_prop(s, argv[0], "enabled", &en)) desc.enabled = en;
+    desc.allow_when_typing = inlay_ui_bool_prop(s, argv[0], "allowWhenTyping");
+    const JSValue scv = JS_GetPropertyStr(js, argv[0], "scope");
+    if (!JS_IsUndefined(scv) && !JS_IsNull(scv)) desc.scope_id = resolve_command_id(nullptr, js, scv, false);
+    JS_FreeValue(js, scv);
+    peek_str_prop(s, argv[0], "shortcut", [&](const char* str, size_t len) noexcept {
+        return parse_shortcut_token(str, len, &desc.shortcut_mods, &desc.shortcut_keycode);
+    });
+    peek_str_prop(s, argv[0], "chord", [&](const char* str, size_t len) noexcept {
+        return parse_shortcut_token(str, len, &desc.chord_mods, &desc.chord_keycode);
+    });
+    const bool ok = etch_register_command(s->etch, &desc);
+    if (ns) JS_FreeCString(js, ns);
+    if (ts) JS_FreeCString(js, ts);
+    if (cs) JS_FreeCString(js, cs);
+    JS_FreeValue(js, nv);
+    JS_FreeValue(js, tv);
+    JS_FreeValue(js, cv);
+    return JS_NewBool(js, ok);
+}
+
+JSValue js_unregister_command(JSContext* js, JSValueConst, int argc, JSValueConst* argv) {
+    auto* s = static_cast<InlaySurface*>(JS_GetContextOpaque(js));
+    if (!s || !s->etch || argc < 1) return JS_NewBool(js, false);
+    const uint32_t cid = resolve_command_id(nullptr, js, argv[0], false);
+    return JS_NewBool(js, cid ? etch_unregister_command(s->etch, cid) : false);
+}
+
+JSValue js_dispatch_command(JSContext* js, JSValueConst, int argc, JSValueConst* argv) {
+    auto* s = static_cast<InlaySurface*>(JS_GetContextOpaque(js));
+    if (!s || !s->etch || argc < 1) return JS_NewBool(js, false);
+    const uint32_t cid = resolve_command_id(nullptr, js, argv[0], false);
+    const bool ok = cid ? etch_dispatch_command(s->etch, cid) : false;
+    if (ok) {
+        auto* stg = ext(s);
+        if (stg->pending_cmd_count < 8u) stg->pending_cmds[stg->pending_cmd_count++] = cid;
+        etch_request_redraw(s->etch);
+    }
+    return JS_NewBool(js, ok);
+}
+
+JSValue js_push_command_scope(JSContext* js, JSValueConst, int argc, JSValueConst* argv) {
+    auto* s = static_cast<InlaySurface*>(JS_GetContextOpaque(js));
+    if (!s || !s->etch || argc < 1) return JS_UNDEFINED;
+    const uint32_t sid = resolve_command_id(nullptr, js, argv[0], false);
+    if (!sid) return JS_UNDEFINED;
+    EtchContext* prev = etch_current_context();
+    etch_set_current_context(s->etch);
+    etch_push_command_scope(sid);
+    etch_set_current_context(prev);
+    return JS_UNDEFINED;
+}
+
+JSValue js_pop_command_scope(JSContext* js, JSValueConst, int, JSValueConst*) {
+    auto* s = static_cast<InlaySurface*>(JS_GetContextOpaque(js));
+    if (!s || !s->etch) return JS_UNDEFINED;
+    EtchContext* prev = etch_current_context();
+    etch_set_current_context(s->etch);
+    etch_pop_command_scope();
+    etch_set_current_context(prev);
+    return JS_UNDEFINED;
+}
+
+JSValue js_read_stream(JSContext* js, JSValueConst, int argc, JSValueConst* argv) {
+    auto* s = static_cast<InlaySurface*>(JS_GetContextOpaque(js));
+    if (!s || argc < 1 || !JS_IsString(argv[0])) return JS_NULL;
+    size_t nlen = 0u;
+    const char* name = JS_ToCStringLen(js, &nlen, argv[0]);
+    if (!name) return JS_EXCEPTION;
+    StreamBinding* found = nullptr;
+    for (uint32_t i = 0u; i < s->stream_count; ++i) {
+        if (inlay_ui_str_eq(name, nlen, s->streams[i].name)) {
+            found = &s->streams[i];
+            break;
+        }
+    }
+    JS_FreeCString(js, name);
+    if (!found || !found->stream) return JS_NULL;
+    bool has_since = false;
+    uint64_t since = 0u;
+    if (argc > 1 && !JS_IsUndefined(argv[1]) && !JS_IsNull(argv[1])) {
+        double dv = 0.0;
+        if (JS_ToFloat64(js, &dv, argv[1]) == 0 && std::isfinite(dv) && dv >= 0.0) {
+            since = static_cast<uint64_t>(dv);
+            has_since = true;
+        }
+    }
+    const uint32_t need = has_since
+        ? inlay_stream_export_since_json(found->stream, since, nullptr, 0u)
+        : inlay_stream_export_json(found->stream, nullptr, 0u);
+    auto* buf = static_cast<char*>(SDL_malloc(size_t(need) + 1u));
+    if (!buf) return JS_ThrowOutOfMemory(js);
+    if (has_since) inlay_stream_export_since_json(found->stream, since, buf, need + 1u);
+    else inlay_stream_export_json(found->stream, buf, need + 1u);
+    buf[need] = '\0';
+    found->last_seen_cursor = inlay_stream_cursor(found->stream);
+    const JSValue parsed = JS_ParseJSON(js, buf, need, "<stream>");
+    SDL_free(buf);
+    return parsed;
+}
+
+JSValue js_save_dock_layout(JSContext* js, JSValueConst, int argc, JSValueConst* argv) {
+    auto* s = static_cast<InlaySurface*>(JS_GetContextOpaque(js));
+    if (!s || !s->etch || argc < 1) return JS_NewString(js, "");
+    const uint32_t eid = resolve_js_element_id(s, js, argv[0]);
+    if (!eid) return JS_NewString(js, "");
+    EtchContext* prev = etch_current_context();
+    etch_set_current_context(s->etch);
+    char stack_buf[8192];
+    const uint32_t need = etch_dock_save_layout_json(eid, stack_buf, sizeof(stack_buf));
+    JSValue ret = JS_UNDEFINED;
+    if (need < sizeof(stack_buf)) {
+        ret = JS_NewStringLen(js, stack_buf, need);
+    } else {
+        auto* heap = static_cast<char*>(SDL_malloc(size_t(need) + 1u));
+        if (heap) {
+            etch_dock_save_layout_json(eid, heap, need + 1u);
+            ret = JS_NewStringLen(js, heap, need);
+            SDL_free(heap);
+        } else {
+            ret = JS_ThrowOutOfMemory(js);
+        }
+    }
+    etch_set_current_context(prev);
+    return ret;
+}
+
+JSValue js_load_dock_layout(JSContext* js, JSValueConst, int argc, JSValueConst* argv) {
+    auto* s = static_cast<InlaySurface*>(JS_GetContextOpaque(js));
+    if (!s || !s->etch || argc < 2) return JS_NewBool(js, false);
+    const uint32_t eid = resolve_js_element_id(s, js, argv[0]);
+    size_t len = 0u;
+    const char* json = JS_ToCStringLen(js, &len, argv[1]);
+    if (!eid || !json) {
+        if (json) JS_FreeCString(js, json);
+        return JS_NewBool(js, false);
+    }
+    EtchContext* prev = etch_current_context();
+    etch_set_current_context(s->etch);
+    const bool ok = etch_dock_load_layout_json(eid, {json, static_cast<uint32_t>(len), false});
+    etch_set_current_context(prev);
+    JS_FreeCString(js, json);
+    if (ok) etch_request_redraw(s->etch);
+    return JS_NewBool(js, ok);
+}
+
+JSValue js_detach_dock_pane(JSContext* js, JSValueConst, int argc, JSValueConst* argv) {
+    auto* s = static_cast<InlaySurface*>(JS_GetContextOpaque(js));
+    if (!s || !s->etch || argc < 2) return JS_NewBool(js, false);
+    const uint32_t dock_id = resolve_js_element_id(s, js, argv[0]);
+    uint32_t pane_id = 0u;
+    if (JS_IsNumber(argv[1])) {
+        (void)JS_ToUint32(js, &pane_id, argv[1]);
+    } else if (JS_IsString(argv[1])) {
+        size_t n = 0u;
+        const char* ps = JS_ToCStringLen(js, &n, argv[1]);
+        if (ps && n > 0u) {
+            const uint32_t h = inlay_fnv1a_32(ps, n, 2166136261u);
+            pane_id = h ? h : 1u;
+        }
+        if (ps) JS_FreeCString(js, ps);
+    }
+    if (!dock_id || !pane_id) return JS_NewBool(js, false);
+    EtchContext* prev = etch_current_context();
+    etch_set_current_context(s->etch);
+    const bool ok = etch_dock_detach_pane(dock_id, pane_id);
+    etch_set_current_context(prev);
+    if (ok) etch_request_redraw(s->etch);
+    return JS_NewBool(js, ok);
+}
+
+JSValue js_encode_terminal_key(JSContext* js, JSValueConst, int argc, JSValueConst* argv) {
+    if (argc < 1) return JS_NewString(js, "");
+    uint32_t keycode = 0u, mods = 0u;
+    if (JS_ToUint32(js, &keycode, argv[0]) < 0) return JS_EXCEPTION;
+    if (argc > 1 && JS_ToUint32(js, &mods, argv[1]) < 0) return JS_EXCEPTION;
+    const bool app_cursor = argc > 2 && JS_ToBool(js, argv[2]) > 0;
+    char buf[32] = {};
+    const uint32_t len = etch_terminal_encode_key(keycode, static_cast<uint16_t>(mods), app_cursor, buf, sizeof(buf));
+    return JS_NewStringLen(js, buf, len < sizeof(buf) ? len : (sizeof(buf) - 1u));
+}
+
+JSValue js_encode_terminal_mouse_sgr(JSContext* js, JSValueConst, int argc, JSValueConst* argv) {
+    if (argc < 6) return JS_NewString(js, "");
+    uint32_t btn = 0u, mods = 0u;
+    int32_t col = 0, row = 0;
+    if (JS_ToUint32(js, &btn, argv[0]) < 0 || JS_ToInt32(js, &col, argv[1]) < 0 ||
+        JS_ToInt32(js, &row, argv[2]) < 0 || JS_ToUint32(js, &mods, argv[3]) < 0) {
+        return JS_EXCEPTION;
+    }
+    const bool pressed = JS_ToBool(js, argv[4]) > 0;
+    const bool motion = JS_ToBool(js, argv[5]) > 0;
+    char buf[48] = {};
+    const uint32_t len = etch_terminal_encode_mouse_sgr(static_cast<uint8_t>(btn), col, row,
+                                                        static_cast<uint16_t>(mods), pressed, motion,
+                                                        buf, sizeof(buf));
+    return JS_NewStringLen(js, buf, len < sizeof(buf) ? len : (sizeof(buf) - 1u));
+}
+
+JSValue js_fuzzy_match(JSContext* js, JSValueConst, int argc, JSValueConst* argv) {
+    if (argc < 2) return JS_ThrowTypeError(js, "fuzzyMatch(pattern, candidate) requires 2 arguments");
+    size_t plen = 0u, clen = 0u;
+    const char* pat = JS_ToCStringLen(js, &plen, argv[0]);
+    const char* cand = JS_ToCStringLen(js, &clen, argv[1]);
+    if (!pat || !cand) {
+        if (pat) JS_FreeCString(js, pat);
+        if (cand) JS_FreeCString(js, cand);
+        return JS_EXCEPTION;
+    }
+    uint32_t pos[64] = {};
+    const EtchFuzzyMatchResult r = etch_fuzzy_match(
+        {pat, static_cast<uint32_t>(plen), false},
+        {cand, static_cast<uint32_t>(clen), false},
+        pos, 64u);
+    JS_FreeCString(js, pat);
+    JS_FreeCString(js, cand);
+    const JSValue obj = JS_NewObject(js);
+    if (JS_IsException(obj)) return obj;
+    JS_SetPropertyStr(js, obj, "matched", JS_NewBool(js, r.matched));
+    JS_SetPropertyStr(js, obj, "score", JS_NewInt32(js, r.score));
+    const JSValue arr = JS_NewArray(js);
+    const uint32_t n = r.match_count > 64u ? 64u : r.match_count;
+    for (uint32_t i = 0u; i < n; ++i) {
+        JS_SetPropertyUint32(js, arr, i, JS_NewUint32(js, pos[i]));
+    }
+    JS_SetPropertyStr(js, obj, "positions", arr);
+    return obj;
+}
+
+JSValue js_clipboard_write(JSContext* js, JSValueConst, int argc, JSValueConst* argv) {
+    if (argc < 1) return JS_NewBool(js, false);
+    const char* txt = JS_ToCString(js, argv[0]);
+    if (!txt) return JS_EXCEPTION;
+    const bool ok = etch_set_clipboard_text(txt);
+    JS_FreeCString(js, txt);
+    return JS_NewBool(js, ok);
+}
+
+JSValue js_clipboard_read(JSContext* js, JSValueConst, int, JSValueConst*) {
+    char scratch[16384];
+    EtchArena arena = etch_arena_from_buffer(scratch, sizeof(scratch));
+    const EtchStr s = etch_get_clipboard_text(&arena);
+    return JS_NewStringLen(js, s.chars ? s.chars : "", s.length);
+}
+
+JSValue js_push_focus_restore(JSContext* js, JSValueConst, int, JSValueConst*) {
+    auto* s = static_cast<InlaySurface*>(JS_GetContextOpaque(js));
+    return JS_NewBool(js, s && s->etch ? etch_push_focus_restore_point(s->etch) : false);
+}
+
+JSValue js_pop_focus_restore(JSContext* js, JSValueConst, int, JSValueConst*) {
+    auto* s = static_cast<InlaySurface*>(JS_GetContextOpaque(js));
+    return JS_NewUint32(js, s && s->etch ? etch_pop_focus_restore_point(s->etch) : 0u);
+}
+
+JSValue js_set_ui_zoom(JSContext* js, JSValueConst, int argc, JSValueConst* argv) {
+    auto* s = static_cast<InlaySurface*>(JS_GetContextOpaque(js));
+    double z = 1.0;
+    if (argc < 1 || JS_ToFloat64(js, &z, argv[0]) < 0 || !std::isfinite(z)) {
+        return JS_ThrowTypeError(js, "setUiZoom expects a finite number");
+    }
+    if (s && s->etch) etch_set_ui_zoom(s->etch, static_cast<float>(z));
+    return JS_NewFloat64(js, s && s->etch ? double(etch_ui_zoom(s->etch)) : 1.0);
+}
+
+JSValue js_get_ui_zoom(JSContext* js, JSValueConst, int, JSValueConst*) {
+    auto* s = static_cast<InlaySurface*>(JS_GetContextOpaque(js));
+    return JS_NewFloat64(js, s && s->etch ? double(etch_ui_zoom(s->etch)) : 1.0);
 }
 
 bool install_state(InlaySurface* s, JSValueConst global) {
@@ -4225,9 +5646,19 @@ void clear_context(InlaySurface* s) {
         for (auto& timer : s->timers) {
             JS_FreeValue(s->js, timer.function);
             timer.function = JS_UNDEFINED;
+            timer.due = 0.0;
+            timer.interval_ms = 0.0;
             timer.id = 0u;
+            timer.is_raf = false;
         }
         auto* storage = ext(s);
+        for (auto& pd : storage->pending_dialogs) {
+            if (pd.active) {
+                JS_FreeValue(s->js, pd.settle[0]);
+                JS_FreeValue(s->js, pd.settle[1]);
+                pd = {};
+            }
+        }
         if (storage->atom_memo_key != JS_ATOM_NULL) {
             JS_FreeAtom(s->js, storage->atom_memo_key);
             storage->atom_memo_key = JS_ATOM_NULL;
@@ -4246,44 +5677,585 @@ void clear_context(InlaySurface* s) {
 }
 
 void free_spec_pools(InlaySurface* s) noexcept {
-    SDL_free(s->doc_specs);      s->doc_specs = nullptr;      s->doc_spec_count = 0u;      s->doc_spec_cap = 0u;
-    SDL_free(s->term_specs);     s->term_specs = nullptr;     s->term_spec_count = 0u;     s->term_spec_cap = 0u;
-    SDL_free(s->vlist_specs);    s->vlist_specs = nullptr;    s->vlist_spec_count = 0u;    s->vlist_spec_cap = 0u;
-    SDL_free(s->table_specs);    s->table_specs = nullptr;    s->table_spec_count = 0u;    s->table_spec_cap = 0u;
-    SDL_free(s->table_cols);     s->table_cols = nullptr;     s->table_col_count = 0u;     s->table_col_cap = 0u;
-    SDL_free(s->table_cells);    s->table_cells = nullptr;    s->table_cell_count = 0u;    s->table_cell_cap = 0u;
-    SDL_free(s->menu_specs);     s->menu_specs = nullptr;     s->menu_spec_count = 0u;     s->menu_spec_cap = 0u;
-    SDL_free(s->menu_items);     s->menu_items = nullptr;     s->menu_item_count = 0u;     s->menu_item_cap = 0u;
-    SDL_free(s->avatar_specs);   s->avatar_specs = nullptr;   s->avatar_spec_count = 0u;   s->avatar_spec_cap = 0u;
-    SDL_free(s->toast_specs);    s->toast_specs = nullptr;    s->toast_spec_count = 0u;    s->toast_spec_cap = 0u;
-    SDL_free(s->skeleton_specs); s->skeleton_specs = nullptr; s->skeleton_spec_count = 0u; s->skeleton_spec_cap = 0u;
+    inlay_ui_free_spec_pools(s);
 }
 
 void move_spec_pools(InlaySurface* dst, InlaySurface* src) noexcept {
-    free_spec_pools(dst);
-    dst->doc_specs = src->doc_specs;           dst->doc_spec_count = src->doc_spec_count;           dst->doc_spec_cap = src->doc_spec_cap;
-    dst->term_specs = src->term_specs;         dst->term_spec_count = src->term_spec_count;         dst->term_spec_cap = src->term_spec_cap;
-    dst->vlist_specs = src->vlist_specs;       dst->vlist_spec_count = src->vlist_spec_count;       dst->vlist_spec_cap = src->vlist_spec_cap;
-    dst->table_specs = src->table_specs;       dst->table_spec_count = src->table_spec_count;       dst->table_spec_cap = src->table_spec_cap;
-    dst->table_cols = src->table_cols;         dst->table_col_count = src->table_col_count;         dst->table_col_cap = src->table_col_cap;
-    dst->table_cells = src->table_cells;       dst->table_cell_count = src->table_cell_count;       dst->table_cell_cap = src->table_cell_cap;
-    dst->menu_specs = src->menu_specs;         dst->menu_spec_count = src->menu_spec_count;         dst->menu_spec_cap = src->menu_spec_cap;
-    dst->menu_items = src->menu_items;         dst->menu_item_count = src->menu_item_count;         dst->menu_item_cap = src->menu_item_cap;
-    dst->avatar_specs = src->avatar_specs;     dst->avatar_spec_count = src->avatar_spec_count;     dst->avatar_spec_cap = src->avatar_spec_cap;
-    dst->toast_specs = src->toast_specs;       dst->toast_spec_count = src->toast_spec_count;       dst->toast_spec_cap = src->toast_spec_cap;
-    dst->skeleton_specs = src->skeleton_specs; dst->skeleton_spec_count = src->skeleton_spec_count; dst->skeleton_spec_cap = src->skeleton_spec_cap;
+    inlay_ui_move_spec_pools(dst, src);
+}
 
-    src->doc_specs = nullptr;      src->doc_spec_count = 0u;      src->doc_spec_cap = 0u;
-    src->term_specs = nullptr;     src->term_spec_count = 0u;     src->term_spec_cap = 0u;
-    src->vlist_specs = nullptr;    src->vlist_spec_count = 0u;    src->vlist_spec_cap = 0u;
-    src->table_specs = nullptr;    src->table_spec_count = 0u;    src->table_spec_cap = 0u;
-    src->table_cols = nullptr;     src->table_col_count = 0u;     src->table_col_cap = 0u;
-    src->table_cells = nullptr;    src->table_cell_count = 0u;    src->table_cell_cap = 0u;
-    src->menu_specs = nullptr;     src->menu_spec_count = 0u;     src->menu_spec_cap = 0u;
-    src->menu_items = nullptr;     src->menu_item_count = 0u;     src->menu_item_cap = 0u;
-    src->avatar_specs = nullptr;   src->avatar_spec_count = 0u;   src->avatar_spec_cap = 0u;
-    src->toast_specs = nullptr;    src->toast_spec_count = 0u;    src->toast_spec_cap = 0u;
-    src->skeleton_specs = nullptr; src->skeleton_spec_count = 0u; src->skeleton_spec_cap = 0u;
+static const RegisteredModule* find_registered_module(const SurfaceStorage* stg, const char* name, size_t len) noexcept {
+    if (!stg || !name || len == 0u || len >= sizeof(RegisteredModule::name)) return nullptr;
+    for (uint32_t i = 0u; i < stg->module_count; ++i) {
+        if (inlay_ui_str_eq(name, len, stg->modules[i].name)) return &stg->modules[i];
+    }
+    return nullptr;
+}
+
+static char* module_normalize_cb(JSContext* ctx, const char* base_name, const char* name, void* opaque) {
+    auto* s = static_cast<InlaySurface*>(opaque);
+    const auto* stg = s ? ext(s) : nullptr;
+    if (!stg || !name || !name[0]) {
+        JS_ThrowReferenceError(ctx, "Invalid module specifier");
+        return nullptr;
+    }
+    const size_t name_len = std::strlen(name);
+    if (name_len >= sizeof(RegisteredModule::name)) {
+        JS_ThrowReferenceError(ctx, "Module specifier too long");
+        return nullptr;
+    }
+
+    char resolved[128] = {};
+    size_t res_len = 0u;
+    const bool is_rel = (name[0] == '.' && (name[1] == '/' || (name[1] == '.' && name[2] == '/')));
+    if (is_rel) {
+        const char* segs[32];
+        size_t seg_lens[32];
+        uint32_t depth = 0u;
+        if (base_name && base_name[0] && base_name[0] != '<') {
+            const char* last_slash = std::strrchr(base_name, '/');
+            if (last_slash) {
+                const char* p = base_name;
+                while (p < last_slash) {
+                    const char* sl = p;
+                    while (sl < last_slash && *sl != '/') ++sl;
+                    const size_t slen = size_t(sl - p);
+                    if (slen > 0u && !(slen == 1u && p[0] == '.')) {
+                        if (depth < 32u) {
+                            segs[depth] = p;
+                            seg_lens[depth] = slen;
+                            ++depth;
+                        }
+                    }
+                    p = (sl < last_slash) ? (sl + 1) : last_slash;
+                }
+            }
+        }
+        const char* p = name;
+        while (*p) {
+            const char* sl = p;
+            while (*sl && *sl != '/') ++sl;
+            const size_t slen = size_t(sl - p);
+            if (slen == 2u && p[0] == '.' && p[1] == '.') {
+                if (depth == 0u) {
+                    JS_ThrowReferenceError(ctx, "Module specifier escapes sandbox root: %s", name);
+                    return nullptr;
+                }
+                --depth;
+            } else if (slen > 0u && !(slen == 1u && p[0] == '.')) {
+                if (depth >= 32u) {
+                    JS_ThrowReferenceError(ctx, "Module path depth exceeded: %s", name);
+                    return nullptr;
+                }
+                segs[depth] = p;
+                seg_lens[depth] = slen;
+                ++depth;
+            }
+            p = *sl ? (sl + 1) : sl;
+        }
+        for (uint32_t i = 0u; i < depth; ++i) {
+            if (i > 0u) {
+                if (res_len + 1u >= sizeof(resolved)) {
+                    JS_ThrowReferenceError(ctx, "Resolved module specifier too long");
+                    return nullptr;
+                }
+                resolved[res_len++] = '/';
+            }
+            if (res_len + seg_lens[i] >= sizeof(resolved)) {
+                JS_ThrowReferenceError(ctx, "Resolved module specifier too long");
+                return nullptr;
+            }
+            std::memcpy(resolved + res_len, segs[i], seg_lens[i]);
+            res_len += seg_lens[i];
+        }
+        resolved[res_len] = '\0';
+    } else {
+        std::memcpy(resolved, name, name_len + 1u);
+        res_len = name_len;
+    }
+
+    if (find_registered_module(stg, resolved, res_len)) {
+        return js_strdup(ctx, resolved);
+    }
+    static constexpr const char* kExts[] = {".tsx", ".ts", ".jsx", ".js"};
+    for (const char* ex : kExts) {
+        const size_t elen = std::strlen(ex);
+        if (res_len + elen < sizeof(resolved)) {
+            char cand[128] = {};
+            std::memcpy(cand, resolved, res_len);
+            std::memcpy(cand + res_len, ex, elen + 1u);
+            if (find_registered_module(stg, cand, res_len + elen)) {
+                return js_strdup(ctx, cand);
+            }
+        }
+    }
+    return js_strdup(ctx, resolved);
+}
+
+static JSModuleDef* module_loader_cb(JSContext* ctx, const char* module_name, void* opaque) {
+    auto* s = static_cast<InlaySurface*>(opaque);
+    const auto* stg = s ? ext(s) : nullptr;
+    if (!stg || !module_name) {
+        JS_ThrowReferenceError(ctx, "Module not found");
+        return nullptr;
+    }
+    const RegisteredModule* mod = find_registered_module(stg, module_name, std::strlen(module_name));
+    if (!mod || !mod->source) {
+        JS_ThrowReferenceError(ctx, "Module not registered: %s", module_name);
+        return nullptr;
+    }
+    const char* src = mod->source;
+    size_t src_len = mod->length;
+    char* jsx_tmp = nullptr;
+    size_t jsx_cap = 0u;
+    if (!s->desc.disable_jsx && src_len > 0u) {
+        char jsx_err[512] = {};
+        size_t jsx_len = 0u;
+        if (!inlay_jsx_transpile(src, src_len, module_name, &jsx_tmp, &jsx_cap, &jsx_len,
+                                 jsx_err, sizeof(jsx_err))) {
+            SDL_free(jsx_tmp);
+            JS_ThrowSyntaxError(ctx, "%s", jsx_err[0] ? jsx_err : "JSXSyntaxError in module");
+            return nullptr;
+        }
+        if (jsx_len > 0u && jsx_tmp) {
+            src = jsx_tmp;
+            src_len = jsx_len;
+        }
+    }
+    const JSValue func_val = JS_Eval(ctx, src, src_len, module_name,
+                                     JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+    SDL_free(jsx_tmp);
+    if (JS_IsException(func_val)) return nullptr;
+    auto* def = static_cast<JSModuleDef*>(JS_VALUE_GET_PTR(func_val));
+    JS_FreeValue(ctx, func_val);
+    return def;
+}
+
+static bool is_esm_ident_char(char c) noexcept {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') || c == '_' || c == '$';
+}
+
+static bool script_uses_esm(const char* s, size_t len) noexcept {
+    if (!s || len < 6u) return false;
+    int brace = 0, paren = 0, bracket = 0;
+    bool stmt_start = true;
+    size_t i = 0u;
+    while (i < len) {
+        const char c = s[i];
+        if (c == ' ' || c == '\t' || c == '\r') { ++i; continue; }
+        if (c == '\n') {
+            if (brace == 0 && paren == 0 && bracket == 0) stmt_start = true;
+            ++i;
+            continue;
+        }
+        if (c == '/' && i + 1u < len && s[i + 1u] == '/') {
+            i += 2u;
+            while (i < len && s[i] != '\n') ++i;
+            continue;
+        }
+        if (c == '/' && i + 1u < len && s[i + 1u] == '*') {
+            i += 2u;
+            while (i + 1u < len && !(s[i] == '*' && s[i + 1u] == '/')) ++i;
+            i = (i + 1u < len) ? (i + 2u) : len;
+            continue;
+        }
+        if (c == '\'' || c == '"' || c == '`') {
+            const char q = c;
+            ++i;
+            while (i < len) {
+                if (s[i] == '\\' && i + 1u < len) { i += 2u; continue; }
+                if (s[i] == q) { ++i; break; }
+                ++i;
+            }
+            stmt_start = false;
+            continue;
+        }
+        if (brace == 0 && paren == 0 && bracket == 0 && stmt_start) {
+            if (i + 6u <= len && std::memcmp(s + i, "import", 6u) == 0 &&
+                (i + 6u == len || !is_esm_ident_char(s[i + 6u]))) {
+                size_t k = i + 6u;
+                while (k < len && (s[k] == ' ' || s[k] == '\t' || s[k] == '\r' || s[k] == '\n')) ++k;
+                if (k < len && s[k] != '(' && s[k] != '.' && s[k] != ':' && s[k] != '=') return true;
+            }
+            if (i + 6u <= len && std::memcmp(s + i, "export", 6u) == 0 &&
+                (i + 6u == len || !is_esm_ident_char(s[i + 6u]))) {
+                size_t k = i + 6u;
+                while (k < len && (s[k] == ' ' || s[k] == '\t' || s[k] == '\r' || s[k] == '\n')) ++k;
+                if (k < len && s[k] != ':' && s[k] != '=' && s[k] != '.') return true;
+            }
+        }
+        if (is_esm_ident_char(c)) {
+            while (i < len && is_esm_ident_char(s[i])) ++i;
+            stmt_start = false;
+            continue;
+        }
+        if (c == '{') { ++brace; stmt_start = false; }
+        else if (c == '}') { if (brace > 0) --brace; stmt_start = (brace == 0 && paren == 0 && bracket == 0); }
+        else if (c == '(') { ++paren; stmt_start = false; }
+        else if (c == ')') { if (paren > 0) --paren; stmt_start = false; }
+        else if (c == '[') { ++bracket; stmt_start = false; }
+        else if (c == ']') { if (bracket > 0) --bracket; stmt_start = false; }
+        else if (c == ';') { stmt_start = (brace == 0 && paren == 0 && bracket == 0); }
+        else { stmt_start = false; }
+        ++i;
+    }
+    return false;
+}
+
+static bool eval_entry_module(InlaySurface* s, const char* src, size_t len, const char* filename) {
+    const JSValue mod_fn = JS_Eval(s->js, src, len, filename,
+                                   JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
+    if (JS_IsException(mod_fn)) return false;
+    auto* mod = static_cast<JSModuleDef*>(JS_VALUE_GET_PTR(mod_fn));
+    const JSValue eval_res = JS_EvalFunction(s->js, mod_fn);
+    if (JS_IsException(eval_res)) return false;
+
+    JSContext* pctx = nullptr;
+    int job_rc = 0;
+    while (!s->timed_out && (job_rc = JS_ExecutePendingJob(s->runtime, &pctx)) > 0) {}
+    if (job_rc < 0 || s->timed_out) {
+        JS_FreeValue(s->js, eval_res);
+        return false;
+    }
+
+    const JSPromiseStateEnum pstate = JS_PromiseState(s->js, eval_res);
+    if (pstate == JS_PROMISE_REJECTED) {
+        const JSValue err = JS_PromiseResult(s->js, eval_res);
+        JS_FreeValue(s->js, eval_res);
+        JS_Throw(s->js, err);
+        return false;
+    }
+    if (pstate == JS_PROMISE_PENDING) {
+        JS_FreeValue(s->js, eval_res);
+        JS_ThrowTypeError(s->js, "Top-level await is not supported in surface entry modules");
+        return false;
+    }
+    JS_FreeValue(s->js, eval_res);
+
+    const JSValue ns = JS_GetModuleNamespace(s->js, mod);
+    if (JS_IsException(ns)) return false;
+    const JSValue target = JS_GetGlobalObject(s->js);
+    JSValue render_fn = JS_GetPropertyStr(s->js, ns, "render");
+    if (!JS_IsFunction(s->js, render_fn)) {
+        JS_FreeValue(s->js, render_fn);
+        render_fn = JS_GetPropertyStr(s->js, ns, "default");
+    }
+    if (JS_IsFunction(s->js, render_fn)) {
+        JS_SetPropertyStr(s->js, target, "render", render_fn);
+    } else {
+        JS_FreeValue(s->js, render_fn);
+    }
+    const JSValue ev_fn = JS_GetPropertyStr(s->js, ns, "onEvent");
+    if (JS_IsFunction(s->js, ev_fn)) {
+        JS_SetPropertyStr(s->js, target, "onEvent", ev_fn);
+    } else {
+        JS_FreeValue(s->js, ev_fn);
+    }
+    const JSValue cmd_fn = JS_GetPropertyStr(s->js, ns, "onCommand");
+    if (JS_IsFunction(s->js, cmd_fn)) {
+        JS_SetPropertyStr(s->js, target, "onCommand", cmd_fn);
+    } else {
+        JS_FreeValue(s->js, cmd_fn);
+    }
+    JS_FreeValue(s->js, target);
+    JS_FreeValue(s->js, ns);
+    return !JS_HasException(s->js);
+}
+
+// ============================================================================
+// Round 4 Built-In Standard Web/JS Globals (performance, crypto, Base64, localStorage)
+// ============================================================================
+
+static JSValue js_perf_now(JSContext* js, JSValueConst, int, JSValueConst*) {
+    auto* s = static_cast<InlaySurface*>(JS_GetContextOpaque(js));
+    return JS_NewFloat64(js, s ? inlay_ui_now_ms(s) : 0.0);
+}
+
+static uint64_t splitmix64_next(uint64_t& x) noexcept {
+    uint64_t z = (x += 0x9E3779B97F4A7C15ULL);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    return z ^ (z >> 31);
+}
+
+static JSValue js_crypto_random_uuid(JSContext* js, JSValueConst, int, JSValueConst*) {
+    auto* s = static_cast<InlaySurface*>(JS_GetContextOpaque(js));
+    auto* owner = s ? ext(ext(s)->host_surface ? ext(s)->host_surface : s) : nullptr;
+    uint64_t seed = SDL_GetPerformanceCounter() ^ (uint64_t(uintptr_t(s)) * 0x517CC1B727220A95ULL);
+    if (owner) seed ^= (++owner->uuid_seq) * 0x9E3779B97F4A7C15ULL;
+    uint8_t b[16];
+    const uint64_t r0 = splitmix64_next(seed);
+    const uint64_t r1 = splitmix64_next(seed);
+    std::memcpy(b, &r0, 8u);
+    std::memcpy(b + 8u, &r1, 8u);
+    b[6] = static_cast<uint8_t>((b[6] & 0x0Fu) | 0x40u); // UUID v4
+    b[8] = static_cast<uint8_t>((b[8] & 0x3Fu) | 0x80u); // RFC 4122 variant
+    char out[40];
+    std::snprintf(out, sizeof(out),
+        "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
+    return JS_NewStringLen(js, out, 36u);
+}
+
+static JSValue js_btoa(JSContext* js, JSValueConst, int argc, JSValueConst* argv) {
+    if (argc < 1) return JS_ThrowTypeError(js, "btoa requires 1 argument");
+    size_t len = 0u;
+    const char* raw = JS_ToCStringLen(js, &len, argv[0]);
+    if (!raw) return JS_EXCEPTION;
+    if (len > 1024u * 1024u) {
+        JS_FreeCString(js, raw);
+        return JS_ThrowRangeError(js, "btoa input too large");
+    }
+    // Decode UTF-8 input to Latin-1 code points (Web API btoa contract).
+    uint8_t* bytes = static_cast<uint8_t*>(SDL_malloc(len ? len : 1u));
+    if (!bytes) { JS_FreeCString(js, raw); return JS_ThrowOutOfMemory(js); }
+    size_t blen = 0u;
+    for (size_t i = 0u; i < len; ) {
+        const uint8_t c0 = static_cast<uint8_t>(raw[i]);
+        if (c0 < 0x80u) {
+            bytes[blen++] = c0;
+            ++i;
+        } else if ((c0 & 0xE0u) == 0xC0u && i + 1u < len) {
+            const uint32_t cp = ((uint32_t(c0 & 0x1Fu) << 6) | uint32_t(static_cast<uint8_t>(raw[i + 1u]) & 0x3Fu));
+            if (cp > 0xFFu) {
+                SDL_free(bytes); JS_FreeCString(js, raw);
+                return JS_ThrowRangeError(js, "btoa: string contains character outside Latin-1 range");
+            }
+            bytes[blen++] = static_cast<uint8_t>(cp);
+            i += 2u;
+        } else {
+            SDL_free(bytes); JS_FreeCString(js, raw);
+            return JS_ThrowRangeError(js, "btoa: string contains character outside Latin-1 range");
+        }
+    }
+    JS_FreeCString(js, raw);
+    static constexpr char kB64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const size_t out_len = ((blen + 2u) / 3u) * 4u;
+    char* out = static_cast<char*>(SDL_malloc(out_len + 1u));
+    if (!out) { SDL_free(bytes); return JS_ThrowOutOfMemory(js); }
+    size_t o = 0u;
+    for (size_t i = 0u; i < blen; i += 3u) {
+        const uint32_t v0 = bytes[i];
+        const uint32_t v1 = (i + 1u < blen) ? bytes[i + 1u] : 0u;
+        const uint32_t v2 = (i + 2u < blen) ? bytes[i + 2u] : 0u;
+        const uint32_t tri = (v0 << 16) | (v1 << 8) | v2;
+        out[o++] = kB64[(tri >> 18) & 0x3Fu];
+        out[o++] = kB64[(tri >> 12) & 0x3Fu];
+        out[o++] = (i + 1u < blen) ? kB64[(tri >> 6) & 0x3Fu] : '=';
+        out[o++] = (i + 2u < blen) ? kB64[tri & 0x3Fu] : '=';
+    }
+    out[o] = '\0';
+    SDL_free(bytes);
+    const JSValue res = JS_NewStringLen(js, out, o);
+    SDL_free(out);
+    return res;
+}
+
+static int b64_dec_val(uint8_t c) noexcept {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+
+static JSValue js_atob(JSContext* js, JSValueConst, int argc, JSValueConst* argv) {
+    if (argc < 1) return JS_ThrowTypeError(js, "atob requires 1 argument");
+    size_t len = 0u;
+    const char* raw = JS_ToCStringLen(js, &len, argv[0]);
+    if (!raw) return JS_EXCEPTION;
+    if (len > 2u * 1024u * 1024u) {
+        JS_FreeCString(js, raw);
+        return JS_ThrowRangeError(js, "atob input too large");
+    }
+    // Strip ASCII whitespace per WHATWG atob spec.
+    uint8_t* clean = static_cast<uint8_t*>(SDL_malloc(len ? len : 1u));
+    if (!clean) { JS_FreeCString(js, raw); return JS_ThrowOutOfMemory(js); }
+    size_t clen = 0u;
+    for (size_t i = 0u; i < len; ++i) {
+        const uint8_t ch = static_cast<uint8_t>(raw[i]);
+        if (ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' || ch == '\f') continue;
+        clean[clen++] = ch;
+    }
+    JS_FreeCString(js, raw);
+    if (clen % 4u == 1u) {
+        SDL_free(clean);
+        return JS_ThrowRangeError(js, "atob: invalid base64 length");
+    }
+    // Encode decoded Latin-1 bytes as UTF-8 (max 2 bytes per byte).
+    const size_t max_bytes = (clen * 3u) / 4u + 4u;
+    char* utf8 = static_cast<char*>(SDL_malloc(max_bytes * 2u + 1u));
+    if (!utf8) { SDL_free(clean); return JS_ThrowOutOfMemory(js); }
+    size_t uo = 0u;
+    auto push_latin1 = [&](uint8_t b) noexcept {
+        if (b < 0x80u) {
+            utf8[uo++] = static_cast<char>(b);
+        } else {
+            utf8[uo++] = static_cast<char>(0xC0u | (b >> 6));
+            utf8[uo++] = static_cast<char>(0x80u | (b & 0x3Fu));
+        }
+    };
+    bool ok = true;
+    for (size_t i = 0u; i < clen && ok; i += 4u) {
+        const size_t rem = clen - i;
+        const int v0 = b64_dec_val(clean[i]);
+        const int v1 = (rem > 1u) ? b64_dec_val(clean[i + 1u]) : -1;
+        const bool p2 = (rem <= 2u) || clean[i + 2u] == '=';
+        const bool p3 = (rem <= 3u) || clean[i + 3u] == '=';
+        const int v2 = p2 ? 0 : b64_dec_val(clean[i + 2u]);
+        const int v3 = p3 ? 0 : b64_dec_val(clean[i + 3u]);
+        if (v0 < 0 || v1 < 0 || (!p2 && v2 < 0) || (!p3 && v3 < 0) || (p2 && !p3)) {
+            ok = false;
+            break;
+        }
+        const uint32_t tri = (uint32_t(v0) << 18) | (uint32_t(v1) << 12) | (uint32_t(v2) << 6) | uint32_t(v3);
+        push_latin1(static_cast<uint8_t>((tri >> 16) & 0xFFu));
+        if (!p2) push_latin1(static_cast<uint8_t>((tri >> 8) & 0xFFu));
+        if (!p3) push_latin1(static_cast<uint8_t>(tri & 0xFFu));
+    }
+    SDL_free(clean);
+    if (!ok) {
+        SDL_free(utf8);
+        return JS_ThrowRangeError(js, "atob: invalid base64 character");
+    }
+    utf8[uo] = '\0';
+    const JSValue res = JS_NewStringLen(js, utf8, uo);
+    SDL_free(utf8);
+    return res;
+}
+
+static SurfaceStorage* ls_owner(JSContext* js) noexcept {
+    auto* s = static_cast<InlaySurface*>(JS_GetContextOpaque(js));
+    if (!s) return nullptr;
+    InlaySurface* target = ext(s)->host_surface ? ext(s)->host_surface : s;
+    return ext(target);
+}
+
+static JSValue js_ls_get_item(JSContext* js, JSValueConst, int argc, JSValueConst* argv) {
+    auto* stg = ls_owner(js);
+    if (!stg || argc < 1) return JS_NULL;
+    size_t klen = 0u;
+    const char* key = JS_ToCStringLen(js, &klen, argv[0]);
+    if (!key) return JS_EXCEPTION;
+    if (stg->storage_get_fn) {
+        const uint32_t cap = 65536u;
+        char* buf = static_cast<char*>(SDL_malloc(cap + 1u));
+        if (!buf) { JS_FreeCString(js, key); return JS_ThrowOutOfMemory(js); }
+        uint32_t out_len = 0u;
+        const bool found = stg->storage_get_fn({key, static_cast<uint32_t>(klen), false},
+                                               buf, cap, &out_len, stg->storage_user);
+        JS_FreeCString(js, key);
+        if (!found) { SDL_free(buf); return JS_NULL; }
+        const uint32_t n = out_len <= cap ? out_len : cap;
+        const JSValue res = JS_NewStringLen(js, buf, n);
+        SDL_free(buf);
+        return res;
+    }
+    for (uint32_t i = 0u; i < stg->ls_count; ++i) {
+        if (stg->ls_entries[i].key && std::strcmp(stg->ls_entries[i].key, key) == 0) {
+            JS_FreeCString(js, key);
+            return JS_NewString(js, stg->ls_entries[i].value ? stg->ls_entries[i].value : "");
+        }
+    }
+    JS_FreeCString(js, key);
+    return JS_NULL;
+}
+
+static JSValue js_ls_set_item(JSContext* js, JSValueConst, int argc, JSValueConst* argv) {
+    auto* stg = ls_owner(js);
+    if (!stg || argc < 2) return JS_UNDEFINED;
+    size_t klen = 0u, vlen = 0u;
+    const char* key = JS_ToCStringLen(js, &klen, argv[0]);
+    if (!key) return JS_EXCEPTION;
+    const char* val = JS_ToCStringLen(js, &vlen, argv[1]);
+    if (!val) { JS_FreeCString(js, key); return JS_EXCEPTION; }
+    if (klen > 256u || vlen > 65536u) {
+        JS_FreeCString(js, key);
+        JS_FreeCString(js, val);
+        return JS_ThrowRangeError(js, "localStorage entry exceeds limit");
+    }
+    if (stg->storage_set_fn) {
+        (void)stg->storage_set_fn({key, static_cast<uint32_t>(klen), false},
+                                  {val, static_cast<uint32_t>(vlen), false}, stg->storage_user);
+    }
+    // Always mirror in local table too so `length` and `key(i)` work consistently.
+    for (uint32_t i = 0u; i < stg->ls_count; ++i) {
+        if (stg->ls_entries[i].key && std::strcmp(stg->ls_entries[i].key, key) == 0) {
+            char* nv = SDL_strdup(val);
+            if (nv) {
+                SDL_free(stg->ls_entries[i].value);
+                stg->ls_entries[i].value = nv;
+            }
+            JS_FreeCString(js, key);
+            JS_FreeCString(js, val);
+            return JS_UNDEFINED;
+        }
+    }
+    if (inlay_grow_pod(stg->ls_entries, stg->ls_cap, stg->ls_count + 1u, 16u, 256u)) {
+        char* nk = SDL_strdup(key);
+        char* nv = SDL_strdup(val);
+        if (nk && nv) {
+            stg->ls_entries[stg->ls_count++] = {nk, nv};
+        } else {
+            SDL_free(nk);
+            SDL_free(nv);
+        }
+    }
+    JS_FreeCString(js, key);
+    JS_FreeCString(js, val);
+    return JS_UNDEFINED;
+}
+
+static JSValue js_ls_remove_item(JSContext* js, JSValueConst, int argc, JSValueConst* argv) {
+    auto* stg = ls_owner(js);
+    if (!stg || argc < 1) return JS_UNDEFINED;
+    size_t klen = 0u;
+    const char* key = JS_ToCStringLen(js, &klen, argv[0]);
+    if (!key) return JS_EXCEPTION;
+    if (stg->storage_remove_fn) {
+        (void)stg->storage_remove_fn({key, static_cast<uint32_t>(klen), false}, stg->storage_user);
+    }
+    for (uint32_t i = 0u; i < stg->ls_count; ++i) {
+        if (stg->ls_entries[i].key && std::strcmp(stg->ls_entries[i].key, key) == 0) {
+            SDL_free(stg->ls_entries[i].key);
+            SDL_free(stg->ls_entries[i].value);
+            stg->ls_entries[i] = stg->ls_entries[--stg->ls_count];
+            break;
+        }
+    }
+    JS_FreeCString(js, key);
+    return JS_UNDEFINED;
+}
+
+static JSValue js_ls_clear(JSContext* js, JSValueConst, int, JSValueConst*) {
+    auto* stg = ls_owner(js);
+    if (!stg) return JS_UNDEFINED;
+    for (uint32_t i = 0u; i < stg->ls_count; ++i) {
+        if (stg->storage_remove_fn && stg->ls_entries[i].key) {
+            (void)stg->storage_remove_fn({stg->ls_entries[i].key,
+                static_cast<uint32_t>(std::strlen(stg->ls_entries[i].key)), false}, stg->storage_user);
+        }
+        SDL_free(stg->ls_entries[i].key);
+        SDL_free(stg->ls_entries[i].value);
+    }
+    stg->ls_count = 0u;
+    return JS_UNDEFINED;
+}
+
+static JSValue js_ls_key(JSContext* js, JSValueConst, int argc, JSValueConst* argv) {
+    auto* stg = ls_owner(js);
+    if (!stg || argc < 1) return JS_NULL;
+    uint32_t idx = 0u;
+    if (JS_ToUint32(js, &idx, argv[0]) != 0 || idx >= stg->ls_count) return JS_NULL;
+    return JS_NewString(js, stg->ls_entries[idx].key ? stg->ls_entries[idx].key : "");
+}
+
+static JSValue js_ls_length(JSContext* js, JSValueConst, int, JSValueConst*) {
+    auto* stg = ls_owner(js);
+    return JS_NewUint32(js, stg ? stg->ls_count : 0u);
 }
 
 bool init_vm_context(InlaySurface* s, const char** out_err) {
@@ -4301,6 +6273,7 @@ bool init_vm_context(InlaySurface* s, const char** out_err) {
     JS_SetMaxStackSize(s->runtime, s->desc.max_stack_bytes);
     JS_SetInterruptHandler(s->runtime, interrupt, s);
     JS_SetHostPromiseRejectionTracker(s->runtime, rejection_tracker, s);
+    JS_SetModuleLoaderFunc(s->runtime, module_normalize_cb, module_loader_cb, s);
     s->js = JS_NewContext(s->runtime);
     if (!s->js) {
         if (out_err) *out_err = "Unable to allocate script context";
@@ -4319,6 +6292,113 @@ bool init_vm_context(InlaySurface* s, const char** out_err) {
                       JS_NewCFunction(s->js, js_set_timeout, "setTimeout", 2));
     JS_SetPropertyStr(s->js, global, "clearTimeout",
                       JS_NewCFunction(s->js, js_clear_timeout, "clearTimeout", 1));
+    JS_SetPropertyStr(s->js, global, "setInterval",
+                      JS_NewCFunction(s->js, js_set_interval, "setInterval", 2));
+    JS_SetPropertyStr(s->js, global, "clearInterval",
+                      JS_NewCFunction(s->js, js_clear_timeout, "clearInterval", 1));
+    JS_SetPropertyStr(s->js, global, "requestAnimationFrame",
+                      JS_NewCFunction(s->js, js_request_animation_frame, "requestAnimationFrame", 1));
+    JS_SetPropertyStr(s->js, global, "cancelAnimationFrame",
+                      JS_NewCFunction(s->js, js_clear_timeout, "cancelAnimationFrame", 1));
+    {
+        const JSValue con = JS_NewObject(s->js);
+        JS_SetPropertyStr(s->js, con, "debug",
+                          JS_NewCFunctionMagic(s->js, js_console_emit, "debug", 1, JS_CFUNC_generic_magic, INLAY_CONSOLE_DEBUG));
+        JS_SetPropertyStr(s->js, con, "log",
+                          JS_NewCFunctionMagic(s->js, js_console_emit, "log", 1, JS_CFUNC_generic_magic, INLAY_CONSOLE_INFO));
+        JS_SetPropertyStr(s->js, con, "info",
+                          JS_NewCFunctionMagic(s->js, js_console_emit, "info", 1, JS_CFUNC_generic_magic, INLAY_CONSOLE_INFO));
+        JS_SetPropertyStr(s->js, con, "warn",
+                          JS_NewCFunctionMagic(s->js, js_console_emit, "warn", 1, JS_CFUNC_generic_magic, INLAY_CONSOLE_WARN));
+        JS_SetPropertyStr(s->js, con, "error",
+                          JS_NewCFunctionMagic(s->js, js_console_emit, "error", 1, JS_CFUNC_generic_magic, INLAY_CONSOLE_ERROR));
+        JS_SetPropertyStr(s->js, global, "console", con);
+    }
+    JS_SetPropertyStr(s->js, global, "fuzzyMatch",
+                      JS_NewCFunction(s->js, js_fuzzy_match, "fuzzyMatch", 2));
+    JS_SetPropertyStr(s->js, global, "clipboardWrite",
+                      JS_NewCFunction(s->js, js_clipboard_write, "clipboardWrite", 1));
+    JS_SetPropertyStr(s->js, global, "clipboardRead",
+                      JS_NewCFunction(s->js, js_clipboard_read, "clipboardRead", 0));
+    JS_SetPropertyStr(s->js, global, "clipboardReadImage",
+                      JS_NewCFunction(s->js, js_clipboard_read_image, "clipboardReadImage", 0));
+    JS_SetPropertyStr(s->js, global, "pushFocusRestorePoint",
+                      JS_NewCFunction(s->js, js_push_focus_restore, "pushFocusRestorePoint", 0));
+    JS_SetPropertyStr(s->js, global, "popFocusRestorePoint",
+                      JS_NewCFunction(s->js, js_pop_focus_restore, "popFocusRestorePoint", 0));
+    JS_SetPropertyStr(s->js, global, "setUiZoom",
+                      JS_NewCFunction(s->js, js_set_ui_zoom, "setUiZoom", 1));
+    JS_SetPropertyStr(s->js, global, "getUiZoom",
+                      JS_NewCFunction(s->js, js_get_ui_zoom, "getUiZoom", 0));
+    JS_SetPropertyStr(s->js, global, "focusElement",
+                      JS_NewCFunction(s->js, js_focus_element, "focusElement", 1));
+    JS_SetPropertyStr(s->js, global, "blurElement",
+                      JS_NewCFunction(s->js, js_blur_element, "blurElement", 0));
+    JS_SetPropertyStr(s->js, global, "scrollTo",
+                      JS_NewCFunction(s->js, js_scroll_to, "scrollTo", 3));
+    JS_SetPropertyStr(s->js, global, "scrollToBottom",
+                      JS_NewCFunction(s->js, js_scroll_to_bottom, "scrollToBottom", 1));
+    JS_SetPropertyStr(s->js, global, "scrollIntoView",
+                      JS_NewCFunction(s->js, js_scroll_into_view, "scrollIntoView", 3));
+    JS_SetPropertyStr(s->js, global, "measureElement",
+                      JS_NewCFunction(s->js, js_measure_element, "measureElement", 1));
+    JS_SetPropertyStr(s->js, global, "openUrl",
+                      JS_NewCFunction(s->js, js_open_url, "openUrl", 1));
+    JS_SetPropertyStr(s->js, global, "notifyDesktop",
+                      JS_NewCFunction(s->js, js_notify_desktop, "notifyDesktop", 3));
+    JS_SetPropertyStr(s->js, global, "openFileDialog",
+                      JS_NewCFunction(s->js, js_open_file_dialog, "openFileDialog", 1));
+    JS_SetPropertyStr(s->js, global, "openFolderDialog",
+                      JS_NewCFunction(s->js, js_open_folder_dialog, "openFolderDialog", 1));
+    JS_SetPropertyStr(s->js, global, "saveFileDialog",
+                      JS_NewCFunction(s->js, js_save_file_dialog, "saveFileDialog", 1));
+    JS_SetPropertyStr(s->js, global, "registerCommand",
+                      JS_NewCFunction(s->js, js_register_command, "registerCommand", 1));
+    JS_SetPropertyStr(s->js, global, "unregisterCommand",
+                      JS_NewCFunction(s->js, js_unregister_command, "unregisterCommand", 1));
+    JS_SetPropertyStr(s->js, global, "dispatchCommand",
+                      JS_NewCFunction(s->js, js_dispatch_command, "dispatchCommand", 1));
+    JS_SetPropertyStr(s->js, global, "pushCommandScope",
+                      JS_NewCFunction(s->js, js_push_command_scope, "pushCommandScope", 1));
+    JS_SetPropertyStr(s->js, global, "popCommandScope",
+                      JS_NewCFunction(s->js, js_pop_command_scope, "popCommandScope", 0));
+    JS_SetPropertyStr(s->js, global, "readStream",
+                      JS_NewCFunction(s->js, js_read_stream, "readStream", 2));
+    JS_SetPropertyStr(s->js, global, "saveDockLayout",
+                      JS_NewCFunction(s->js, js_save_dock_layout, "saveDockLayout", 1));
+    JS_SetPropertyStr(s->js, global, "loadDockLayout",
+                      JS_NewCFunction(s->js, js_load_dock_layout, "loadDockLayout", 2));
+    JS_SetPropertyStr(s->js, global, "detachDockPane",
+                      JS_NewCFunction(s->js, js_detach_dock_pane, "detachDockPane", 2));
+    JS_SetPropertyStr(s->js, global, "encodeTerminalKey",
+                      JS_NewCFunction(s->js, js_encode_terminal_key, "encodeTerminalKey", 3));
+    JS_SetPropertyStr(s->js, global, "encodeTerminalMouseSgr",
+                      JS_NewCFunction(s->js, js_encode_terminal_mouse_sgr, "encodeTerminalMouseSgr", 6));
+    {
+        const JSValue perf = JS_NewObject(s->js);
+        JS_SetPropertyStr(s->js, perf, "now", JS_NewCFunction(s->js, js_perf_now, "now", 0));
+        JS_SetPropertyStr(s->js, global, "performance", perf);
+    }
+    {
+        const JSValue cry = JS_NewObject(s->js);
+        JS_SetPropertyStr(s->js, cry, "randomUUID", JS_NewCFunction(s->js, js_crypto_random_uuid, "randomUUID", 0));
+        JS_SetPropertyStr(s->js, global, "crypto", cry);
+    }
+    JS_SetPropertyStr(s->js, global, "btoa", JS_NewCFunction(s->js, js_btoa, "btoa", 1));
+    JS_SetPropertyStr(s->js, global, "atob", JS_NewCFunction(s->js, js_atob, "atob", 1));
+    {
+        const JSValue ls = JS_NewObject(s->js);
+        JS_SetPropertyStr(s->js, ls, "getItem", JS_NewCFunction(s->js, js_ls_get_item, "getItem", 1));
+        JS_SetPropertyStr(s->js, ls, "setItem", JS_NewCFunction(s->js, js_ls_set_item, "setItem", 2));
+        JS_SetPropertyStr(s->js, ls, "removeItem", JS_NewCFunction(s->js, js_ls_remove_item, "removeItem", 1));
+        JS_SetPropertyStr(s->js, ls, "clear", JS_NewCFunction(s->js, js_ls_clear, "clear", 0));
+        JS_SetPropertyStr(s->js, ls, "key", JS_NewCFunction(s->js, js_ls_key, "key", 1));
+        const JSAtom len_atom = JS_NewAtom(s->js, "length");
+        const JSValue len_get = JS_NewCFunction(s->js, js_ls_length, "get length", 0);
+        JS_DefinePropertyGetSet(s->js, ls, len_atom, len_get, JS_UNDEFINED, JS_PROP_CONFIGURABLE);
+        JS_FreeAtom(s->js, len_atom);
+        JS_SetPropertyStr(s->js, global, "localStorage", ls);
+    }
     JS_SetPropertyStr(s->js, global, "Atomics", JS_UNDEFINED);
     JS_SetPropertyStr(s->js, global, "SharedArrayBuffer", JS_UNDEFINED);
     JS_FreeValue(s->js, global);
@@ -4329,7 +6409,7 @@ bool init_vm_context(InlaySurface* s, const char** out_err) {
         "globalThis.__inlay_stk=[];globalThis.__inlay_has_hm=false;"
         "globalThis.__inlay_seen=Object.create(null);globalThis.__inlay_fx=[];globalThis.__inlay_dirty=false;"
         "globalThis.__inlay_begin=()=>{globalThis.__inlay_dirty=false;globalThis.__inlay_seen=Object.create(null);"
-        "globalThis.__inlay_fx.length=0;globalThis.__inlay_stk=[{k:'__root',i:0,c:0,eb:''}];"
+        "globalThis.__inlay_fx.length=0;globalThis.__inlay_stk=[{k:'__root',i:0,c:0,eb:'',ctx:null}];"
         "globalThis.__inlay_seen.__root=globalThis.__inlay_visit=1;};"
         "globalThis.__inlay_commit=()=>{if(globalThis.__inlay_has_hm){const hm=globalThis.__inlay_hm,seen=globalThis.__inlay_seen;"
         "let any=false;for(const k in hm){if(!seen[k]){const a=hm[k];for(let j=0;j<a.length;++j){"
@@ -4342,10 +6422,10 @@ bool init_vm_context(InlaySurface* s, const char** out_err) {
         "if(tag===Math)tag='math';"
         "if(typeof tag==='function'){"
         "if(tag.__ui)return tag(props||{},...children);"
-        "const stk=globalThis.__inlay_stk,pf=stk.length?stk[stk.length-1]:{k:'__root',i:0,c:0,eb:''};"
+        "const stk=globalThis.__inlay_stk,pf=stk.length?stk[stk.length-1]:{k:'__root',i:0,c:0,eb:'',ctx:null};"
         "const nm=tag.name||'C',hk=props&&props.key!==undefined&&props.key!==null;"
         "const sk=pf.k+'/'+(hk?(nm+'#'+String(props.key)):(nm+'@'+(pf.c++)));"
-        "globalThis.__inlay_seen[sk]=++globalThis.__inlay_visit;stk.push({k:sk,i:0,c:0,memo:pf.memo,eb:pf.eb||''});"
+        "globalThis.__inlay_seen[sk]=++globalThis.__inlay_visit;stk.push({k:sk,i:0,c:0,memo:pf.memo,eb:pf.eb||'',ctx:pf.ctx||null});"
         "const mp=children.length||!(props&&'children'in props)?Object.assign({},props,{children}):Object.assign({},props);"
         "try{return tag(mp);}finally{stk.pop();}}"
         "const stk=globalThis.__inlay_stk,pf=stk.length?stk[stk.length-1]:null;"
@@ -4364,11 +6444,14 @@ bool init_vm_context(InlaySurface* s, const char** out_err) {
         "checkbox:m('checkbox'),tabs:m('tabs'),combobox:m('combobox'),scroll:m('scroll'),"
         "progress:m('progress'),slider:m('slider'),badge:x('badge'),divider:m('divider'),"
         "image:m('image'),modal:m('modal'),popover:m('popover'),tooltip:m('tooltip'),"
-        "split:m('split'),math:x('math'),diagram:x('diagram'),slot:x('slot','name'),"
+        "split:m('split'),math:x('math'),diagram:x('diagram'),slot:x('slot','name'),portal:x('portal','name'),"
         "doc:x('doc','markdown'),codeEditor:x('codeEditor','buffer'),terminal:x('terminal','ansi'),virtualList:m('virtualList'),"
         "table:m('table'),tree:m('tree'),treeItem:x('treeItem','label'),"
         "menu:m('menu'),contextMenu:m('contextMenu'),avatar:x('avatar','name'),"
         "toast:x('toast','description'),accordion:x('accordion','title'),skeleton:m('skeleton'),"
+        "dockSpace:m('dockSpace'),dockPane:m('dockPane'),sheet:m('sheet'),hoverCard:m('hoverCard'),"
+        "radioGroup:m('radioGroup'),toggleGroup:m('toggleGroup'),colorPicker:m('colorPicker'),"
+        "chart:m('chart'),viewZone:m('viewZone'),diffView:m('diffView'),"
         "h:globalThis.h,fragment:(...c)=>c};"
         "const G=globalThis;"
         "G.Box='box';G.Row='row';G.Col='col';G.Card='card';G.Form='form';G.Text='text';"
@@ -4376,12 +6459,15 @@ bool init_vm_context(InlaySurface* s, const char** out_err) {
         "G.Checkbox='checkbox';G.Tabs='tabs';G.Combobox='combobox';G.Scroll='scroll';"
         "G.Progress='progress';G.Slider='slider';G.Badge='badge';G.Divider='divider';"
         "G.Image='image';G.Modal='modal';G.Popover='popover';G.Tooltip='tooltip';"
-        "G.Split='split';G.Spacer='spacer';G.Diagram='diagram';G.Slot='slot';"
+        "G.Split='split';G.Spacer='spacer';G.Diagram='diagram';G.Slot='slot';G.Portal='portal';"
         "G.Doc='doc';G.CodeEditor='codeEditor';G.Terminal='terminal';G.VirtualList='virtualList';G.Table='table';"
         "G.Tree='tree';G.TreeItem='treeItem';G.Menu='menu';G.ContextMenu='contextMenu';"
         "G.Avatar='avatar';G.Toast='toast';G.Accordion='accordion';G.Skeleton='skeleton';"
+        "G.DockSpace='dockSpace';G.DockPane='dockPane';G.Sheet='sheet';G.HoverCard='hoverCard';"
+        "G.RadioGroup='radioGroup';G.ToggleGroup='toggleGroup';G.ColorPicker='colorPicker';"
+        "G.Chart='chart';G.ViewZone='viewZone';G.DiffView='diffView';"
         "G.Fragment=G.__frag;"
-        "const slot=()=>{const stk=G.__inlay_stk,f=stk.length?stk[stk.length-1]:{k:'__root',i:0,c:0,eb:''};"
+        "const slot=()=>{const stk=G.__inlay_stk,f=stk.length?stk[stk.length-1]:{k:'__root',i:0,c:0,eb:'',ctx:null};"
         "if(f.i===0&&G.__inlay_collect)G.__inlay_collect.push(f.k);"
         "const hm=G.__inlay_hm;let a=hm[f.k];if(!a){a=hm[f.k]=[];G.__inlay_has_hm=true;}return[a,f.i++];};"
         "const same=(a,b)=>{if(!a||!b||a.length!==b.length)return false;"
@@ -4390,16 +6476,42 @@ bool init_vm_context(InlaySurface* s, const char** out_err) {
         "const frame=G.__inlay_stk[G.__inlay_stk.length-1],owner=frame&&frame.memo;"
         "return[a[i],v=>{const n=typeof v==='function'?v(a[i]):v;"
         "if(!Object.is(a[i],n)){a[i]=n;for(let m=owner;m;m=m.parent)m.dirty=true;G.__inlay_dirty=true;}}];};"
+        "G.useReducer=(reducer,initArg,init)=>{const[a,i]=slot();"
+        "const frame=G.__inlay_stk[G.__inlay_stk.length-1],owner=frame&&frame.memo;"
+        "if(i>=a.length){const st=typeof init==='function'?init(initArg):initArg;"
+        "const cell={s:st,r:reducer,d:null};"
+        "cell.d=act=>{const n=cell.r(cell.s,act);if(!Object.is(cell.s,n)){cell.s=n;for(let m=owner;m;m=m.parent)m.dirty=true;G.__inlay_dirty=true;}};"
+        "a[i]=cell;}else{a[i].r=reducer;}return[a[i].s,a[i].d];};"
         "G.useRef=init=>{const[a,i]=slot();if(i>=a.length)a[i]={current:init};return a[i];};"
         "G.useMemo=(fn,deps)=>{const[a,i]=slot();"
         "if(i>=a.length||!deps||!same(a[i].d,deps))a[i]={v:fn(),d:deps?deps.slice():null};return a[i].v;};"
         "G.useCallback=(fn,deps)=>G.useMemo(()=>fn,deps);"
         "G.useEffect=(fn,deps)=>{const[a,i]=slot();"
         "if(i>=a.length){const r={__fx:1,d:deps?deps.slice():null,fn,cl:undefined};a[i]=r;G.__inlay_fx.push(r);}"
-        "else if(!deps||!same(a[i].d,deps)){a[i].d=deps?deps.slice():null;a[i].fn=fn;G.__inlay_fx.push(a[i]);}};})();"
+        "else if(!deps||!same(a[i].d,deps)){a[i].d=deps?deps.slice():null;a[i].fn=fn;G.__inlay_fx.push(a[i]);}};"
+        "let nextCtxId=1;"
+        "G.provideContext=(ctx,value)=>{const stk=G.__inlay_stk,f=stk.length?stk[stk.length-1]:null;"
+        "if(!f||!ctx||!ctx.__ctxId)return;"
+        "if(!f.ctxOwn){f.ctx=Object.create(f.ctx||null);f.ctxOwn=true;}"
+        "f.ctx[ctx.__ctxId]=value;};"
+        "G.useContext=ctx=>{const stk=G.__inlay_stk,f=stk.length?stk[stk.length-1]:null;"
+        "if(!ctx||!ctx.__ctxId)return undefined;"
+        "const v=(f&&f.ctx&&(ctx.__ctxId in f.ctx))?f.ctx[ctx.__ctxId]:ctx.defaultValue;"
+        "for(let m=f&&f.memo;m;m=m.parent){if(!m.ctxs)m.ctxs=[];m.ctxs.push({c:ctx,v});}"
+        "return v;};"
+        "G.createContext=defaultValue=>{const id=nextCtxId++;"
+        "const ctx={__ctxId:id,defaultValue,Provider:null};"
+        "function Provider(p){G.provideContext(ctx,p.value);"
+        "if(typeof p.render==='function')return p.render(p.value);"
+        "const ch=p.children;"
+        "if(typeof ch==='function')return ch(p.value);"
+        "if(Array.isArray(ch)&&ch.length===1&&typeof ch[0]==='function')return ch[0](p.value);"
+        "return ch;}"
+        "ctx.Provider=Provider;return ctx;};})();"
         R"JS(
         (() => {
             const G = globalThis;
+            const readCtxVal = (map, c) => (map && (c.__ctxId in map)) ? map[c.__ctxId] : c.defaultValue;
             function equalProps(a, b) {
                 const keys = Object.keys(a);
                 if (keys.length !== Object.keys(b).length) return false;
@@ -4420,15 +6532,23 @@ bool init_vm_context(InlaySurface* s, const char** out_err) {
                     const stack = G.__inlay_stk, frame = stack[stack.length - 1];
                     const collect = G.__inlay_collect;
                     cache.parent = frame.memo;
-                    if (cache.component === component && !cache.dirty && equal(cache.props, props)) {
+                    const ctxMatch = !cache.ctxs || cache.ctxs.every(e => Object.is(readCtxVal(frame.ctx, e.c), e.v));
+                    if (cache.component === component && !cache.dirty && ctxMatch && equal(cache.props, props)) {
                         for (const key of cache.scopes) {
                             G.__inlay_seen[key] = ++G.__inlay_visit;
                             if (collect) collect.push(key);
+                        }
+                        if (cache.ctxs) {
+                            for (let m = cache.parent; m; m = m.parent) {
+                                if (!m.ctxs) m.ctxs = [];
+                                for (const e of cache.ctxs) m.ctxs.push(e);
+                            }
                         }
                         return cache.tree;
                     }
                     cache.component = null;
                     cache.dirty = false;
+                    cache.ctxs = null;
                     frame.memo = cache;
                     const scopes = [];
                     G.__inlay_collect = scopes;
@@ -4503,6 +6623,201 @@ bool init_vm_context(InlaySurface* s, const char** out_err) {
             G.ui.errorBoundary.__ui = true;
         })();
         )JS";
+    static constexpr char bootstrap_globals[] = R"JS(
+        (() => {
+            const G = globalThis;
+            // Standard JS/Web globals: queueMicrotask, structuredClone, TextEncoder/Decoder, URL/URLSearchParams
+            if (typeof G.queueMicrotask !== 'function') {
+                G.queueMicrotask = fn => { Promise.resolve().then(fn); };
+            }
+            if (typeof G.structuredClone !== 'function') {
+                G.structuredClone = val => {
+                    const seen = new WeakMap();
+                    const clone = v => {
+                        if (v === null || typeof v !== 'object') return v;
+                        if (seen.has(v)) return seen.get(v);
+                        if (v instanceof Date) return new Date(v.getTime());
+                        if (v instanceof RegExp) return new RegExp(v.source, v.flags);
+                        if (v instanceof ArrayBuffer) return v.slice(0);
+                        if (ArrayBuffer.isView(v)) {
+                            const Ctor = v.constructor;
+                            return new Ctor(v.buffer.slice(v.byteOffset, v.byteOffset + v.byteLength));
+                        }
+                        if (v instanceof Map) {
+                            const out = new Map();
+                            seen.set(v, out);
+                            for (const [k, x] of v) out.set(clone(k), clone(x));
+                            return out;
+                        }
+                        if (v instanceof Set) {
+                            const out = new Set();
+                            seen.set(v, out);
+                            for (const x of v) out.add(clone(x));
+                            return out;
+                        }
+                        if (Array.isArray(v)) {
+                            const out = new Array(v.length);
+                            seen.set(v, out);
+                            for (let i = 0; i < v.length; ++i) out[i] = clone(v[i]);
+                            return out;
+                        }
+                        const out = {};
+                        seen.set(v, out);
+                        for (const k of Object.keys(v)) out[k] = clone(v[k]);
+                        return out;
+                    };
+                    return clone(val);
+                };
+            }
+            if (typeof G.TextEncoder !== 'function') {
+                G.TextEncoder = class TextEncoder {
+                    constructor() { this.encoding = 'utf-8'; }
+                    encode(str = '') {
+                        const s = String(str), out = [];
+                        for (let i = 0; i < s.length; ++i) {
+                            let cp = s.charCodeAt(i);
+                            if (cp >= 0xD800 && cp <= 0xDBFF && i + 1 < s.length) {
+                                const lo = s.charCodeAt(i + 1);
+                                if (lo >= 0xDC00 && lo <= 0xDFFF) { cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00); ++i; }
+                            }
+                            if (cp < 0x80) out.push(cp);
+                            else if (cp < 0x800) out.push(0xC0 | (cp >> 6), 0x80 | (cp & 0x3F));
+                            else if (cp < 0x10000) out.push(0xE0 | (cp >> 12), 0x80 | ((cp >> 6) & 0x3F), 0x80 | (cp & 0x3F));
+                            else out.push(0xF0 | (cp >> 18), 0x80 | ((cp >> 12) & 0x3F), 0x80 | ((cp >> 6) & 0x3F), 0x80 | (cp & 0x3F));
+                        }
+                        return new Uint8Array(out);
+                    }
+                    encodeInto(str, dest) {
+                        const bytes = this.encode(str);
+                        const n = Math.min(bytes.length, dest.length);
+                        dest.set(bytes.subarray(0, n));
+                        return { read: str.length, written: n };
+                    }
+                };
+            }
+            if (typeof G.TextDecoder !== 'function') {
+                G.TextDecoder = class TextDecoder {
+                    constructor(enc = 'utf-8') { this.encoding = String(enc).toLowerCase(); }
+                    decode(input) {
+                        if (!input) return '';
+                        const b = input instanceof Uint8Array ? input
+                            : ArrayBuffer.isView(input) ? new Uint8Array(input.buffer, input.byteOffset, input.byteLength)
+                            : new Uint8Array(input);
+                        let res = '';
+                        for (let i = 0; i < b.length; ) {
+                            const c0 = b[i++];
+                            if (c0 < 0x80) { res += String.fromCharCode(c0); continue; }
+                            if ((c0 & 0xE0) === 0xC0 && i < b.length) {
+                                const cp = ((c0 & 0x1F) << 6) | (b[i++] & 0x3F);
+                                res += String.fromCharCode(cp);
+                            } else if ((c0 & 0xF0) === 0xE0 && i + 1 < b.length) {
+                                const cp = ((c0 & 0x0F) << 12) | ((b[i++] & 0x3F) << 6) | (b[i++] & 0x3F);
+                                res += String.fromCharCode(cp);
+                            } else if ((c0 & 0xF8) === 0xF0 && i + 2 < b.length) {
+                                let cp = ((c0 & 0x07) << 18) | ((b[i++] & 0x3F) << 12) | ((b[i++] & 0x3F) << 6) | (b[i++] & 0x3F);
+                                cp -= 0x10000;
+                                res += String.fromCharCode(0xD800 + (cp >> 10), 0xDC00 + (cp & 0x3FF));
+                            } else {
+                                res += '\uFFFD';
+                            }
+                        }
+                        return res;
+                    }
+                };
+            }
+            if (typeof G.URLSearchParams !== 'function') {
+                const decQ = s => { try { return decodeURIComponent(s.replace(/\+/g, ' ')); } catch (_) { return s; } };
+                const encQ = s => encodeURIComponent(String(s)).replace(/%20/g, '+');
+                G.URLSearchParams = class URLSearchParams {
+                    constructor(init = '') {
+                        this._p = [];
+                        this._cb = null;
+                        if (typeof init === 'string') {
+                            const s = init.startsWith('?') ? init.slice(1) : init;
+                            if (s) for (const part of s.split('&')) {
+                                if (!part) continue;
+                                const eq = part.indexOf('=');
+                                this._p.push(eq >= 0 ? [decQ(part.slice(0, eq)), decQ(part.slice(eq + 1))] : [decQ(part), '']);
+                            }
+                        } else if (Array.isArray(init)) {
+                            for (const kv of init) if (kv && kv.length >= 2) this._p.push([String(kv[0]), String(kv[1])]);
+                        } else if (init && typeof init === 'object') {
+                            if (init instanceof URLSearchParams) {
+                                for (const [k, v] of init._p) this._p.push([k, v]);
+                            } else {
+                                for (const k of Object.keys(init)) this._p.push([k, String(init[k])]);
+                            }
+                        }
+                    }
+                    _sync() { if (this._cb) this._cb(); }
+                    get size() { return this._p.length; }
+                    append(k, v) { this._p.push([String(k), String(v)]); this._sync(); }
+                    delete(k) { const ks = String(k); this._p = this._p.filter(e => e[0] !== ks); this._sync(); }
+                    get(k) { const ks = String(k); const e = this._p.find(x => x[0] === ks); return e ? e[1] : null; }
+                    getAll(k) { const ks = String(k); return this._p.filter(x => x[0] === ks).map(x => x[1]); }
+                    has(k) { const ks = String(k); return this._p.some(x => x[0] === ks); }
+                    set(k, v) {
+                        const ks = String(k), vs = String(v);
+                        let found = false;
+                        this._p = this._p.filter(x => { if (x[0] !== ks) return true; if (!found) { x[1] = vs; found = true; return true; } return false; });
+                        if (!found) this._p.push([ks, vs]);
+                        this._sync();
+                    }
+                    sort() { this._p.sort((a, b) => a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0); this._sync(); }
+                    entries() { return this._p.map(e => [e[0], e[1]])[Symbol.iterator](); }
+                    keys() { return this._p.map(e => e[0])[Symbol.iterator](); }
+                    values() { return this._p.map(e => e[1])[Symbol.iterator](); }
+                    forEach(fn, thisArg) { for (const [k, v] of this._p) fn.call(thisArg, v, k, this); }
+                    [Symbol.iterator]() { return this.entries(); }
+                    toString() { return this._p.map(([k, v]) => encQ(k) + '=' + encQ(v)).join('&'); }
+                };
+            }
+            if (typeof G.URL !== 'function') {
+                G.URL = class URL {
+                    constructor(url, base) {
+                        let raw = String(url);
+                        if (base !== undefined) {
+                            const b = base instanceof URL ? base : new URL(base);
+                            if (!/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(raw)) {
+                                if (raw.startsWith('//')) raw = b.protocol + raw;
+                                else if (raw.startsWith('/')) raw = b.origin + raw;
+                                else if (raw.startsWith('?')) raw = b.origin + b.pathname + raw;
+                                else if (raw.startsWith('#')) raw = b.origin + b.pathname + b.search + raw;
+                                else {
+                                    const dir = b.pathname.slice(0, b.pathname.lastIndexOf('/') + 1);
+                                    raw = b.origin + dir + raw;
+                                }
+                            }
+                        }
+                        const m = /^([a-zA-Z][a-zA-Z0-9+.-]*:)(?:\/\/(?:([^:@/?#]*)(?::([^@/?#]*))?@)?(\[[^\]]+\]|[^:/?#]*)(?::(\d*))?)?([^?#]*)(\?[^#]*)?(#.*)?$/.exec(raw);
+                        if (!m) throw new TypeError('Invalid URL: ' + raw);
+                        this.protocol = m[1].toLowerCase();
+                        this.username = m[2] || '';
+                        this.password = m[3] || '';
+                        this.hostname = (m[4] || '').toLowerCase();
+                        this.port = m[5] || '';
+                        this.pathname = m[6] || (this.hostname ? '/' : '');
+                        this._search = m[7] || '';
+                        this.hash = m[8] || '';
+                        this.searchParams = new G.URLSearchParams(this._search);
+                        this.searchParams._cb = () => { const s = this.searchParams.toString(); this._search = s ? ('?' + s) : ''; };
+                    }
+                    get host() { return this.port ? (this.hostname + ':' + this.port) : this.hostname; }
+                    set host(v) { const s = String(v), c = s.lastIndexOf(':'); if (c >= 0) { this.hostname = s.slice(0, c); this.port = s.slice(c + 1); } else { this.hostname = s; this.port = ''; } }
+                    get origin() { return this.hostname ? (this.protocol + '//' + this.host) : 'null'; }
+                    get search() { return this._search; }
+                    set search(v) { const s = String(v); this._search = s ? (s.startsWith('?') ? s : '?' + s) : ''; this.searchParams = new G.URLSearchParams(this._search); this.searchParams._cb = () => { const qs = this.searchParams.toString(); this._search = qs ? ('?' + qs) : ''; }; }
+                    get href() {
+                        const auth = this.username ? (this.username + (this.password ? ':' + this.password : '') + '@') : '';
+                        const authHost = this.hostname ? ('//' + auth + this.host) : '';
+                        return this.protocol + authHost + this.pathname + this._search + this.hash;
+                    }
+                    toString() { return this.href; }
+                    toJSON() { return this.href; }
+                };
+            }
+        })();
+        )JS";
 
     bool ran_bc = false;
     if (stg->bootstrap_bc && stg->bootstrap_bc_len > 0u) {
@@ -4517,8 +6832,21 @@ bool init_vm_context(InlaySurface* s, const char** out_err) {
         }
     }
     if (!ran_bc) {
-        const JSValue fn = JS_Eval(s->js, bootstrap, sizeof(bootstrap) - 1u, "<inlay>",
+        const size_t len1 = sizeof(bootstrap) - 1u;
+        const size_t len2 = sizeof(bootstrap_globals) - 1u;
+        const size_t total = len1 + 1u + len2;
+        auto* joined = static_cast<char*>(SDL_malloc(total + 1u));
+        if (!joined) {
+            if (out_err) *out_err = "Unable to allocate script bootstrap";
+            return false;
+        }
+        std::memcpy(joined, bootstrap, len1);
+        joined[len1] = '\n';
+        std::memcpy(joined + len1 + 1u, bootstrap_globals, len2);
+        joined[total] = '\0';
+        const JSValue fn = JS_Eval(s->js, joined, total, "<inlay>",
                                    JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
+        SDL_free(joined);
         if (!JS_IsException(fn)) {
             if (!stg->bootstrap_bc) {
                 size_t bc_len = 0u;
@@ -4553,7 +6881,7 @@ bool load_hmr_staged(InlaySurface* s, EtchStr effective, const char* filename) {
     static constexpr char prefix[] = "(function(){";
     static constexpr char suffix[] =
         "\n;return {render:typeof render==='function'?render:undefined,onEvent:typeof "
-        "onEvent==='function'?onEvent:undefined};})()";
+        "onEvent==='function'?onEvent:undefined,onCommand:typeof onCommand==='function'?onCommand:undefined};})()";
 
     auto* staged = static_cast<SurfaceStorage*>(SDL_calloc(1u, sizeof(SurfaceStorage)));
     if (!staged) {
@@ -4572,9 +6900,23 @@ bool load_hmr_staged(InlaySurface* s, EtchStr effective, const char* filename) {
     st->next_timer = s->next_timer;
     st->image_resolver_fn = s->image_resolver_fn;
     st->image_resolver_user_data = s->image_resolver_user_data;
+    st->console_fn = s->console_fn;
+    st->console_user_data = s->console_user_data;
+    st->code_tok_fn = s->code_tok_fn;
+    st->code_tok_user_data = s->code_tok_user_data;
+    st->doc_hl_fn = s->doc_hl_fn;
+    st->doc_hl_user_data = s->doc_hl_user_data;
+    st->doc_fence_est = s->doc_fence_est;
+    st->doc_fence_ren = s->doc_fence_ren;
+    st->doc_fence_user_data = s->doc_fence_user_data;
+    staged->last_view_id = live_ext->last_view_id;
+    staged->command_names = live_ext->command_names;
+    staged->command_name_count = live_ext->command_name_count;
+    staged->command_name_cap = live_ext->command_name_cap;
     std::memcpy(st->path, s->path, sizeof(st->path));
-    std::memcpy(st->actions, s->actions, sizeof(st->actions));
+    st->actions = s->actions;
     st->action_count = s->action_count;
+    st->action_cap = s->action_cap;
     std::memcpy(st->slots, s->slots, sizeof(st->slots));
     st->slot_count = s->slot_count;
     for (auto& timer : st->timers) timer.function = JS_UNDEFINED;
@@ -4596,6 +6938,15 @@ bool load_hmr_staged(InlaySurface* s, EtchStr effective, const char* filename) {
     st->content = s->content;
     st->content_count = s->content_count;
     st->content_cap = s->content_cap;
+    st->terminals = s->terminals;
+    st->terminal_count = s->terminal_count;
+    st->terminal_cap = s->terminal_cap;
+    st->streams = s->streams;
+    st->stream_count = s->stream_count;
+    st->stream_cap = s->stream_cap;
+    staged->modules = live_ext->modules;
+    staged->module_count = live_ext->module_count;
+    staged->module_cap = live_ext->module_cap;
     st->vlist_cache = s->vlist_cache;
     st->vlist_cache_count = s->vlist_cache_count;
     st->vlist_cache_cap = s->vlist_cache_cap;
@@ -4624,10 +6975,28 @@ bool load_hmr_staged(InlaySurface* s, EtchStr effective, const char* filename) {
             live_ext->bootstrap_bc = staged->bootstrap_bc;
             live_ext->bootstrap_bc_len = staged->bootstrap_bc_len;
         }
+        live_ext->command_names = staged->command_names;
+        live_ext->command_name_count = staged->command_name_count;
+        live_ext->command_name_cap = staged->command_name_cap;
+        staged->command_names = nullptr;
+        staged->command_name_count = 0u;
+        staged->command_name_cap = 0u;
+        st->actions = nullptr;
+        st->action_count = 0u;
+        st->action_cap = 0u;
         st->json_scratch = nullptr;
         st->content = nullptr;
         st->content_count = 0u;
         st->content_cap = 0u;
+        st->terminals = nullptr;
+        st->terminal_count = 0u;
+        st->terminal_cap = 0u;
+        st->streams = nullptr;
+        st->stream_count = 0u;
+        st->stream_cap = 0u;
+        staged->modules = nullptr;
+        staged->module_count = 0u;
+        staged->module_cap = 0u;
         st->vlist_cache = nullptr;
         st->vlist_cache_count = 0u;
         st->vlist_cache_cap = 0u;
@@ -4690,7 +7059,10 @@ bool load_hmr_staged(InlaySurface* s, EtchStr effective, const char* filename) {
     st->node_capacity = init_nodes;
     const bool text_ok = inlay_grow_pod(st->text, staged->text_capacity, init_text, init_text, st->desc.max_text_bytes);
 
-    const uint32_t needed = effective.length + uint32_t(sizeof(prefix) + sizeof(suffix));
+    const bool is_module = effective.length > 0u && script_uses_esm(effective.chars, effective.length);
+    const uint32_t needed = is_module
+        ? (effective.length + 1u)
+        : (effective.length + uint32_t(sizeof(prefix) + sizeof(suffix)));
     uint32_t src_cap = 4096u;
     while (src_cap < needed) src_cap *= 2u;
     st->source = static_cast<char*>(SDL_malloc(src_cap));
@@ -4702,12 +7074,19 @@ bool load_hmr_staged(InlaySurface* s, EtchStr effective, const char* filename) {
         record_reload_error(s, "HMR staging storage allocation failed");
         return false;
     }
-    std::memcpy(st->source, prefix, sizeof(prefix) - 1u);
-    if (effective.length > 0u) {
-        std::memcpy(st->source + sizeof(prefix) - 1u, effective.chars, effective.length);
+    size_t length = 0u;
+    if (is_module) {
+        std::memcpy(st->source, effective.chars, effective.length);
+        st->source[effective.length] = '\0';
+        length = effective.length;
+    } else {
+        std::memcpy(st->source, prefix, sizeof(prefix) - 1u);
+        if (effective.length > 0u) {
+            std::memcpy(st->source + sizeof(prefix) - 1u, effective.chars, effective.length);
+        }
+        std::memcpy(st->source + sizeof(prefix) - 1u + effective.length, suffix, sizeof(suffix));
+        length = sizeof(prefix) - 1u + effective.length + sizeof(suffix) - 1u;
     }
-    std::memcpy(st->source + sizeof(prefix) - 1u + effective.length, suffix, sizeof(suffix));
-    const size_t length = sizeof(prefix) - 1u + effective.length + sizeof(suffix) - 1u;
 
     const char* vm_err = nullptr;
     if (!init_vm_context(st, &vm_err)) {
@@ -4717,20 +7096,25 @@ bool load_hmr_staged(InlaySurface* s, EtchStr effective, const char* filename) {
     }
 
     const uint64_t start = SDL_GetPerformanceCounter();
-    begin_tick(st);
+    begin_tick(st, 4.0);
     const JSValue global = JS_GetGlobalObject(st->js);
     bool ok = !JS_HasException(st->js) && install_state(st, global);
     JS_FreeValue(st->js, global);
     if (ok) {
-        const JSValue result = JS_Eval(st->js, st->source, length, filename, JS_EVAL_TYPE_GLOBAL);
-        ok = !JS_IsException(result);
-        if (ok) {
-            const JSValue target = JS_GetGlobalObject(st->js);
-            JS_SetPropertyStr(st->js, target, "render", JS_GetPropertyStr(st->js, result, "render"));
-            JS_SetPropertyStr(st->js, target, "onEvent", JS_GetPropertyStr(st->js, result, "onEvent"));
-            JS_FreeValue(st->js, target);
+        if (is_module) {
+            ok = eval_entry_module(st, st->source, length, filename);
+        } else {
+            const JSValue result = JS_Eval(st->js, st->source, length, filename, JS_EVAL_TYPE_GLOBAL);
+            ok = !JS_IsException(result);
+            if (ok) {
+                const JSValue target = JS_GetGlobalObject(st->js);
+                JS_SetPropertyStr(st->js, target, "render", JS_GetPropertyStr(st->js, result, "render"));
+                JS_SetPropertyStr(st->js, target, "onEvent", JS_GetPropertyStr(st->js, result, "onEvent"));
+                JS_SetPropertyStr(st->js, target, "onCommand", JS_GetPropertyStr(st->js, result, "onCommand"));
+                JS_FreeValue(st->js, target);
+            }
+            JS_FreeValue(st->js, result);
         }
-        JS_FreeValue(st->js, result);
     }
     if (ok && !JS_HasException(st->js)) ok = rebuild(st, true);
     const bool completed = finish_tick(st, start) && ok && !st->stats.has_error && !st->timed_out;
@@ -4791,11 +7175,12 @@ bool load_hmr_staged(InlaySurface* s, EtchStr effective, const char* filename) {
     live_ext->atom_eb_key = staged->atom_eb_key;     staged->atom_eb_key = JS_ATOM_NULL;
     JS_SetInterruptHandler(s->runtime, interrupt, s);
     JS_SetHostPromiseRejectionTracker(s->runtime, rejection_tracker, s);
+    JS_SetModuleLoaderFunc(s->runtime, module_normalize_cb, module_loader_cb, s);
     JS_SetContextOpaque(s->js, s);
 
-    for (uint32_t i = 0u; i < 32u; ++i) {
+    for (uint32_t i = 0u; i < 64u; ++i) {
         s->timers[i] = st->timers[i];
-        st->timers[i] = {JS_UNDEFINED, 0.0, 0u};
+        st->timers[i] = {JS_UNDEFINED, 0.0, 0.0, 0u, false};
     }
     s->next_timer = st->next_timer;
 
@@ -4884,7 +7269,7 @@ bool load(InlaySurface* s, EtchStr script, bool is_hmr = false) {
     static constexpr char prefix[] = "(function(){";
     static constexpr char suffix[] =
         "\n;return {render:typeof render==='function'?render:undefined,onEvent:typeof "
-        "onEvent==='function'?onEvent:undefined};})()";
+        "onEvent==='function'?onEvent:undefined,onCommand:typeof onCommand==='function'?onCommand:undefined};})()";
 
     const char* filename = s->path[0] ? s->path : "<surface>";
     EtchStr effective = script;
@@ -4916,7 +7301,10 @@ bool load(InlaySurface* s, EtchStr script, bool is_hmr = false) {
         return load_hmr_staged(s, effective, filename);
     }
 
-    const uint32_t needed = effective.length + uint32_t(sizeof(prefix) + sizeof(suffix));
+    const bool is_module = effective.length > 0u && script_uses_esm(effective.chars, effective.length);
+    const uint32_t needed = is_module
+        ? (effective.length + 1u)
+        : (effective.length + uint32_t(sizeof(prefix) + sizeof(suffix)));
     if (needed > s->source_capacity) {
         uint32_t cap = s->source_capacity ? s->source_capacity : 4096u;
         while (cap < needed) cap *= 2u;
@@ -4929,12 +7317,19 @@ bool load(InlaySurface* s, EtchStr script, bool is_hmr = false) {
         s->source = memory;
         s->source_capacity = cap;
     }
-    std::memcpy(s->source, prefix, sizeof(prefix) - 1u);
-    if (effective.length) {
-        std::memcpy(s->source + sizeof(prefix) - 1u, effective.chars, effective.length);
+    size_t length = 0u;
+    if (is_module) {
+        std::memcpy(s->source, effective.chars, effective.length);
+        s->source[effective.length] = '\0';
+        length = effective.length;
+    } else {
+        std::memcpy(s->source, prefix, sizeof(prefix) - 1u);
+        if (effective.length) {
+            std::memcpy(s->source + sizeof(prefix) - 1u, effective.chars, effective.length);
+        }
+        std::memcpy(s->source + sizeof(prefix) - 1u + effective.length, suffix, sizeof(suffix));
+        length = sizeof(prefix) - 1u + effective.length + sizeof(suffix) - 1u;
     }
-    std::memcpy(s->source + sizeof(prefix) - 1u + effective.length, suffix, sizeof(suffix));
-    const size_t length = sizeof(prefix) - 1u + effective.length + sizeof(suffix) - 1u;
 
     ext(s)->container_width_count = 0u;
     ext(s)->needs_container_rebuild = false;
@@ -4951,20 +7346,25 @@ bool load(InlaySurface* s, EtchStr script, bool is_hmr = false) {
     // The fixed framework bootstrap runs in a new, empty VM. Start the
     // caller's execution budget before installing state or running user JS.
     const uint64_t start = SDL_GetPerformanceCounter();
-    begin_tick(s);
+    begin_tick(s, 4.0);
     const JSValue global = JS_GetGlobalObject(s->js);
     bool ok = !JS_HasException(s->js) && install_state(s, global);
     JS_FreeValue(s->js, global);
     if (ok) {
-        const JSValue result = JS_Eval(s->js, s->source, length, filename, JS_EVAL_TYPE_GLOBAL);
-        ok = !JS_IsException(result);
-        if (ok) {
-            const JSValue target = JS_GetGlobalObject(s->js);
-            JS_SetPropertyStr(s->js, target, "render", JS_GetPropertyStr(s->js, result, "render"));
-            JS_SetPropertyStr(s->js, target, "onEvent", JS_GetPropertyStr(s->js, result, "onEvent"));
-            JS_FreeValue(s->js, target);
+        if (is_module) {
+            ok = eval_entry_module(s, s->source, length, filename);
+        } else {
+            const JSValue result = JS_Eval(s->js, s->source, length, filename, JS_EVAL_TYPE_GLOBAL);
+            ok = !JS_IsException(result);
+            if (ok) {
+                const JSValue target = JS_GetGlobalObject(s->js);
+                JS_SetPropertyStr(s->js, target, "render", JS_GetPropertyStr(s->js, result, "render"));
+                JS_SetPropertyStr(s->js, target, "onEvent", JS_GetPropertyStr(s->js, result, "onEvent"));
+                JS_SetPropertyStr(s->js, target, "onCommand", JS_GetPropertyStr(s->js, result, "onCommand"));
+                JS_FreeValue(s->js, target);
+            }
+            JS_FreeValue(s->js, result);
         }
-        JS_FreeValue(s->js, result);
     }
     if (ok && !JS_HasException(s->js)) ok = rebuild(s, true);
     const bool completed = finish_tick(s, start) && ok;
@@ -5343,6 +7743,168 @@ EtchStr arena_json_finish(const ArenaJsonWriter& w) noexcept {
     return (w.data && !w.overflow) ? EtchStr{w.data, w.len, false} : EtchStr{};
 }
 
+uint32_t hash_str_bytes(EtchStr s) noexcept {
+    uint32_t h = 2166136261u;
+    for (uint32_t i = 0u; i < s.length; ++i) {
+        h ^= static_cast<uint8_t>(s.chars[i]);
+        h *= 16777619u;
+    }
+    return h ? h : 1u;
+}
+
+void dispatch_dnd_and_keys(InlaySurface* s, const ColdVisualStyle* cold, uint32_t id, WidgetEvents* events) {
+    if (!cold || !events) return;
+    if (cold->dnd_idx != INLAY_UI_NONE && cold->dnd_idx < s->dnd_spec_count) {
+        const NodeDndSpec& dnd = s->dnd_specs[cold->dnd_idx];
+        if (dnd.draggable) {
+            const EtchStr kind_s = inlay_ui_slice(s, dnd.drag_kind);
+            const uint32_t kind_h = kind_s.length > 0u ? hash_str_bytes(kind_s) : etch_id("item");
+            const EtchStr lbl = dnd.drag_label.len ? inlay_ui_frame_text(s, inlay_ui_slice(s, dnd.drag_label))
+                                                   : ETCH_STR_LIT("item");
+            const EtchStr dat = inlay_ui_slice(s, dnd.drag_data);
+            (void)etch_begin_drag_payload(id, kind_h, lbl, dat.chars, dat.length, 0u, 0u);
+        }
+        if (has_event(dnd.on_drop_action, dnd.on_drop_handler)) {
+            const EtchStr acc_s = inlay_ui_slice(s, dnd.drop_accept);
+            const uint32_t acc_h = acc_s.length > 0u ? hash_str_bytes(acc_s) : 0u;
+            EtchDragPayloadView pv = {};
+            if (etch_accept_drag_payload(id, acc_h, &pv)) {
+                const uint32_t cap = pv.label.length * 2u + pv.size * 2u + 96u;
+                ArenaJsonWriter w = arena_json_begin(s->etch, cap);
+                arena_json_raw(w, "{\"kindHash\":", 12u);
+                char kh[24];
+                const int kn = std::snprintf(kh, sizeof(kh), "%u", pv.kind_hash);
+                if (kn > 0) arena_json_raw(w, kh, uint32_t(kn));
+                arena_json_raw(w, ",\"label\":", 9u);
+                arena_json_quoted(w, pv.label);
+                arena_json_raw(w, ",\"data\":", 8u);
+                arena_json_quoted(w, {static_cast<const char*>(pv.data), pv.size, false});
+                arena_json_raw(w, "}", 1u);
+                const EtchStr payload = arena_json_finish(w);
+                if (payload.length > 0u) {
+                    inlay_ui_queue_event(s, events, inlay_ui_slice(s, dnd.on_drop_action),
+                                         dnd.on_drop_handler, payload, true);
+                }
+            }
+        }
+        if (has_event(dnd.on_file_drop_action, dnd.on_file_drop_handler)) {
+            const uint32_t fc = etch_dropped_file_on_count(id);
+            const uint32_t tc = etch_dropped_text_on_count(id);
+            if (fc > 0u || tc > 0u) {
+                uint32_t cap = 64u;
+                for (uint32_t i = 0u; i < fc; ++i) cap += etch_dropped_file_on_at(id, i).length * 2u + 8u;
+                for (uint32_t i = 0u; i < tc; ++i) cap += etch_dropped_text_on_at(id, i).length * 2u + 8u;
+                ArenaJsonWriter w = arena_json_begin(s->etch, cap);
+                arena_json_raw(w, "{\"files\":[", 10u);
+                for (uint32_t i = 0u; i < fc; ++i) {
+                    if (i > 0u) arena_json_raw(w, ",", 1u);
+                    arena_json_quoted(w, etch_dropped_file_on_at(id, i));
+                }
+                arena_json_raw(w, "],\"texts\":[", 11u);
+                for (uint32_t i = 0u; i < tc; ++i) {
+                    if (i > 0u) arena_json_raw(w, ",", 1u);
+                    arena_json_quoted(w, etch_dropped_text_on_at(id, i));
+                }
+                arena_json_raw(w, "]}", 2u);
+                const EtchStr payload = arena_json_finish(w);
+                if (payload.length > 0u) {
+                    inlay_ui_queue_event(s, events, inlay_ui_slice(s, dnd.on_file_drop_action),
+                                         dnd.on_file_drop_handler, payload, true);
+                }
+            }
+        }
+        if (has_event(dnd.on_drag_hover_action, dnd.on_drag_hover_handler)) {
+            const bool hov = etch_os_drag_hovering(id);
+            DragHoverSlot* dh = nullptr;
+            for (uint32_t i = 0u; i < s->drag_hover_state_count; ++i) {
+                if (s->drag_hover_states[i].element_id == id) { dh = &s->drag_hover_states[i]; break; }
+            }
+            if (!dh && inlay_grow_pod(s->drag_hover_states, s->drag_hover_state_cap, s->drag_hover_state_count + 1u, 8u, 64u)) {
+                dh = &s->drag_hover_states[s->drag_hover_state_count++];
+                *dh = {id, false, s->frame_counter};
+            }
+            if (dh) {
+                dh->last_used_frame = s->frame_counter;
+                if (dh->hovering != hov) {
+                    dh->hovering = hov;
+                    inlay_ui_queue_event(s, events, inlay_ui_slice(s, dnd.on_drag_hover_action),
+                                         dnd.on_drag_hover_handler, hov ? ETCH_STR_LIT("true") : ETCH_STR_LIT("false"));
+                }
+            }
+        }
+    }
+
+    if (has_event(cold->on_key_action, cold->on_key_handler) && (cold->global_keys || etch_focused(id))) {
+        auto key_name = [](uint32_t code, char tmp[16]) noexcept -> const char* {
+            switch (code) {
+                case SDLK_ESCAPE: return "Escape";
+                case SDLK_RETURN: case SDLK_KP_ENTER: return "Enter";
+                case SDLK_TAB: return "Tab";
+                case SDLK_BACKSPACE: return "Backspace";
+                case SDLK_DELETE: return "Delete";
+                case SDLK_SPACE: return "Space";
+                case SDLK_UP: return "ArrowUp";
+                case SDLK_DOWN: return "ArrowDown";
+                case SDLK_LEFT: return "ArrowLeft";
+                case SDLK_RIGHT: return "ArrowRight";
+                case SDLK_HOME: return "Home";
+                case SDLK_END: return "End";
+                case SDLK_PAGEUP: return "PageUp";
+                case SDLK_PAGEDOWN: return "PageDown";
+                case SDLK_INSERT: return "Insert";
+                case SDLK_F1: return "F1"; case SDLK_F2: return "F2"; case SDLK_F3: return "F3"; case SDLK_F4: return "F4";
+                case SDLK_F5: return "F5"; case SDLK_F6: return "F6"; case SDLK_F7: return "F7"; case SDLK_F8: return "F8";
+                case SDLK_F9: return "F9"; case SDLK_F10: return "F10"; case SDLK_F11: return "F11"; case SDLK_F12: return "F12";
+                default: break;
+            }
+            if (code >= 0x21u && code <= 0x7Eu) {
+                if (code == '"') return "\\\"";
+                if (code == '\\') return "\\\\";
+                tmp[0] = static_cast<char>(code);
+                tmp[1] = '\0';
+                return tmp;
+            }
+            std::snprintf(tmp, 16u, "Key%u", code);
+            return tmp;
+        };
+        const uint32_t kc = etch_frame_key_count();
+        for (uint32_t ki = 0u; ki < kc; ++ki) {
+            EtchFrameKeyEvent fk = {};
+            if (!etch_frame_key_at(ki, &fk) || fk.consumed || fk.keycode == 0u) continue;
+            char tmp[16] = {};
+            const char* name = key_name(fk.keycode, tmp);
+            char payload[160];
+            const int n = std::snprintf(payload, sizeof(payload),
+                "{\"key\":\"%s\",\"keyCode\":%u,\"ctrl\":%s,\"shift\":%s,\"alt\":%s,\"meta\":%s,\"repeat\":%s}",
+                name, fk.keycode,
+                (fk.mods & ETCH_MOD_CTRL) ? "true" : "false",
+                (fk.mods & ETCH_MOD_SHIFT) ? "true" : "false",
+                (fk.mods & ETCH_MOD_ALT) ? "true" : "false",
+                (fk.mods & ETCH_MOD_SUPER) ? "true" : "false",
+                fk.repeat ? "true" : "false");
+            if (n > 0) {
+                inlay_ui_queue_event(s, events, inlay_ui_slice(s, cold->on_key_action),
+                                     cold->on_key_handler, inlay_ui_frame_text(s, {payload, uint32_t(n), false}));
+                if (cold->consume_keys) (void)etch_consume_frame_key_at(ki);
+            }
+        }
+    }
+    if (has_event(cold->on_text_action, cold->on_text_handler) && (cold->global_keys || etch_focused(id))) {
+        if (etch_focused(id)) {
+            etch_request_text_input(id, etch_element_bounds(id));
+        }
+        const uint32_t tid = etch_focused(id) ? id : 0u;
+        const EtchStr typed = etch_typed_text(tid);
+        if (typed.length > 0u && typed.chars) {
+            const EtchStr payload = input_json(s->etch, typed.chars, typed.length);
+            if (payload.length > 0u) {
+                inlay_ui_queue_event(s, events, inlay_ui_slice(s, cold->on_text_action),
+                                     cold->on_text_handler, payload);
+            }
+        }
+    }
+}
+
 void dispatch_box_interaction(InlaySurface* s, const NodeStyle& st, const ColdVisualStyle* cold,
                               const CoreNodeExtra* extra, uint32_t id, WidgetEvents* events,
                               uint8_t descendants_consumed = 0u) {
@@ -5383,6 +7945,7 @@ void dispatch_box_interaction(InlaySurface* s, const NodeStyle& st, const ColdVi
             }
         }
         dispatch_hover_focus(s, cold, id, events);
+        dispatch_dnd_and_keys(s, cold, id, events);
     }
 }
 
@@ -5410,6 +7973,7 @@ bool box_handles_opacity(InlayUiKind kind) noexcept {
         case INLAY_UI_BADGE:
         case INLAY_UI_DIVIDER:
         case INLAY_UI_SLOT:
+        case INLAY_UI_PORTAL:
         case INLAY_UI_TABS:
             return true;
         default:
@@ -5758,7 +8322,8 @@ void inlay_ui_queue_event(InlaySurface* s, WidgetEvents* events, EtchStr name, u
                           EtchStr payload, bool is_click) {
     const bool has_name = name.length > 0u && name.length < 64u;
     const bool has_handler = handler != INLAY_UI_NONE;
-    if ((!has_name && !has_handler) || (!is_click && !payload.length) || payload.length > 65536u) return;
+    const uint32_t max_payload = s->desc.max_state_bytes ? s->desc.max_state_bytes : 65536u;
+    if ((!has_name && !has_handler) || (!is_click && !payload.length) || payload.length > max_payload) return;
     auto* event = static_cast<WidgetEvent*>(
         etch_frame_arena_alloc(s->etch, sizeof(WidgetEvent), alignof(WidgetEvent)));
     if (!event) return;
@@ -5832,6 +8397,12 @@ EtchCorners inlay_ui_resolve_corners(const NodeStyle& st, const ColdVisualStyle*
 void inlay_ui_populate_box_desc(InlaySurface* s, const NodeStyle& st, const EtchTheme& theme,
                                 uint32_t id, EtchBoxDesc& box, bool use_layer) noexcept {
     const ColdVisualStyle* cold = inlay_ui_get_cold(s, st);
+    const CoreNodeExtra* extra = (&st >= s->styles && &st < s->styles + s->node_count)
+        ? get_core_extra(s, static_cast<uint32_t>(&st - s->styles))
+        : nullptr;
+    if (extra && (extra->flags & CefWindowDragPassthrough)) {
+        box.window_drag_passthrough = true;
+    }
     const bool dark = inlay_is_dark_theme(theme);
     const EtchColor default_inset = dark ? etch_rgba8(0u, 0u, 0u, 120u) : etch_rgba8(15u, 23u, 42u, 38u);
 
@@ -6591,7 +9162,151 @@ void inlay_ui_draw_node(InlaySurface* s, uint32_t index, uint32_t parent,
             if (extra && (extra->flags & CefEditorHasSearch) != 0u) {
                 etch_code_editor_set_search_highlights(id, inlay_ui_frame_text(s, inlay_ui_slice(s, extra->field_error)), false);
             }
+            const CodeEditorRichSpec* espec = (st.ext_idx != INLAY_UI_NONE && st.ext_idx < s->editor_rich_spec_count)
+                ? &s->editor_rich_specs[st.ext_idx] : nullptr;
+            struct DecoCtx { InlaySurface* s; const CodeEditorRichSpec* spec; EtchTheme theme; };
+            if (s->code_tok_fn) {
+                editor.tokenizer = s->code_tok_fn;
+                editor.tokenizer_user_data = s->code_tok_user_data;
+            }
+            if (espec) {
+                editor.auto_height = espec->auto_height;
+                editor.show_overview_ruler = espec->show_overview_ruler;
+                editor.show_minimap = espec->show_minimap;
+                if (espec->has_show_line_numbers) editor.show_line_numbers = espec->show_line_numbers;
+                if (espec->language.len > 0u) editor.language = inlay_ui_frame_text(s, inlay_ui_slice(s, espec->language));
+                if (espec->has_highlight_brackets) editor.highlight_matching_brackets = espec->highlight_brackets;
+                if (espec->has_indent_guides) editor.show_indent_guides = espec->indent_guides;
+                if (espec->has_diag_tooltips) editor.show_diagnostic_tooltips = espec->diag_tooltips;
+                if (espec->gutter_tag_width > 0.f) editor.gutter_tag_width_px = espec->gutter_tag_width;
+                if (espec->sticky_header.len > 0u) {
+                    editor.show_sticky_header = true;
+                    editor.sticky_header_text = inlay_ui_frame_text(s, inlay_ui_slice(s, espec->sticky_header));
+                }
+                if (espec->deco_cnt > 0u) {
+                    auto* dctx = static_cast<DecoCtx*>(etch_frame_arena_alloc(s->etch, sizeof(DecoCtx), alignof(DecoCtx)));
+                    if (dctx) {
+                        *dctx = {s, espec, theme};
+                        editor.line_decorator = [](uint32_t line_idx, EtchCodeLineDecoration* out_dec, void* user) -> bool {
+                            const auto* dc = static_cast<const DecoCtx*>(user);
+                            const auto* sp = dc->spec;
+                            for (uint32_t k = 0u; k < sp->deco_cnt; ++k) {
+                                const auto& d = dc->s->editor_line_decos[sp->deco_off + k];
+                                if (d.line != line_idx) continue;
+                                if (d.row_bg.set) out_dec->row_bg = inlay_ui_resolve_color(d.row_bg, dc->theme, EtchColor{});
+                                if (d.gutter_bar.set) out_dec->gutter_bar_color = inlay_ui_resolve_color(d.gutter_bar, dc->theme, EtchColor{});
+                                if (d.gutter_tag.len > 0u) out_dec->gutter_tag = inlay_ui_frame_text(dc->s, inlay_ui_slice(dc->s, d.gutter_tag));
+                                if (d.gutter_tag_color.set) out_dec->gutter_tag_color = inlay_ui_resolve_color(d.gutter_tag_color, dc->theme, dc->theme.text_muted);
+                                return true;
+                            }
+                            return false;
+                        };
+                        editor.line_decorator_user_data = dctx;
+                    }
+                }
+                if (espec->hint_cnt > 0u && espec->hint_off + espec->hint_cnt <= s->editor_hint_count) {
+                    auto* arr = static_cast<EtchCodeInlayHint*>(etch_frame_arena_alloc(
+                        s->etch, size_t(espec->hint_cnt) * sizeof(EtchCodeInlayHint), alignof(EtchCodeInlayHint)));
+                    if (arr) {
+                        for (uint32_t k = 0u; k < espec->hint_cnt; ++k) {
+                            const auto& h = s->editor_hints[espec->hint_off + k];
+                            arr[k] = {
+                                h.line, h.col, inlay_ui_frame_text(s, inlay_ui_slice(s, h.text)),
+                                h.color.set ? inlay_ui_resolve_color(h.color, theme, theme.text_muted) : EtchColor{},
+                                h.bg.set ? inlay_ui_resolve_color(h.bg, theme, EtchColor{}) : EtchColor{},
+                                h.border_color.set ? inlay_ui_resolve_color(h.border_color, theme, EtchColor{}) : EtchColor{},
+                                h.radius
+                            };
+                        }
+                        etch_code_editor_set_inlay_hints(id, arr, espec->hint_cnt);
+                    }
+                }
+                if (espec->hl_cnt > 0u && espec->hl_off + espec->hl_cnt <= s->editor_inline_hl_count) {
+                    auto* arr = static_cast<EtchCodeInlineHighlight*>(etch_frame_arena_alloc(
+                        s->etch, size_t(espec->hl_cnt) * sizeof(EtchCodeInlineHighlight), alignof(EtchCodeInlineHighlight)));
+                    if (arr) {
+                        for (uint32_t k = 0u; k < espec->hl_cnt; ++k) {
+                            const auto& h = s->editor_inline_hls[espec->hl_off + k];
+                            arr[k] = {
+                                h.line, h.start_col, h.end_col,
+                                h.bg.set ? inlay_ui_resolve_color(h.bg, theme, EtchColor{}) : EtchColor{},
+                                h.border_color.set ? inlay_ui_resolve_color(h.border_color, theme, EtchColor{}) : EtchColor{},
+                                h.radius
+                            };
+                        }
+                        etch_code_editor_set_inline_highlights(id, arr, espec->hl_cnt);
+                    }
+                }
+                if (espec->marker_cnt > 0u && espec->marker_off + espec->marker_cnt <= s->editor_marker_count) {
+                    auto* arr = static_cast<EtchCodeOverviewMarker*>(etch_frame_arena_alloc(
+                        s->etch, size_t(espec->marker_cnt) * sizeof(EtchCodeOverviewMarker), alignof(EtchCodeOverviewMarker)));
+                    if (arr) {
+                        for (uint32_t k = 0u; k < espec->marker_cnt; ++k) {
+                            const auto& m = s->editor_markers[espec->marker_off + k];
+                            arr[k] = {
+                                m.line,
+                                m.color.set ? inlay_ui_resolve_color(m.color, theme, theme.accent) : theme.accent,
+                                m.lane
+                            };
+                        }
+                        etch_code_editor_set_overview_markers(id, arr, espec->marker_cnt);
+                    }
+                }
+                for (uint32_t k = 0u; k < espec->fold_cnt && espec->fold_off + k < s->editor_fold_count; ++k) {
+                    const auto& f = s->editor_folds[espec->fold_off + k];
+                    etch_code_editor_set_fold(id, f.start, f.end, f.collapsed);
+                }
+                if (espec->vz_cnt > 0u && espec->vz_off + espec->vz_cnt <= s->editor_view_zone_count) {
+                    auto* arr = static_cast<EtchCodeViewZone*>(etch_frame_arena_alloc(
+                        s->etch, size_t(espec->vz_cnt) * sizeof(EtchCodeViewZone), alignof(EtchCodeViewZone)));
+                    if (arr) {
+                        for (uint32_t k = 0u; k < espec->vz_cnt; ++k) {
+                            const auto& z = s->editor_view_zones[espec->vz_off + k];
+                            arr[k] = {
+                                z.id, z.after_line, z.height, z.above_line,
+                                z.fill_color.set ? inlay_ui_resolve_color(z.fill_color, theme, EtchColor{}) : EtchColor{}
+                            };
+                        }
+                        etch_code_editor_set_view_zones(id, arr, espec->vz_cnt);
+                    }
+                }
+                if (espec->has_scroll_x || espec->has_scroll_y) {
+                    EditorScrollSlot* es = nullptr;
+                    for (uint32_t si = 0u; si < s->editor_scroll_state_count; ++si) {
+                        if (s->editor_scroll_states[si].element_id == id) { es = &s->editor_scroll_states[si]; break; }
+                    }
+                    if (!es && inlay_grow_pod(s->editor_scroll_states, s->editor_scroll_state_cap, s->editor_scroll_state_count + 1u, 8u, 64u)) {
+                        es = &s->editor_scroll_states[s->editor_scroll_state_count++];
+                        *es = {id, 0.f, 0.f, 0.f, 0.f, false, false, 0u, 0u, false, s->frame_counter};
+                    }
+                    if (es) {
+                        es->last_used_frame = s->frame_counter;
+                        const bool px_chg = espec->has_scroll_x && (!es->had_prop_x || std::fabs(es->applied_prop_x - espec->scroll_x) > 0.5f);
+                        const bool py_chg = espec->has_scroll_y && (!es->had_prop_y || std::fabs(es->applied_prop_y - espec->scroll_y) > 0.5f);
+                        if (px_chg || py_chg) {
+                            EtchVec2 cur_off = etch_scroll_offset(id);
+                            if (px_chg) { cur_off.x = espec->scroll_x; es->applied_prop_x = espec->scroll_x; es->had_prop_x = true; }
+                            if (py_chg) { cur_off.y = espec->scroll_y; es->applied_prop_y = espec->scroll_y; es->had_prop_y = true; }
+                            etch_code_editor_set_scroll_offset(id, cur_off, true);
+                        }
+                    }
+                }
+            }
             const auto edit = etch_code_editor(&editor);
+            // Render declarative <ViewZone zoneId={...}> children inside editor view zones
+            for (uint32_t at = n.first_child; at != INLAY_UI_NONE; at = s->nodes[at].next_sibling) {
+                if (s->nodes[at].kind != INLAY_UI_VIEW_ZONE) continue;
+                const uint32_t zid = static_cast<uint32_t>(s->styles[at].int_value);
+                if (zid != 0u && etch_code_editor_begin_view_zone(id, zid)) {
+                    const bool prev_col = s->draw_parent_col;
+                    s->draw_parent_col = true;
+                    for (uint32_t ch = s->nodes[at].first_child; ch != INLAY_UI_NONE; ch = s->nodes[ch].next_sibling) {
+                        inlay_ui_draw_node(s, ch, id, theme, events);
+                    }
+                    s->draw_parent_col = prev_col;
+                    etch_code_editor_end_view_zone();
+                }
+            }
             if (edit.changed || etch_clicked(id)) ext(s)->child_consumed_mask |= ConsumeClick;
             if (edit.changed && has_event(st.action, st.handler)) {
                 char payload[128];
@@ -6601,6 +9316,78 @@ void inlay_ui_draw_node(InlaySurface* s, uint32_t index, uint32_t parent,
                 inlay_ui_queue_event(s, events, inlay_ui_slice(s, st.action), st.handler,
                                      inlay_ui_frame_text(s, {payload, uint32_t(len), false}));
             }
+            if (espec && events) {
+                if (edit.clicked_gutter_line >= 0 && has_event(espec->on_gutter_click_action, espec->on_gutter_click_handler)) {
+                    char payload[48];
+                    const int len = std::snprintf(payload, sizeof(payload), "{\"line\":%d}", edit.clicked_gutter_line);
+                    if (len > 0) inlay_ui_queue_event(s, events, inlay_ui_slice(s, espec->on_gutter_click_action),
+                                                      espec->on_gutter_click_handler,
+                                                      inlay_ui_frame_text(s, {payload, uint32_t(len), false}), true);
+                }
+                if (edit.gutter_drag_start_line >= 0 && edit.gutter_drag_end_line >= 0 &&
+                    has_event(espec->on_gutter_range_action, espec->on_gutter_range_handler)) {
+                    char payload[96];
+                    const int len = std::snprintf(payload, sizeof(payload),
+                        "{\"startLine\":%d,\"endLine\":%d,\"dragging\":%s}",
+                        edit.gutter_drag_start_line, edit.gutter_drag_end_line,
+                        edit.gutter_dragging ? "true" : "false");
+                    if (len > 0) inlay_ui_queue_event(s, events, inlay_ui_slice(s, espec->on_gutter_range_action),
+                                                      espec->on_gutter_range_handler,
+                                                      inlay_ui_frame_text(s, {payload, uint32_t(len), false}));
+                }
+                if (has_event(espec->on_scroll_action, espec->on_scroll_handler)) {
+                    const EtchVec2 so = etch_scroll_offset(id);
+                    EditorScrollSlot* es = nullptr;
+                    for (uint32_t si = 0u; si < s->editor_scroll_state_count; ++si) {
+                        if (s->editor_scroll_states[si].element_id == id) { es = &s->editor_scroll_states[si]; break; }
+                    }
+                    if (!es && inlay_grow_pod(s->editor_scroll_states, s->editor_scroll_state_cap, s->editor_scroll_state_count + 1u, 8u, 64u)) {
+                        es = &s->editor_scroll_states[s->editor_scroll_state_count++];
+                        *es = {id, so.x, so.y, 0.f, 0.f, false, false, 0u, 0u, false, s->frame_counter};
+                    }
+                    if (es) {
+                        es->last_used_frame = s->frame_counter;
+                        if (std::fabs(so.x - es->last_x) > 0.5f || std::fabs(so.y - es->last_y) > 0.5f) {
+                            es->last_x = so.x; es->last_y = so.y;
+                            char payload[64];
+                            const int len = std::snprintf(payload, sizeof(payload), "{\"x\":%.2f,\"y\":%.2f}", double(so.x), double(so.y));
+                            if (len > 0) inlay_ui_queue_event(s, events, inlay_ui_slice(s, espec->on_scroll_action),
+                                                              espec->on_scroll_handler,
+                                                              inlay_ui_frame_text(s, {payload, uint32_t(len), false}));
+                        }
+                    }
+                }
+                if (has_event(espec->on_cursor_action, espec->on_cursor_handler)) {
+                    EditorScrollSlot* es = nullptr;
+                    for (uint32_t si = 0u; si < s->editor_scroll_state_count; ++si) {
+                        if (s->editor_scroll_states[si].element_id == id) { es = &s->editor_scroll_states[si]; break; }
+                    }
+                    if (!es && inlay_grow_pod(s->editor_scroll_states, s->editor_scroll_state_cap, s->editor_scroll_state_count + 1u, 8u, 64u)) {
+                        es = &s->editor_scroll_states[s->editor_scroll_state_count++];
+                        *es = {id, 0.f, 0.f, 0.f, 0.f, false, false, 0u, 0u, false, s->frame_counter};
+                    }
+                    if (es) {
+                        es->last_used_frame = s->frame_counter;
+                        if (!es->has_cursor_state || es->last_cursor_byte != edit.cursor_byte || es->last_anchor_byte != edit.selection_anchor_byte) {
+                            const bool had_prev = es->has_cursor_state;
+                            es->has_cursor_state = true;
+                            es->last_cursor_byte = edit.cursor_byte;
+                            es->last_anchor_byte = edit.selection_anchor_byte;
+                            if (had_prev) {
+                                char payload[160];
+                                const int len = std::snprintf(payload, sizeof(payload),
+                                    "{\"cursorByte\":%u,\"anchorByte\":%u,\"line\":%u,\"col\":%u,\"cursorCount\":%u}",
+                                    edit.cursor_byte, edit.selection_anchor_byte,
+                                    edit.cursor_line, edit.cursor_col_byte, etch_code_editor_cursor_count(id));
+                                if (len > 0) inlay_ui_queue_event(s, events, inlay_ui_slice(s, espec->on_cursor_action),
+                                                                  espec->on_cursor_handler,
+                                                                  inlay_ui_frame_text(s, {payload, uint32_t(len), false}));
+                            }
+                        }
+                    }
+                }
+            }
+            dispatch_dnd_and_keys(s, cold, id, events);
         }
     } else if (n.kind == INLAY_UI_INPUT) {
         auto input = etch_text_input_desc_default();
@@ -6640,9 +9427,16 @@ void inlay_ui_draw_node(InlaySurface* s, uint32_t index, uint32_t parent,
         input.multiline = extra && (extra->flags & CefInputMultiline);
         input.read_only = extra && (extra->flags & CefInputReadOnly);
         input.word_wrap = extra && (extra->flags & CefInputWordWrap);
+        input.auto_grow = extra && (extra->flags & CefInputAutoGrow);
+        if (extra && (extra->flags & CefInputHasAutoGrowRange)) {
+            if (extra->aux_f0 > 0.f) input.min_height_px = extra->aux_f0;
+            if (extra->aux_f1 > 0.f) input.max_height_px = extra->aux_f1;
+        }
         ActiveFormCtx* active_form = ext(s)->active_form;
         const bool has_own_submit = extra && has_event(extra->submit_action, extra->submit_handler);
-        input.submit_on_enter = has_own_submit || (active_form != nullptr && !input.multiline);
+        input.submit_on_enter = (extra && (extra->flags & CefInputHasSubmitEnter))
+            ? ((extra->flags & CefInputSubmitEnterVal) != 0u)
+            : (has_own_submit || (active_form != nullptr && !input.multiline));
         const EtchStr edit_text = input.password ? inlay_ui_slice(s, extra->password_text) : n.text;
         uint32_t length = edit_text.length;
         if (length >= INLAY_UI_INPUT_CAPACITY) {
@@ -6673,6 +9467,36 @@ void inlay_ui_draw_node(InlaySurface* s, uint32_t index, uint32_t parent,
             etch_begin_box(&wrap);
             if (wrap.width.kind != ETCH_SIZING_FIT) {
                 input.width = etch_sizing_grow(0.f, 0.f);
+            }
+        }
+
+        const InputRichSpec* ispec = (st.ext_idx != INLAY_UI_NONE && st.ext_idx < s->input_rich_spec_count)
+            ? &s->input_rich_specs[st.ext_idx] : nullptr;
+        if (ispec) {
+            if (ispec->ghost_text.len > 0u) {
+                input.ghost_text = inlay_ui_frame_text(s, inlay_ui_slice(s, ispec->ghost_text));
+            }
+            if (ispec->ghost_color.set) {
+                input.ghost_color = inlay_ui_resolve_color(ispec->ghost_color, theme, theme.text_muted);
+            }
+            input.accept_ghost_on_tab = ispec->accept_ghost_on_tab;
+            if (ispec->hl_count > 0u && ispec->hl_offset + ispec->hl_count <= s->input_highlight_count) {
+                auto* hls = static_cast<EtchTextInputHighlight*>(etch_frame_arena_alloc(
+                    s->etch, size_t(ispec->hl_count) * sizeof(EtchTextInputHighlight), alignof(EtchTextInputHighlight)));
+                if (hls) {
+                    for (uint32_t hi = 0u; hi < ispec->hl_count; ++hi) {
+                        const auto& h = s->input_highlights[ispec->hl_offset + hi];
+                        hls[hi] = {
+                            h.offset, h.length,
+                            h.color.set ? inlay_ui_resolve_color(h.color, theme, theme.accent) : EtchColor{},
+                            h.bg.set ? inlay_ui_resolve_color(h.bg, theme, EtchColor{}) : EtchColor{},
+                            h.border_color.set ? inlay_ui_resolve_color(h.border_color, theme, EtchColor{}) : EtchColor{},
+                            h.radius, h.atomic
+                        };
+                    }
+                    input.highlights = hls;
+                    input.highlight_count = ispec->hl_count;
+                }
             }
         }
 
@@ -6724,6 +9548,33 @@ void inlay_ui_draw_node(InlaySurface* s, uint32_t index, uint32_t parent,
                 active_form->submit_requested = true;
             }
         }
+        if (ispec && events) {
+            if (edit.ghost_accepted && has_event(ispec->on_accept_ghost_action, ispec->on_accept_ghost_handler)) {
+                inlay_ui_queue_event(s, events, inlay_ui_slice(s, ispec->on_accept_ghost_action),
+                                     ispec->on_accept_ghost_handler,
+                                     input_json(s->etch, s->edit_buffer, edit.byte_length), true);
+            }
+            if (edit.pasted_image && has_event(ispec->on_paste_image_action, ispec->on_paste_image_handler)) {
+                inlay_ui_queue_event(s, events, inlay_ui_slice(s, ispec->on_paste_image_action),
+                                     ispec->on_paste_image_handler, ETCH_STR_LIT("true"), true);
+            }
+            if (has_event(ispec->on_caret_action, ispec->on_caret_handler) &&
+                (edit.changed || etch_clicked(id) ||
+                 (edit.focused && (etch_key_pressed(SDLK_LEFT, true) || etch_key_pressed(SDLK_RIGHT, true) ||
+                                   etch_key_pressed(SDLK_UP, true) || etch_key_pressed(SDLK_DOWN, true))))) {
+                char payload[128];
+                const int len = std::snprintf(payload, sizeof(payload),
+                    "{\"cursor\":%u,\"x\":%.1f,\"y\":%.1f,\"w\":%.1f,\"h\":%.1f}",
+                    edit.cursor_byte, double(edit.caret_rect.x), double(edit.caret_rect.y),
+                    double(edit.caret_rect.w), double(edit.caret_rect.h));
+                if (len > 0) {
+                    inlay_ui_queue_event(s, events, inlay_ui_slice(s, ispec->on_caret_action),
+                                         ispec->on_caret_handler,
+                                         inlay_ui_frame_text(s, {payload, uint32_t(len), false}));
+                }
+            }
+        }
+        if (!disabled) dispatch_dnd_and_keys(s, cold, id, events);
     } else if (n.kind == INLAY_UI_TOGGLE) {
         auto toggle = etch_toggle_switch_desc_default();
         bool checked = (st.flags & NfChecked) != 0u;
@@ -6737,9 +9588,19 @@ void inlay_ui_draw_node(InlaySurface* s, uint32_t index, uint32_t parent,
         if (st.border_color.set) {
             toggle.border_color = inlay_ui_resolve_color(st.border_color, theme, toggle.border_color);
         }
+        if (st.flags & NfHasBorderWidth) toggle.border_width = std::fmax(0.f, st.border_width);
+        if ((st.flags2 & Nf2WExplicit) && st.w_kind == uint8_t(ETCH_SIZING_FIXED) && st.w_val > 0.f) {
+            toggle.track_width_px = st.w_val;
+        }
+        if ((st.flags2 & Nf2HExplicit) && st.h_kind == uint8_t(ETCH_SIZING_FIXED) && st.h_val > 0.f) {
+            toggle.track_height_px = st.h_val;
+        }
         if (extra) {
             if (extra->flags & CefSwitchHasTrackW) toggle.track_width_px = extra->aux_f0;
             if (extra->flags & CefSwitchHasTrackH) toggle.track_height_px = extra->aux_f1;
+            if (extra->flags & CefSwitchHasTrackR) toggle.track_radius = etch_corners_all(extra->aux_f2);
+            if (extra->flags & CefSwitchHasThumbR) toggle.thumb_radius = etch_corners_all(extra->aux_f3);
+            if (extra->flags & CefSwitchHasThumbPad) toggle.thumb_padding_px = extra->aux_f4;
             if (extra->color_a.set) toggle.off_color = inlay_ui_resolve_color(extra->color_a, theme, toggle.off_color);
             if (extra->color_b.set) toggle.thumb_color = inlay_ui_resolve_color(extra->color_b, theme, toggle.thumb_color);
         }
@@ -6967,6 +9828,11 @@ void inlay_ui_draw_node(InlaySurface* s, uint32_t index, uint32_t parent,
         if (has_max && ratio > max_r) ratio = max_r;
         ratio = std::fmin(0.98f, std::fmax(0.02f, ratio));
         sp.default_ratio = ratio;
+        if (extra) {
+            if (extra->flags & CefSplitHasDividerSz) sp.divider_size_px = extra->aux_f0;
+            if (extra->flags & CefSplitHasDividerHit) sp.divider_hit_px = extra->aux_f1;
+            if (extra->flags & CefSplitHideGrip) sp.show_grip = false;
+        }
 
         // Programmatic ratio sync without clobbering user drags or triggering idle redraws.
         SplitSyncEntry* sync = find_or_add_split_sync(s, id, ratio);
@@ -7509,6 +10375,9 @@ void inlay_ui_draw_node(InlaySurface* s, uint32_t index, uint32_t parent,
                 ? st.w_val
                 : ((st.flags & NfHasSize) && st.font_size > 0.f ? st.font_size : 24.f);
             ic.color = resolve_live_text_color(s, st, cold, id, theme, theme.text_primary);
+            if (extra && (extra->flags & CefIconHasSecondaryCol) && extra->color_a.set) {
+                ic.secondary_color = inlay_ui_resolve_color(extra->color_a, theme, ic.color);
+            }
             etch_icon(&ic);
             dispatch_box_interaction(s, st, cold, extra, id, events);
         } else {
@@ -7592,11 +10461,13 @@ INLAY_API InlaySurface* inlay_surface_create(EtchContext* context, const InlaySu
     InlaySurfaceDesc d = inlay_surface_desc_default();
     if (desc && !inlay_read_abi_struct(desc, &d)) return nullptr;
     if (d.max_text_bytes == 0u) d.max_text_bytes = kDefaultMaxTextBytes;
+    if (d.max_state_bytes == 0u) d.max_state_bytes = 65536u;
     if (!context || d.memory_limit_bytes < 512u * 1024u ||
         d.memory_limit_bytes > 256u * 1024u * 1024u || d.max_stack_bytes < 16384u ||
         d.max_stack_bytes > 512u * 1024u || !std::isfinite(d.max_tick_ms) || d.max_tick_ms <= 0.f ||
         d.max_tick_ms > 50.f || !d.max_nodes || d.max_nodes > 65536u ||
-        d.max_text_bytes > kHardMaxTextBytes) {
+        d.max_text_bytes > kHardMaxTextBytes ||
+        d.max_state_bytes < 1024u || d.max_state_bytes > 4u * 1024u * 1024u) {
         return nullptr;
     }
 
@@ -7620,7 +10491,7 @@ INLAY_API InlaySurface* inlay_surface_create(EtchContext* context, const InlaySu
     s->node_capacity = init_nodes;
 
     const bool text_ok = inlay_grow_pod(s->text, storage->text_capacity, init_text, init_text, d.max_text_bytes);
-    s->json_scratch = static_cast<char*>(SDL_malloc(65537u));
+    s->json_scratch = static_cast<char*>(SDL_malloc(size_t(d.max_state_bytes) + 1u));
     s->runtime = JS_NewRuntime();
     if (!s->nodes || !s->styles || !storage->node_extra_idx || !text_ok || !s->text ||
         !s->json_scratch || !s->runtime || !save_state(s, "{}", 2u)) {
@@ -7646,7 +10517,20 @@ INLAY_API InlaySurface* inlay_surface_create(EtchContext* context, const InlaySu
 INLAY_API void inlay_surface_destroy(InlaySurface* s) {
     if (!s) return;
     auto* storage = ext(s);
+    SDL_free(s->actions);
     SDL_free(s->content);
+    SDL_free(s->terminals);
+    SDL_free(s->streams);
+    SDL_free(storage->command_names);
+    for (uint32_t i = 0u; i < storage->ls_count; ++i) {
+        SDL_free(storage->ls_entries[i].key);
+        SDL_free(storage->ls_entries[i].value);
+    }
+    SDL_free(storage->ls_entries);
+    for (uint32_t i = 0u; i < storage->module_count; ++i) {
+        SDL_free(storage->modules[i].source);
+    }
+    SDL_free(storage->modules);
     clear_context(s);
     SDL_free(storage->action_policies);
     SDL_free(storage->async_actions);
@@ -7685,7 +10569,9 @@ INLAY_API bool inlay_surface_set_script(InlaySurface* s, EtchStr script) {
 }
 
 INLAY_API bool inlay_surface_set_state_json(InlaySurface* s, EtchStr json) {
-    if (!s || !json.chars || !json.length || json.length > 65536u) return false;
+    if (!s || !json.chars || !json.length) return false;
+    const uint32_t limit = s->desc.max_state_bytes ? s->desc.max_state_bytes : 65536u;
+    if (json.length > limit) return false;
     if (!s->js) return false;
     const JSValue parsed = parse_json(s, json);
     if (JS_IsException(parsed)) {
@@ -7720,7 +10606,7 @@ INLAY_API bool inlay_surface_bind_action(InlaySurface* s, EtchStr name, InlayAct
             return true;
         }
     }
-    if (s->action_count == 32u) return false;
+    if (!inlay_grow_pod(s->actions, s->action_cap, s->action_count + 1u, 16u, 512u)) return false;
     auto& a = s->actions[s->action_count++];
     std::memcpy(a.name, name.chars, name.length);
     a.name[name.length] = '\0';
@@ -8021,6 +10907,27 @@ INLAY_API uint32_t inlay_surface_export_dts(const InlaySurface* s, char* out_buf
     emit_content_union("DocumentName", INLAY_UI_DOC);
     emit_content_union("BufferName", INLAY_UI_CODE_EDITOR);
     emit_content_union("ModelName", INLAY_UI_VIRTUAL_LIST);
+    emit_content_union("PortalName", INLAY_UI_PORTAL);
+    w.put("export type TerminalName = ");
+    if (s->terminal_count == 0u) {
+        w.put("never");
+    } else {
+        for (uint32_t i = 0u; i < s->terminal_count; ++i) {
+            if (i > 0u) w.put(" | ");
+            w.put_ts_str(s->terminals[i].name);
+        }
+    }
+    w.put(";\n");
+    w.put("export type StreamName = ");
+    if (s->stream_count == 0u) {
+        w.put("never");
+    } else {
+        for (uint32_t i = 0u; i < s->stream_count; ++i) {
+            if (i > 0u) w.put(" | ");
+            w.put_ts_str(s->streams[i].name);
+        }
+    }
+    w.put(";\n");
 
     w.put(
         "\n"
@@ -8037,7 +10944,19 @@ INLAY_API uint32_t inlay_surface_export_dts(const InlaySurface* s, char* out_buf
         "  opacity?: number;\n"
         "  disabled?: boolean;\n"
         "  stopPropagation?: boolean;\n"
+        "  draggable?: boolean;\n"
+        "  dragKind?: string;\n"
+        "  dragLabel?: string;\n"
+        "  dragData?: unknown;\n"
+        "  dropAccept?: string;\n"
+        "  globalKeys?: boolean;\n"
+        "  consumeKeys?: boolean;\n"
         "  onClick?: ActionName | ((state: unknown) => void);\n"
+        "  onDrop?: ActionName | ((ev: { kindHash: number; label: string; data: string }, state: unknown) => void);\n"
+        "  onFileDrop?: ActionName | ((ev: { files: string[]; texts: string[] }, state: unknown) => void);\n"
+        "  onDragHover?: ActionName | ((hovering: boolean, state: unknown) => void);\n"
+        "  onKeyDown?: ActionName | ((ev: { key: string; keyCode: number; ctrl: boolean; shift: boolean; alt: boolean; meta: boolean; repeat: boolean }, state: unknown) => void);\n"
+        "  onTextInput?: ActionName | ((text: string, state: unknown) => void);\n"
         "  [key: string]: unknown;\n"
         "}\n"
         "export interface FormProps extends CommonProps {\n"
@@ -8055,13 +10974,119 @@ INLAY_API uint32_t inlay_surface_export_dts(const InlaySurface* s, char* out_buf
         "  error?: string;\n"
         "  password?: boolean;\n"
         "  multiline?: boolean;\n"
+        "  autoGrow?: boolean;\n"
+        "  minHeight?: number;\n"
+        "  maxHeight?: number;\n"
         "  readOnly?: boolean;\n"
+        "  highlights?: { offset: number; length: number; color?: string; bg?: string; borderColor?: string; radius?: number; atomic?: boolean }[];\n"
+        "  ghostText?: string;\n"
+        "  ghostColor?: string;\n"
+        "  acceptGhostOnTab?: boolean;\n"
+        "  onAcceptGhost?: ActionName | ((value: string, state: unknown) => void);\n"
+        "  onPasteImage?: ActionName | ((ok: boolean, state: unknown) => void);\n"
+        "  onCaret?: ActionName | ((ev: { cursor: number; x: number; y: number; w: number; h: number }, state: unknown) => void);\n"
         "  onChange?: ActionName | ((value: string, state: unknown) => void);\n"
         "  onSubmit?: ActionName | ((value: string, state: unknown) => void);\n"
         "}\n"
         "export interface SlotProps extends CommonProps { name: SlotName; props?: unknown; }\n"
-        "export interface DocProps extends CommonProps { document?: DocumentName; markdown?: string; }\n"
-        "export interface CodeEditorProps extends CommonProps { buffer: BufferName; readOnly?: boolean; wordWrap?: boolean; ghostText?: string; searchQuery?: string; }\n"
+        "export interface PortalProps extends CommonProps {\n"
+        "  name: PortalName;\n"
+        "  url?: string;\n"
+        "  html?: string;\n"
+        "  zoom?: number;\n"
+        "  findQuery?: string;\n"
+        "  findMatchCase?: boolean;\n"
+        "  findForward?: boolean;\n"
+        "  navAction?: string;\n"
+        "  evalScript?: string;\n"
+        "  initScript?: string;\n"
+        "  postMessage?: string;\n"
+        "  onStateChange?: ActionName | ((ev: { loading: boolean; canGoBack: boolean; canGoForward: boolean; zoom: number; title: string; url: string; faviconUrl: string; find: { active: boolean; activeMatch: number; totalMatches: number } }, state: unknown) => void);\n"
+        "  onMessage?: ActionName | ((message: unknown, state: unknown) => void);\n"
+        "  onNavigate?: ActionName | ((ev: { url: string }, state: unknown) => void);\n"
+        "}\n"
+        "export interface DocProps extends CommonProps {\n"
+        "  document?: DocumentName;\n"
+        "  markdown?: string;\n"
+        "  streamingRepair?: boolean;\n"
+        "  findQuery?: string;\n"
+        "  onLinkClick?: ActionName | ((ev: { url: string; text: string; kind: string }, state: unknown) => void);\n"
+        "  onSelectionChange?: ActionName | ((ev: { active: boolean; text: string; markdown: string; rect: { x: number; y: number; w: number; h: number } }, state: unknown) => void);\n"
+        "  onFindResult?: ActionName | ((ev: { count: number; activeIndex: number }, state: unknown) => void);\n"
+        "  onTaskToggle?: ActionName | ((ev: { blockIndex: number; checked: boolean }, state: unknown) => void);\n"
+        "  onDiagramNodeClick?: ActionName | ((ev: { nodeId: string; blockIndex: number }, state: unknown) => void);\n"
+        "}\n"
+        "export interface TerminalProps extends CommonProps {\n"
+        "  buffer?: TerminalName;\n"
+        "  ansi?: string;\n"
+        "  autoFit?: boolean;\n"
+        "  focusable?: boolean;\n"
+        "  interactiveSelection?: boolean;\n"
+        "  palette?: string[];\n"
+        "  captureInput?: boolean;\n"
+        "  bracketedPaste?: boolean;\n"
+        "  mouseReporting?: boolean;\n"
+        "  appCursor?: boolean;\n"
+        "  searchMatches?: { row: number; startCol: number; endCol: number; active?: boolean }[];\n"
+        "  cursorShape?: 'underline' | 'block' | 'bar' | 'hollow';\n"
+        "  cursorVisible?: boolean;\n"
+        "  onCellClick?: ActionName | ((ev: { col: number; row: number; right: boolean }, state: unknown) => void);\n"
+        "  onLinkClick?: ActionName | ((ev: { hyperlinkId: number; col: number; row: number }, state: unknown) => void);\n"
+        "  onResize?: ActionName | ((ev: { cols: number; rows: number }, state: unknown) => void);\n"
+        "  onSelectionChange?: ActionName | ((ev: { hasSelection: boolean; startCol: number; startRow: number; endCol: number; endRow: number }, state: unknown) => void);\n"
+        "  onWheel?: ActionName | ((ev: { deltaY: number }, state: unknown) => void);\n"
+        "  onInput?: ActionName | ((ev: { text: string; keyCode: number; mods: number; repeat: boolean; vt: string }, state: unknown) => void);\n"
+        "  onPaste?: ActionName | ((ev: { text: string }, state: unknown) => void);\n"
+        "  onMouse?: ActionName | ((ev: { button: number; col: number; row: number; down: boolean; released: boolean; moved: boolean; sgr: string }, state: unknown) => void);\n"
+        "}\n"
+        "export interface CodeEditorProps extends CommonProps {\n"
+        "  buffer: BufferName;\n"
+        "  language?: string;\n"
+        "  highlightBrackets?: boolean;\n"
+        "  showIndentGuides?: boolean;\n"
+        "  showDiagnosticTooltips?: boolean;\n"
+        "  readOnly?: boolean;\n"
+        "  wordWrap?: boolean;\n"
+        "  autoHeight?: boolean;\n"
+        "  showOverviewRuler?: boolean;\n"
+        "  showMinimap?: boolean;\n"
+        "  showLineNumbers?: boolean;\n"
+        "  stickyHeader?: string;\n"
+        "  ghostText?: string;\n"
+        "  searchQuery?: string;\n"
+        "  inlayHints?: { line: number; col: number; text: string; color?: string; bg?: string; borderColor?: string; radius?: number }[];\n"
+        "  inlineHighlights?: { line: number; startCol: number; endCol: number; bg?: string; borderColor?: string; radius?: number }[];\n"
+        "  overviewMarkers?: { line: number; color?: string; lane?: number }[];\n"
+        "  lineDecorations?: { line: number; rowBg?: string; gutterBar?: string; gutterTag?: string; gutterTagColor?: string }[];\n"
+        "  folds?: { start: number; end: number; collapsed?: boolean }[];\n"
+        "  viewZones?: { id: number; afterLine: number; height: number; aboveLine?: boolean; fillColor?: string }[];\n"
+        "  scrollX?: number;\n"
+        "  scrollY?: number;\n"
+        "  onScroll?: ActionName | ((ev: { x: number; y: number }, state: unknown) => void);\n"
+        "  onCursorChange?: ActionName | ((ev: { cursorByte: number; anchorByte: number; line: number; col: number; cursorCount: number }, state: unknown) => void);\n"
+        "  onGutterClick?: ActionName | ((ev: { line: number }, state: unknown) => void);\n"
+        "  onGutterRange?: ActionName | ((ev: { startLine: number; endLine: number; dragging: boolean }, state: unknown) => void);\n"
+        "}\n"
+        "export interface DiffViewProps extends CommonProps {\n"
+        "  oldText: string;\n"
+        "  newText: string;\n"
+        "  language?: string;\n"
+        "  filePath?: string;\n"
+        "  mode?: 'split' | 'unified';\n"
+        "  contextLines?: number;\n"
+        "  collapseUnchanged?: boolean;\n"
+        "  wordDiff?: boolean;\n"
+        "  showOverviewRuler?: boolean;\n"
+        "  showMinimap?: boolean;\n"
+        "  showLineNumbers?: boolean;\n"
+        "  editable?: boolean;\n"
+        "  hunkActions?: { id: string; label: string }[];\n"
+        "  annotations?: { line: number; side?: 'old' | 'new'; height?: number; author?: string; body: string; color?: string }[];\n"
+        "  onGutterClick?: ActionName | ((ev: { line: number; side: string; origLine: number }, state: unknown) => void);\n"
+        "  onGutterRange?: ActionName | ((ev: { startLine: number; endLine: number; dragging: boolean; side: string }, state: unknown) => void);\n"
+        "  onChange?: ActionName | ((value: string, state: unknown) => void);\n"
+        "  onHunkAction?: ActionName | ((ev: { hunkIndex: number; actionId: string; oldStart: number; oldCount: number; newStart: number; newCount: number }, state: unknown) => void);\n"
+        "}\n"
         "export interface VirtualListProps extends CommonProps { model?: ModelName; count?: number; itemHeight?: number; items?: unknown[]; renderItem?: (index: number) => InlayNode; }\n"
         "export interface TreeProps extends CommonProps { model?: ModelName; showIndentGuide?: boolean; rowHeight?: number; indent?: number; }\n");
 
@@ -8071,7 +11096,59 @@ INLAY_API uint32_t inlay_surface_export_dts(const InlaySurface* s, char* out_buf
         "declare function request<T = unknown>(name: AsyncActionName, payload?: unknown): Promise<T> & { cancel(): boolean };\n"
         "declare function setTimeout(fn: () => void, ms?: number): number;\n"
         "declare function clearTimeout(id: number): void;\n"
+        "declare function setInterval(fn: () => void, ms?: number): number;\n"
+        "declare function clearInterval(id: number): void;\n"
+        "declare function requestAnimationFrame(fn: (nowMs: number) => void): number;\n"
+        "declare function cancelAnimationFrame(id: number): void;\n"
+        "declare const console: { debug(...args: unknown[]): void; log(...args: unknown[]): void; info(...args: unknown[]): void; warn(...args: unknown[]): void; error(...args: unknown[]): void };\n"
+        "declare function fuzzyMatch(pattern: string, candidate: string): { matched: boolean; score: number; positions: number[] };\n"
+        "declare function clipboardWrite(text: string): boolean;\n"
+        "declare function clipboardRead(): string;\n"
+        "declare function clipboardReadImage(): { mime: string; sizeBytes: number; base64: string } | null;\n"
+        "declare function pushFocusRestorePoint(): boolean;\n"
+        "declare function popFocusRestorePoint(): number;\n"
+        "declare function setUiZoom(zoom: number): number;\n"
+        "declare function getUiZoom(): number;\n"
+        "declare function focusElement(id: string | number): boolean;\n"
+        "declare function blurElement(): void;\n"
+        "declare function scrollTo(id: string | number, x: number, y: number): boolean;\n"
+        "declare function scrollToBottom(id: string | number): boolean;\n"
+        "declare function scrollIntoView(scrollId: string | number, itemId: string | number, margin?: number): boolean;\n"
+        "declare function measureElement(id: string | number): { x: number; y: number; w: number; h: number; visible: boolean; visibleX: number; visibleY: number; visibleW: number; visibleH: number; opacity: number } | null;\n"
+        "declare function openUrl(url: string): boolean;\n"
+        "declare function notifyDesktop(title: string, body?: string, opts?: { tag?: number; silent?: boolean }): boolean;\n"
+        "declare function openFileDialog(opts?: { defaultLocation?: string; multiple?: boolean; filters?: { name: string; pattern: string }[] }): Promise<{ cancelled: boolean; error: boolean; selectedFilter?: number; paths: string[] }>;\n"
+        "declare function openFolderDialog(opts?: { defaultLocation?: string; multiple?: boolean }): Promise<{ cancelled: boolean; error: boolean; paths: string[] }>;\n"
+        "declare function saveFileDialog(opts?: { defaultLocation?: string; filters?: { name: string; pattern: string }[] }): Promise<{ cancelled: boolean; error: boolean; selectedFilter?: number; paths: string[] }>;\n"
+        "declare function registerCommand(desc: { id: string | number; title?: string; name?: string; category?: string; shortcut?: string; chord?: string; enabled?: boolean; allowWhenTyping?: boolean; scope?: string | number }): boolean;\n"
+        "declare function unregisterCommand(id: string | number): boolean;\n"
+        "declare function dispatchCommand(id: string | number): boolean;\n"
+        "declare function pushCommandScope(id: string | number): void;\n"
+        "declare function popCommandScope(): void;\n"
+        "declare function readStream(name: StreamName, sinceCursor?: number): { cursor: number; items: unknown[] } | null;\n"
+        "declare function saveDockLayout(id: string | number): string;\n"
+        "declare function loadDockLayout(id: string | number, json: string): boolean;\n"
+        "declare function detachDockPane(dockId: string | number, paneId: string | number): boolean;\n"
+        "declare function encodeTerminalKey(keyCode: number, mods?: number, appCursor?: boolean): string;\n"
+        "declare function encodeTerminalMouseSgr(button: number, col: number, row: number, mods: number, pressed: boolean, motion: boolean): string;\n"
+        "declare const performance: { now(): number };\n"
+        "declare const crypto: { randomUUID(): string };\n"
+        "declare function btoa(data: string): string;\n"
+        "declare function atob(data: string): string;\n"
+        "declare function queueMicrotask(fn: () => void): void;\n"
+        "declare function structuredClone<T>(value: T): T;\n"
+        "declare const localStorage: { readonly length: number; getItem(key: string): string | null; setItem(key: string, value: string): void; removeItem(key: string): void; clear(): void; key(index: number): string | null };\n"
+        "declare class TextEncoder { readonly encoding: string; encode(input?: string): Uint8Array; encodeInto(source: string, dest: Uint8Array): { read: number; written: number }; }\n"
+        "declare class TextDecoder { readonly encoding: string; constructor(label?: string); decode(input?: ArrayBuffer | ArrayBufferView): string; }\n"
+        "declare class URLSearchParams implements Iterable<[string, string]> { readonly size: number; constructor(init?: string | string[][] | Record<string, string> | URLSearchParams); append(name: string, value: string): void; delete(name: string): void; get(name: string): string | null; getAll(name: string): string[]; has(name: string): boolean; set(name: string, value: string): void; sort(): void; entries(): IterableIterator<[string, string]>; keys(): IterableIterator<string>; values(): IterableIterator<string>; forEach(cb: (value: string, key: string, parent: URLSearchParams) => void): void; [Symbol.iterator](): IterableIterator<[string, string]>; toString(): string; }\n"
+        "declare class URL { protocol: string; username: string; password: string; hostname: string; port: string; host: string; readonly origin: string; pathname: string; search: string; readonly searchParams: URLSearchParams; hash: string; readonly href: string; constructor(url: string, base?: string | URL); toString(): string; toJSON(): string; }\n"
         "declare function useState<T>(init: T | (() => T)): [T, (next: T | ((prev: T) => T)) => void];\n"
+        "declare function useReducer<S, A>(reducer: (state: S, action: A) => S, initialArg: S): [S, (action: A) => void];\n"
+        "declare function useReducer<S, I, A>(reducer: (state: S, action: A) => S, initialArg: I, init: (arg: I) => S): [S, (action: A) => void];\n"
+        "export interface Context<T> { defaultValue: T; Provider: (props: { value: T; render?: (v: T) => InlayNode; children?: ((v: T) => InlayNode) | InlayNode }) => InlayNode; }\n"
+        "declare function createContext<T>(defaultValue: T): Context<T>;\n"
+        "declare function useContext<T>(ctx: Context<T>): T;\n"
+        "declare function provideContext<T>(ctx: Context<T>, value: T): void;\n"
         "declare function useRef<T>(init: T): { current: T };\n"
         "declare function useMemo<T>(fn: () => T, deps?: readonly unknown[]): T;\n"
         "declare function useCallback<T extends (...args: unknown[]) => unknown>(fn: T, deps?: readonly unknown[]): T;\n"
@@ -8105,9 +11182,20 @@ INLAY_API uint32_t inlay_surface_export_dts(const InlaySurface* s, char* out_buf
         "  function math(props?: string | CommonProps): InlayNode;\n"
         "  function diagram(props?: string | CommonProps): InlayNode;\n"
         "  function slot(props?: SlotName | SlotProps): InlayNode;\n"
+        "  function portal(props?: PortalName | PortalProps): InlayNode;\n"
         "  function doc(props?: string | DocProps): InlayNode;\n"
-        "  function codeEditor(props?: BufferName | CodeEditorProps): InlayNode;\n"
-        "  function terminal(props?: string | CommonProps): InlayNode;\n"
+        "  function codeEditor(props?: BufferName | CodeEditorProps, ...children: InlayNode[]): InlayNode;\n"
+        "  function terminal(props?: string | TerminalProps): InlayNode;\n"
+        "  function dockSpace(props?: CommonProps | InlayNode, ...children: InlayNode[]): InlayNode;\n"
+        "  function dockPane(props?: CommonProps | InlayNode, ...children: InlayNode[]): InlayNode;\n"
+        "  function sheet(props?: CommonProps | InlayNode, ...children: InlayNode[]): InlayNode;\n"
+        "  function hoverCard(props?: CommonProps | InlayNode, ...children: InlayNode[]): InlayNode;\n"
+        "  function radioGroup(props?: CommonProps): InlayNode;\n"
+        "  function toggleGroup(props?: CommonProps): InlayNode;\n"
+        "  function colorPicker(props?: CommonProps): InlayNode;\n"
+        "  function chart(props?: CommonProps): InlayNode;\n"
+        "  function viewZone(props?: { zoneId: number }, ...children: InlayNode[]): InlayNode;\n"
+        "  function diffView(props?: DiffViewProps): InlayNode;\n"
         "  function virtualList(props?: VirtualListProps, ...children: InlayNode[]): InlayNode;\n"
         "  function table(props?: CommonProps): InlayNode;\n"
         "  function tree(props?: TreeProps, ...children: InlayNode[]): InlayNode;\n"
@@ -8153,9 +11241,10 @@ INLAY_API uint32_t inlay_surface_export_dts(const InlaySurface* s, char* out_buf
         "    Spacer: CommonProps;\n"
         "    Diagram: CommonProps;\n"
         "    Slot: SlotProps;\n"
+        "    Portal: PortalProps;\n"
         "    Doc: DocProps;\n"
         "    CodeEditor: CodeEditorProps;\n"
-        "    Terminal: CommonProps;\n"
+        "    Terminal: TerminalProps;\n"
         "    VirtualList: VirtualListProps;\n"
         "    Table: CommonProps;\n"
         "    Tree: TreeProps;\n"
@@ -8166,6 +11255,7 @@ INLAY_API uint32_t inlay_surface_export_dts(const InlaySurface* s, char* out_buf
         "    Toast: CommonProps;\n"
         "    Accordion: CommonProps;\n"
         "    Skeleton: CommonProps;\n"
+        "    DiffView: DiffViewProps;\n"
         "    [elemName: string]: CommonProps;\n"
         "  }\n"
         "}\n");
@@ -8186,6 +11276,173 @@ INLAY_API bool inlay_surface_bind_text_buffer(InlaySurface* s, EtchStr name, Etc
     return bind_content(s, name, INLAY_UI_CODE_EDITOR, buffer);
 }
 
+INLAY_API bool inlay_surface_bind_terminal(InlaySurface* s, EtchStr name, InlayTerminalReadFn read_fn, void* user_data) {
+    if (!s || s->running || s->drawing || !name.chars || !name.length ||
+        name.length >= sizeof(TerminalBinding::name) || std::memchr(name.chars, 0, name.length)) {
+        return false;
+    }
+    uint32_t found = s->terminal_count;
+    for (uint32_t i = 0u; i < s->terminal_count; ++i) {
+        if (inlay_ui_equal(name, s->terminals[i].name)) {
+            found = i;
+            break;
+        }
+    }
+    if (!read_fn) {
+        if (found < s->terminal_count) {
+            s->terminals[found] = s->terminals[--s->terminal_count];
+            etch_request_redraw(s->etch);
+        }
+        return true;
+    }
+    if (found == s->terminal_count) {
+        if (!inlay_grow_pod(s->terminals, s->terminal_cap, s->terminal_count + 1u, 4u, 64u)) return false;
+        ++s->terminal_count;
+    }
+    auto& dst = s->terminals[found];
+    dst = {};
+    std::memcpy(dst.name, name.chars, name.length);
+    dst.name[name.length] = '\0';
+    dst.read_fn = read_fn;
+    dst.user = user_data;
+    etch_request_redraw(s->etch);
+    return true;
+}
+
+INLAY_API bool inlay_surface_bind_portal(InlaySurface* s, EtchStr name, InlayPortal* portal) {
+    if (portal && (!s || inlay_portal_context(portal) != s->etch)) return false;
+    return bind_content(s, name, INLAY_UI_PORTAL, portal);
+}
+
+INLAY_API bool inlay_surface_bind_stream(InlaySurface* s, EtchStr name, InlayStream* stream) {
+    if (!s || s->running || s->drawing || !name.chars || !name.length ||
+        name.length >= sizeof(StreamBinding::name) || std::memchr(name.chars, 0, name.length)) {
+        return false;
+    }
+    uint32_t found = s->stream_count;
+    for (uint32_t i = 0u; i < s->stream_count; ++i) {
+        if (inlay_ui_equal(name, s->streams[i].name)) {
+            found = i;
+            break;
+        }
+    }
+    if (!stream) {
+        if (found < s->stream_count) {
+            s->streams[found] = s->streams[--s->stream_count];
+            etch_request_redraw(s->etch);
+        }
+        return true;
+    }
+    if (found == s->stream_count) {
+        if (!inlay_grow_pod(s->streams, s->stream_cap, s->stream_count + 1u, 4u, 64u)) return false;
+        ++s->stream_count;
+    }
+    auto& dst = s->streams[found];
+    dst = {};
+    std::memcpy(dst.name, name.chars, name.length);
+    dst.name[name.length] = '\0';
+    dst.stream = stream;
+    dst.last_seen_cursor = UINT64_MAX;
+    etch_request_redraw(s->etch);
+    return true;
+}
+
+INLAY_API void inlay_surface_set_console_callback(InlaySurface* s, InlayConsoleFn fn, void* user_data) {
+    if (!s) return;
+    s->console_fn = fn;
+    s->console_user_data = user_data;
+}
+
+INLAY_API void inlay_surface_set_storage_hooks(InlaySurface* s, InlayStorageGetFn get_fn,
+                                               InlayStorageSetFn set_fn, InlayStorageRemoveFn remove_fn,
+                                               void* user_data) {
+    if (!s) return;
+    auto* stg = ext(s);
+    stg->storage_get_fn = get_fn;
+    stg->storage_set_fn = set_fn;
+    stg->storage_remove_fn = remove_fn;
+    stg->storage_user = user_data;
+}
+
+INLAY_API void inlay_surface_set_code_tokenizer(InlaySurface* s, EtchSyntaxTokenizeFn fn, void* user_data) {
+    if (!s) return;
+    s->code_tok_fn = fn;
+    s->code_tok_user_data = user_data;
+    etch_request_redraw(s->etch);
+}
+
+INLAY_API void inlay_surface_set_doc_hooks(InlaySurface* s, InlayCodeHighlightFn hl_fn, void* hl_user,
+                                           InlayCustomFenceEstimateFn fence_est, InlayCustomFenceRenderFn fence_ren,
+                                           void* fence_user) {
+    if (!s) return;
+    s->doc_hl_fn = hl_fn;
+    s->doc_hl_user_data = hl_user;
+    s->doc_fence_est = fence_est;
+    s->doc_fence_ren = fence_ren;
+    s->doc_fence_user_data = fence_user;
+    etch_request_redraw(s->etch);
+}
+
+INLAY_API bool inlay_surface_register_module(InlaySurface* s, EtchStr module_name, EtchStr source_utf8) {
+    if (!s || s->running || s->drawing || !module_name.chars || !module_name.length ||
+        module_name.length >= sizeof(RegisteredModule::name) ||
+        std::memchr(module_name.chars, 0, module_name.length) ||
+        (!source_utf8.chars && source_utf8.length > 0u) ||
+        source_utf8.length > kMaxScriptBytes ||
+        (source_utf8.length > 0u && std::memchr(source_utf8.chars, 0, source_utf8.length))) {
+        return false;
+    }
+    auto* stg = ext(s);
+    uint32_t found = stg->module_count;
+    for (uint32_t i = 0u; i < stg->module_count; ++i) {
+        if (inlay_ui_equal(module_name, stg->modules[i].name)) {
+            found = i;
+            break;
+        }
+    }
+    char* copy = static_cast<char*>(SDL_malloc(size_t(source_utf8.length) + 1u));
+    if (!copy) return false;
+    if (source_utf8.length > 0u) {
+        std::memcpy(copy, source_utf8.chars, source_utf8.length);
+    }
+    copy[source_utf8.length] = '\0';
+    if (found == stg->module_count) {
+        if (!inlay_grow_pod(stg->modules, stg->module_cap, stg->module_count + 1u, 8u, 256u)) {
+            SDL_free(copy);
+            return false;
+        }
+        ++stg->module_count;
+        auto& dst = stg->modules[found];
+        dst = {};
+        std::memcpy(dst.name, module_name.chars, module_name.length);
+        dst.name[module_name.length] = '\0';
+        dst.source = copy;
+        dst.length = source_utf8.length;
+    } else {
+        SDL_free(stg->modules[found].source);
+        stg->modules[found].source = copy;
+        stg->modules[found].length = source_utf8.length;
+    }
+    return true;
+}
+
+INLAY_API bool inlay_surface_unregister_module(InlaySurface* s, EtchStr module_name) {
+    if (!s || s->running || s->drawing || !module_name.chars || !module_name.length ||
+        module_name.length >= sizeof(RegisteredModule::name) ||
+        std::memchr(module_name.chars, 0, module_name.length)) {
+        return false;
+    }
+    auto* stg = ext(s);
+    for (uint32_t i = 0u; i < stg->module_count; ++i) {
+        if (inlay_ui_equal(module_name, stg->modules[i].name)) {
+            SDL_free(stg->modules[i].source);
+            stg->modules[i] = stg->modules[--stg->module_count];
+            return true;
+        }
+    }
+    return false;
+}
+
 INLAY_API bool inlay_surface_set_image_resolver(InlaySurface* s, InlayImageResolverFn fn, void* user_data) {
     if (!s) return false;
     s->image_resolver_fn = fn;
@@ -8196,9 +11453,11 @@ INLAY_API bool inlay_surface_set_image_resolver(InlaySurface* s, InlayImageResol
 
 INLAY_API bool inlay_surface_dispatch(InlaySurface* s, EtchStr name, EtchStr payload) {
     if (!s || !s->js || !s->loaded || s->running || s->drawing || !name.chars || !name.length ||
-        name.length >= 64u || !payload.chars || !payload.length || payload.length > 65536u) {
+        name.length >= 64u || !payload.chars || !payload.length) {
         return false;
     }
+    const uint32_t limit = s->desc.max_state_bytes ? s->desc.max_state_bytes : 65536u;
+    if (payload.length > limit) return false;
     return run_update(s, name, payload);
 }
 
@@ -8257,6 +11516,7 @@ INLAY_API void inlay_surface_view(InlaySurface* s, const InlaySurfaceViewDesc* i
         return;
     }
     ++s->frame_counter;
+    ext(s)->last_view_id = input.id;
 
     // Bug 7 fix: throttle auto-polling of SDL_GetPathInfo inside view to 80 ms.
     const double current = inlay_ui_now_ms(s);
@@ -8265,21 +11525,150 @@ INLAY_API void inlay_surface_view(InlaySurface* s, const InlaySurfaceViewDesc* i
     }
     if (s->pending_state && s->loaded && !s->stats.has_error) run_update(s, {}, {});
 
+    // Reactive bound InlayStream change detection (auto-rebuilds when host appends stream items).
+    if (s->stream_count > 0u && s->loaded && !s->stats.has_error) {
+        bool stream_changed = false;
+        for (uint32_t si = 0u; si < s->stream_count; ++si) {
+            auto& sb = s->streams[si];
+            if (!sb.stream || sb.last_seen_cursor == UINT64_MAX) continue;
+            const uint64_t cur = inlay_stream_cursor(sb.stream);
+            if (cur != sb.last_seen_cursor) {
+                sb.last_seen_cursor = cur;
+                stream_changed = true;
+            }
+        }
+        if (stream_changed) run_update(s, {}, {});
+    }
+
+    // Async native file/folder/save dialog completion bridge.
+    if (s->loaded && !s->stats.has_error) {
+        bool any_dialog_pending = false;
+        for (const auto& pd : ext(s)->pending_dialogs) {
+            if (pd.active) { any_dialog_pending = true; break; }
+        }
+        if (any_dialog_pending) {
+            char dscratch[8192];
+            EtchArena darena = etch_arena_from_buffer(dscratch, sizeof(dscratch));
+            const EtchFileDialogResult dres = etch_poll_file_dialog(s->etch, &darena);
+            if (dres.ready) {
+                for (auto& pd : ext(s)->pending_dialogs) {
+                    if (!pd.active || pd.tag != dres.request_tag) continue;
+                    const JSValue resolve_fn = pd.settle[0];
+                    const JSValue reject_fn = pd.settle[1];
+                    pd = {};
+                    const uint64_t start = SDL_GetPerformanceCounter();
+                    begin_tick(s);
+                    JSValue obj = JS_NewObject(s->js);
+                    JS_SetPropertyStr(s->js, obj, "cancelled", JS_NewBool(s->js, dres.cancelled));
+                    JS_SetPropertyStr(s->js, obj, "error", JS_NewBool(s->js, dres.error));
+                    JS_SetPropertyStr(s->js, obj, "selectedFilter", JS_NewInt32(s->js, dres.selected_filter));
+                    const JSValue parr = JS_NewArray(s->js);
+                    for (uint32_t pi = 0u; pi < dres.path_count; ++pi) {
+                        JS_SetPropertyUint32(s->js, parr, pi,
+                            JS_NewStringLen(s->js, dres.paths[pi].chars ? dres.paths[pi].chars : "", dres.paths[pi].length));
+                    }
+                    JS_SetPropertyStr(s->js, obj, "paths", parr);
+                    const JSValue call_r = JS_Call(s->js, resolve_fn, JS_UNDEFINED, 1, &obj);
+                    JS_FreeValue(s->js, call_r);
+                    JS_FreeValue(s->js, obj);
+                    JS_FreeValue(s->js, resolve_fn);
+                    JS_FreeValue(s->js, reject_fn);
+                    if (!JS_HasException(s->js)) rebuild(s, false);
+                    finish_tick(s, start);
+                    etch_request_redraw(s->etch);
+                    break;
+                }
+            }
+        }
+    }
+
+    // Command registry triggered-command dispatch -> global onCommand(id, state).
+    if (s->loaded && !s->stats.has_error) {
+        auto* stg = ext(s);
+        uint32_t trig[8] = {};
+        uint32_t trig_n = 0u;
+        for (uint32_t pi = 0u; pi < stg->pending_cmd_count && trig_n < 8u; ++pi) {
+            trig[trig_n++] = stg->pending_cmds[pi];
+        }
+        stg->pending_cmd_count = 0u;
+        while (trig_n < 8u) {
+            const uint32_t cid = etch_poll_triggered_command(s->etch);
+            if (!cid) break;
+            trig[trig_n++] = cid;
+        }
+        if (trig_n > 0u) {
+            const uint64_t start = SDL_GetPerformanceCounter();
+            begin_tick(s);
+            const JSValue global = JS_GetGlobalObject(s->js);
+            const JSValue cmd_fn = JS_GetPropertyStr(s->js, global, "onCommand");
+            if (JS_IsFunction(s->js, cmd_fn)) {
+                for (uint32_t ti = 0u; ti < trig_n && !JS_HasException(s->js); ++ti) {
+                    JSValue id_arg = JS_NewUint32(s->js, trig[ti]);
+                    for (uint32_t ni = 0u; ni < stg->command_name_count; ++ni) {
+                        if (stg->command_names[ni].id == trig[ti]) {
+                            JS_FreeValue(s->js, id_arg);
+                            id_arg = JS_NewString(s->js, stg->command_names[ni].name);
+                            break;
+                        }
+                    }
+                    JSValue args[2] = {id_arg, JS_GetPropertyStr(s->js, global, "state")};
+                    const JSValue res = JS_Call(s->js, cmd_fn, global, 2, args);
+                    JS_FreeValue(s->js, res);
+                    JS_FreeValue(s->js, args[0]);
+                    JS_FreeValue(s->js, args[1]);
+                }
+            }
+            JS_FreeValue(s->js, cmd_fn);
+            JS_FreeValue(s->js, global);
+            if (!JS_HasException(s->js)) rebuild(s, false);
+            finish_tick(s, start);
+            etch_request_redraw(s->etch);
+        }
+    }
+
     bool timer_due = false;
     for (const auto& timer : s->timers) {
-        timer_due |= !JS_IsUndefined(timer.function) && timer.due <= current;
+        timer_due |= !JS_IsUndefined(timer.function) && (timer.is_raf || timer.due <= current);
     }
     if (timer_due && s->loaded && !s->stats.has_error) {
         const uint64_t start = SDL_GetPerformanceCounter();
         begin_tick(s);
-        for (auto& timer : s->timers) {
-            if (!JS_IsUndefined(timer.function) && timer.due <= current && !JS_HasException(s->js)) {
-                const JSValue function = timer.function;
-                timer.function = JS_UNDEFINED;
-                timer.id = 0u;
-                const JSValue result = JS_Call(s->js, function, JS_UNDEFINED, 0, nullptr);
+        // Snapshot timer IDs due this frame so rAF/timers scheduled inside callbacks wait for next frame.
+        uint32_t due_ids[64] = {};
+        uint32_t due_count = 0u;
+        for (const auto& timer : s->timers) {
+            if (!JS_IsUndefined(timer.function) && (timer.is_raf || timer.due <= current) && due_count < 64u) {
+                due_ids[due_count++] = timer.id;
+            }
+        }
+        for (uint32_t di = 0u; di < due_count && !JS_HasException(s->js); ++di) {
+            for (auto& timer : s->timers) {
+                if (timer.id != due_ids[di] || JS_IsUndefined(timer.function)) continue;
+                const bool raf = timer.is_raf;
+                const double iv = timer.interval_ms;
+                JSValue function = JS_UNDEFINED;
+                if (iv > 0.0 && !raf) {
+                    function = JS_DupValue(s->js, timer.function);
+                    timer.due = current + iv;
+                } else {
+                    function = timer.function;
+                    timer.function = JS_UNDEFINED;
+                    timer.due = 0.0;
+                    timer.interval_ms = 0.0;
+                    timer.id = 0u;
+                    timer.is_raf = false;
+                }
+                JSValue result = JS_UNDEFINED;
+                if (raf) {
+                    JSValue ts = JS_NewFloat64(s->js, current);
+                    result = JS_Call(s->js, function, JS_UNDEFINED, 1, &ts);
+                    JS_FreeValue(s->js, ts);
+                } else {
+                    result = JS_Call(s->js, function, JS_UNDEFINED, 0, nullptr);
+                }
                 JS_FreeValue(s->js, result);
                 JS_FreeValue(s->js, function);
+                break;
             }
         }
         if (!JS_HasException(s->js)) rebuild(s, false);
@@ -8402,6 +11791,7 @@ INLAY_API int32_t inlay_surface_next_timer_ms(const InlaySurface* s) {
     double soonest = 0.0;
     for (const auto& timer : s->timers) {
         if (JS_IsUndefined(timer.function)) continue;
+        if (timer.is_raf) return 0;
         if (!has || timer.due < soonest) {
             soonest = timer.due;
             has = true;
@@ -8460,6 +11850,16 @@ INLAY_API uint32_t inlay_surface_export_dts(const InlaySurface*, char* out_buf, 
 }
 INLAY_API bool inlay_surface_bind_document(InlaySurface*, EtchStr, InlayDoc*) { return false; }
 INLAY_API bool inlay_surface_bind_text_buffer(InlaySurface*, EtchStr, EtchTextBuffer*) { return false; }
+INLAY_API bool inlay_surface_bind_terminal(InlaySurface*, EtchStr, InlayTerminalReadFn, void*) { return false; }
+INLAY_API bool inlay_surface_bind_portal(InlaySurface*, EtchStr, InlayPortal*) { return false; }
+INLAY_API bool inlay_surface_bind_stream(InlaySurface*, EtchStr, InlayStream*) { return false; }
+INLAY_API void inlay_surface_set_console_callback(InlaySurface*, InlayConsoleFn, void*) {}
+INLAY_API void inlay_surface_set_storage_hooks(InlaySurface*, InlayStorageGetFn, InlayStorageSetFn, InlayStorageRemoveFn, void*) {}
+INLAY_API void inlay_surface_set_code_tokenizer(InlaySurface*, EtchSyntaxTokenizeFn, void*) {}
+INLAY_API void inlay_surface_set_doc_hooks(InlaySurface*, InlayCodeHighlightFn, void*,
+                                           InlayCustomFenceEstimateFn, InlayCustomFenceRenderFn, void*) {}
+INLAY_API bool inlay_surface_register_module(InlaySurface*, EtchStr, EtchStr) { return false; }
+INLAY_API bool inlay_surface_unregister_module(InlaySurface*, EtchStr) { return false; }
 INLAY_API bool inlay_surface_set_image_resolver(InlaySurface*, InlayImageResolverFn, void*) { return false; }
 INLAY_API bool inlay_surface_dispatch(InlaySurface*, EtchStr, EtchStr) { return false; }
 INLAY_API bool inlay_surface_enable_hmr(InlaySurface*, const char*) { return false; }

@@ -352,11 +352,138 @@ struct ColdVisualStyle {
     uint32_t on_hover_handler;
     TextSlice on_focus_action;
     uint32_t on_focus_handler;
+    TextSlice on_key_action;
+    uint32_t on_key_handler;
+    bool global_keys;
+    bool consume_keys;
+    TextSlice on_text_action;
+    uint32_t on_text_handler;
+    uint32_t dnd_idx; // Index into InlaySurface::dnd_specs or INLAY_UI_NONE
 };
 
 // ============================================================================
 // Cold Extended Widget Specs (Per-Rebuild Pools) & Persistent Caches
 // ============================================================================
+
+struct NodeDndSpec {
+    bool draggable;
+    TextSlice drag_kind;
+    TextSlice drag_label;
+    TextSlice drag_data;
+    TextSlice drop_accept;
+    TextSlice on_drop_action;
+    uint32_t on_drop_handler;
+    TextSlice on_file_drop_action;
+    uint32_t on_file_drop_handler;
+    TextSlice on_drag_hover_action;
+    uint32_t on_drag_hover_handler;
+};
+
+struct InputHighlightItem {
+    uint32_t offset;
+    uint32_t length;
+    ColorRef color;
+    ColorRef bg;
+    ColorRef border_color;
+    float radius;
+    bool atomic;
+};
+
+struct InputRichSpec {
+    uint32_t hl_offset;
+    uint32_t hl_count;
+    TextSlice ghost_text;
+    ColorRef ghost_color;
+    bool accept_ghost_on_tab;
+    TextSlice on_accept_ghost_action;
+    uint32_t on_accept_ghost_handler;
+    TextSlice on_paste_image_action;
+    uint32_t on_paste_image_handler;
+    TextSlice on_caret_action;
+    uint32_t on_caret_handler;
+};
+
+struct EditorInlayHintItem {
+    uint32_t line;
+    uint32_t col;
+    TextSlice text;
+    ColorRef color;
+    ColorRef bg;
+    ColorRef border_color;
+    float radius;
+};
+
+struct EditorInlineHlItem {
+    uint32_t line;
+    uint32_t start_col;
+    uint32_t end_col;
+    ColorRef bg;
+    ColorRef border_color;
+    float radius;
+};
+
+struct EditorOverviewItem {
+    uint32_t line;
+    ColorRef color;
+    uint8_t lane;
+};
+
+struct EditorLineDecoItem {
+    uint32_t line;
+    ColorRef row_bg;
+    ColorRef gutter_bar;
+    ColorRef gutter_tag_color;
+    TextSlice gutter_tag;
+};
+
+struct EditorFoldItem {
+    uint32_t start;
+    uint32_t end;
+    bool collapsed;
+};
+
+struct EditorViewZoneItem {
+    uint32_t id;
+    uint32_t after_line;
+    float height;
+    bool above_line;
+    ColorRef fill_color;
+};
+
+struct CodeEditorRichSpec {
+    bool auto_height;
+    bool show_overview_ruler;
+    bool has_show_line_numbers;
+    bool show_line_numbers;
+    bool has_scroll_x;
+    bool has_scroll_y;
+    float scroll_x;
+    float scroll_y;
+    float gutter_tag_width;
+    TextSlice sticky_header;
+    uint32_t hint_off, hint_cnt;
+    uint32_t hl_off, hl_cnt;
+    uint32_t marker_off, marker_cnt;
+    uint32_t deco_off, deco_cnt;
+    uint32_t fold_off, fold_cnt;
+    uint32_t vz_off, vz_cnt;
+    TextSlice on_scroll_action;
+    uint32_t on_scroll_handler;
+    TextSlice on_gutter_click_action;
+    uint32_t on_gutter_click_handler;
+    TextSlice on_gutter_range_action;
+    uint32_t on_gutter_range_handler;
+    TextSlice language;
+    bool has_highlight_brackets;
+    bool highlight_brackets;
+    bool has_indent_guides;
+    bool indent_guides;
+    bool has_diag_tooltips;
+    bool diag_tooltips;
+    bool show_minimap;
+    TextSlice on_cursor_action;
+    uint32_t on_cursor_handler;
+};
 
 struct DocWidgetSpec {
     uint64_t content_hash;
@@ -366,10 +493,27 @@ struct DocWidgetSpec {
     bool hide_copy_button;
     bool stick_to_bottom;
     bool auto_height;
+    bool streaming_repair;
     float block_padding_px;
     float block_gap_px;
     TextSlice on_link_action;
     uint32_t on_link_handler;
+    TextSlice find_query;
+    TextSlice on_sel_action;
+    uint32_t on_sel_handler;
+    TextSlice on_find_action;
+    uint32_t on_find_handler;
+    TextSlice on_task_toggle_action;
+    uint32_t on_task_toggle_handler;
+    TextSlice on_diagram_node_action;
+    uint32_t on_diagram_node_handler;
+};
+
+struct TermSearchMatchItem {
+    uint32_t row;
+    uint32_t start_col;
+    uint32_t end_col;
+    bool active;
 };
 
 struct TermWidgetSpec {
@@ -378,8 +522,42 @@ struct TermWidgetSpec {
     int32_t cursor_col;
     int32_t cursor_row;
     bool has_cursor;
+    bool auto_fit;
+    bool focusable;
+    bool interactive_selection;
+    bool has_cursor_shape;
+    uint8_t cursor_shape;
+    bool cursor_visible;
+    bool has_cursor_visible;
     float line_height_px;
     ColorRef cursor_color;
+    ColorRef search_color;
+    ColorRef search_active_color;
+    uint32_t search_off;
+    uint32_t search_cnt;
+    TextSlice buffer_name;
+    TextSlice on_cell_click_action;
+    uint32_t on_cell_click_handler;
+    TextSlice on_link_click_action;
+    uint32_t on_link_click_handler;
+    TextSlice on_resize_action;
+    uint32_t on_resize_handler;
+    TextSlice on_sel_action;
+    uint32_t on_sel_handler;
+    TextSlice on_wheel_action;
+    uint32_t on_wheel_handler;
+    bool capture_input;
+    bool bracketed_paste;
+    bool mouse_reporting;
+    bool app_cursor;
+    bool has_palette;
+    EtchColor palette[16];
+    TextSlice on_input_action;
+    uint32_t on_input_handler;
+    TextSlice on_paste_action;
+    uint32_t on_paste_handler;
+    TextSlice on_mouse_action;
+    uint32_t on_mouse_handler;
 };
 
 struct VirtualListSpec {
@@ -502,10 +680,303 @@ struct ToastSpec {
     uint8_t position; // ToastPosition
     bool open;
     bool dismissible;
+    uint32_t stack_index;
+    uint32_t duration_ms;
     TextSlice action_name;
     uint32_t action_handler;
     TextSlice dismiss_action;
     uint32_t dismiss_handler;
+};
+
+struct DockSpaceSpec {
+    float tab_bar_height;
+    float divider_size;
+    float default_split_ratio;
+    bool default_split_vertical;
+    bool has_default_split;
+    TextSlice on_active_action;
+    uint32_t on_active_handler;
+    TextSlice layout_json;
+    TextSlice on_layout_action;
+    uint32_t on_layout_handler;
+    TextSlice on_tear_off_action;
+    uint32_t on_tear_off_handler;
+};
+
+struct DockPaneSpec {
+    uint32_t pane_id;
+    TextSlice title;
+    uint16_t icon_id;
+    bool has_icon;
+    bool closable;
+    bool pinned;
+    bool dirty;
+    bool split_second;
+    ColorRef badge_color;
+    TextSlice on_close_action;
+    uint32_t on_close_handler;
+    TextSlice on_rclick_action;
+    uint32_t on_rclick_handler;
+};
+
+struct SheetSpec {
+    bool open;
+    bool dismiss_on_backdrop;
+    bool dismiss_on_escape;
+    bool show_handle;
+    uint8_t edge; // EtchSheetEdge
+    float extent_px;
+    TextSlice on_close_action;
+    uint32_t on_close_handler;
+};
+
+struct HoverCardSpec {
+    float open_delay_ms;
+    float close_delay_ms;
+    float width_px;
+};
+
+struct ChoiceItemSpec {
+    TextSlice label;
+    TextSlice value;
+    TextSlice description;
+    uint16_t icon_id;
+    bool has_icon;
+    bool disabled;
+};
+
+struct RadioGroupSpec {
+    uint32_t item_off;
+    uint32_t item_cnt;
+    TextSlice value;
+    bool horizontal;
+    TextSlice on_change_action;
+    uint32_t on_change_handler;
+};
+
+struct ToggleGroupSpec {
+    uint32_t item_off;
+    uint32_t item_cnt;
+    TextSlice value;
+    uint32_t selected_mask;
+    bool multiple;
+    bool outline;
+    TextSlice on_change_action;
+    uint32_t on_change_handler;
+};
+
+struct ColorPickerSpec {
+    EtchColor value;
+    bool has_value;
+    EtchColor presets[16];
+    uint8_t preset_count;
+    TextSlice on_change_action;
+    uint32_t on_change_handler;
+};
+
+struct ChartPointSpec {
+    float value;
+    TextSlice label;
+};
+
+struct ChartSpec {
+    uint8_t variant; // 0=bar, 1=area, 2=line
+    uint32_t pt_off;
+    uint32_t pt_cnt;
+    ColorRef color;
+    float height_px;
+    bool show_grid;
+    bool show_labels;
+};
+
+struct PortalWidgetSpec {
+    TextSlice url;
+    TextSlice html;
+    float zoom;
+    bool has_zoom;
+    TextSlice find_query;
+    bool has_find;
+    bool find_match_case;
+    bool find_forward;
+    TextSlice nav_action;
+    TextSlice eval_script;
+    TextSlice init_script;
+    TextSlice post_message;
+    TextSlice on_state_action;
+    uint32_t on_state_handler;
+    TextSlice on_msg_action;
+    uint32_t on_msg_handler;
+    TextSlice on_nav_action;
+    uint32_t on_nav_handler;
+};
+
+struct PortalSyncSlot {
+    uint32_t element_id;
+    uint64_t url_hash;
+    uint64_t html_hash;
+    uint64_t find_hash;
+    uint64_t nav_hash;
+    uint64_t eval_hash;
+    uint64_t init_hash;
+    uint64_t post_hash;
+    float applied_zoom;
+    bool has_applied_zoom;
+    uint64_t last_state_hash;
+    uint64_t last_used_frame;
+};
+
+struct DocViewTrackSlot {
+    uint32_t element_id;
+    bool sel_active;
+    uint32_t sel_anchor;
+    uint32_t sel_focus;
+    uint64_t last_find_hash;
+    uint32_t last_find_count;
+    uint64_t last_used_frame;
+};
+
+struct DiffAnnotationItem {
+    uint32_t line;
+    bool is_new_side;
+    float height;
+    TextSlice author;
+    TextSlice body;
+    ColorRef color;
+};
+
+struct DiffHunkActionItem {
+    TextSlice id;
+    TextSlice label;
+};
+
+struct DiffViewSpec {
+    TextSlice old_text;
+    TextSlice new_text;
+    TextSlice language;
+    TextSlice file_path;
+    uint8_t mode; // 0 = split, 1 = unified
+    uint32_t context_lines;
+    bool collapse_unchanged;
+    bool word_diff;
+    bool show_overview_ruler;
+    bool show_line_numbers;
+    bool editable;
+    float font_size;
+    bool has_font_size;
+    uint32_t ann_off;
+    uint32_t ann_cnt;
+    DiffHunkActionItem hunk_actions[8];
+    uint32_t hunk_action_cnt;
+    TextSlice on_gutter_click_action;
+    uint32_t on_gutter_click_handler;
+    TextSlice on_gutter_range_action;
+    uint32_t on_gutter_range_handler;
+    TextSlice on_change_action;
+    uint32_t on_change_handler;
+    TextSlice on_hunk_action;
+    uint32_t on_hunk_handler;
+};
+
+struct DiffLineMeta {
+    int8_t kind; // 0=same, 1=add, -1=del, 2=pad
+    uint32_t orig_line;
+};
+
+struct DiffHunk {
+    uint32_t split_start;
+    uint32_t split_end;
+    uint32_t uni_start;
+    uint32_t uni_end;
+    uint32_t old_start;
+    uint32_t old_count;
+    uint32_t new_start;
+    uint32_t new_count;
+};
+
+struct DiffViewCacheEntry {
+    uint32_t element_id;
+    uint64_t diff_hash;
+    uint8_t mode;
+    bool collapse_unchanged;
+    bool word_diff;
+    uint32_t context_lines;
+    EtchTextBuffer* left_buf;
+    EtchTextBuffer* right_buf;
+    EtchTextBuffer* unified_buf;
+    DiffLineMeta* left_meta;
+    DiffLineMeta* right_meta;
+    DiffLineMeta* unified_meta;
+    uint32_t split_line_count;
+    uint32_t unified_line_count;
+    EtchCodeInlineHighlight* left_hls;
+    uint32_t left_hl_count;
+    EtchCodeInlineHighlight* right_hls;
+    uint32_t right_hl_count;
+    EtchCodeInlineHighlight* unified_hls;
+    uint32_t unified_hl_count;
+    EtchCodeOverviewMarker* markers;
+    uint32_t marker_count;
+    EditorFoldItem* folds;
+    uint32_t fold_count;
+    DiffHunk* hunks;
+    uint32_t hunk_count;
+    uint32_t active_hunk;
+    uint32_t added_lines;
+    uint32_t removed_lines;
+    float last_left_scroll_x;
+    float last_right_scroll_x;
+    float last_left_scroll_y;
+    float last_right_scroll_y;
+    uint64_t last_used_frame;
+};
+
+struct DockSyncEntry {
+    uint32_t element_id;
+    uint32_t known_panes[32];
+    uint32_t known_pane_count;
+    bool initialized;
+    uint64_t applied_layout_hash;
+    uint64_t last_layout_hash;
+    uint32_t last_active_pane;
+    uint64_t last_used_frame;
+};
+
+struct HoverCardStateSlot {
+    uint32_t element_id;
+    bool open;
+    double hover_enter_ms;
+    double hover_leave_ms;
+    uint64_t last_used_frame;
+};
+
+struct ToastTimerSlot {
+    uint32_t element_id;
+    double opened_ms;
+    bool fired;
+    uint64_t last_used_frame;
+};
+
+struct ColorPickerSlot {
+    uint32_t element_id;
+    float h, s, v;
+    bool initialized;
+    uint64_t last_used_frame;
+};
+
+struct EditorScrollSlot {
+    uint32_t element_id;
+    float last_x, last_y;
+    float applied_prop_x, applied_prop_y;
+    bool had_prop_x, had_prop_y;
+    uint32_t last_cursor_byte, last_anchor_byte;
+    bool has_cursor_state;
+    uint64_t last_used_frame;
+};
+
+struct DragHoverSlot {
+    uint32_t element_id;
+    bool hovering;
+    uint64_t last_used_frame;
 };
 
 enum SkeletonShape : uint8_t {
@@ -541,6 +1012,8 @@ struct TermCacheEntry {
     int32_t cursor_row;
     uint64_t content_hash;
     uint32_t content_len;
+    uint32_t last_vis_cols;
+    uint32_t last_vis_rows;
     uint64_t last_used_frame;
 };
 
@@ -626,10 +1099,24 @@ struct ContentBinding {
     void* resource;
 };
 
+struct TerminalBinding {
+    char name[64];
+    InlayTerminalReadFn read_fn;
+    void* user;
+};
+
+struct StreamBinding {
+    char name[64];
+    InlayStream* stream;
+    uint64_t last_seen_cursor;
+};
+
 struct TimerEntry {
     JSValue function;
     double due;
+    double interval_ms;
     uint32_t id;
+    bool is_raf;
 };
 
 struct WidgetEvent {
@@ -687,9 +1174,63 @@ struct InlaySurface {
     uint32_t toast_spec_count, toast_spec_cap;
     SkeletonSpec* skeleton_specs;
     uint32_t skeleton_spec_count, skeleton_spec_cap;
+    NodeDndSpec* dnd_specs;
+    uint32_t dnd_spec_count, dnd_spec_cap;
+    InputRichSpec* input_rich_specs;
+    uint32_t input_rich_spec_count, input_rich_spec_cap;
+    InputHighlightItem* input_highlights;
+    uint32_t input_highlight_count, input_highlight_cap;
+    CodeEditorRichSpec* editor_rich_specs;
+    uint32_t editor_rich_spec_count, editor_rich_spec_cap;
+    EditorInlayHintItem* editor_hints;
+    uint32_t editor_hint_count, editor_hint_cap;
+    EditorInlineHlItem* editor_inline_hls;
+    uint32_t editor_inline_hl_count, editor_inline_hl_cap;
+    EditorOverviewItem* editor_markers;
+    uint32_t editor_marker_count, editor_marker_cap;
+    EditorLineDecoItem* editor_line_decos;
+    uint32_t editor_line_deco_count, editor_line_deco_cap;
+    EditorFoldItem* editor_folds;
+    uint32_t editor_fold_count, editor_fold_cap;
+    EditorViewZoneItem* editor_view_zones;
+    uint32_t editor_view_zone_count, editor_view_zone_cap;
+    TermSearchMatchItem* term_search_matches;
+    uint32_t term_search_match_count, term_search_match_cap;
+    DockSpaceSpec* dock_space_specs;
+    uint32_t dock_space_spec_count, dock_space_spec_cap;
+    DockPaneSpec* dock_pane_specs;
+    uint32_t dock_pane_spec_count, dock_pane_spec_cap;
+    SheetSpec* sheet_specs;
+    uint32_t sheet_spec_count, sheet_spec_cap;
+    HoverCardSpec* hover_card_specs;
+    uint32_t hover_card_spec_count, hover_card_spec_cap;
+    ChoiceItemSpec* choice_items;
+    uint32_t choice_item_count, choice_item_cap;
+    RadioGroupSpec* radio_group_specs;
+    uint32_t radio_group_spec_count, radio_group_spec_cap;
+    ToggleGroupSpec* toggle_group_specs;
+    uint32_t toggle_group_spec_count, toggle_group_spec_cap;
+    ColorPickerSpec* color_picker_specs;
+    uint32_t color_picker_spec_count, color_picker_spec_cap;
+    ChartSpec* chart_specs;
+    uint32_t chart_spec_count, chart_spec_cap;
+    ChartPointSpec* chart_points;
+    uint32_t chart_point_count, chart_point_cap;
+    PortalWidgetSpec* portal_specs;
+    uint32_t portal_spec_count, portal_spec_cap;
+    DiffViewSpec* diff_specs;
+    uint32_t diff_spec_count, diff_spec_cap;
+    DiffAnnotationItem* diff_annotations;
+    uint32_t diff_annotation_count, diff_annotation_cap;
     // Persistent widget & style caches
     DocCacheEntry* doc_cache;
     uint32_t doc_cache_count, doc_cache_cap;
+    DocViewTrackSlot* doc_track_slots;
+    uint32_t doc_track_slot_count, doc_track_slot_cap;
+    PortalSyncSlot* portal_sync_slots;
+    uint32_t portal_sync_slot_count, portal_sync_slot_cap;
+    DiffViewCacheEntry* diff_cache;
+    uint32_t diff_cache_count, diff_cache_cap;
     TermCacheEntry* term_cache;
     uint32_t term_cache_count, term_cache_cap;
     VirtualListWinEntry* vlist_cache;
@@ -698,6 +1239,18 @@ struct InlaySurface {
     uint32_t table_sort_cache_count, table_sort_cache_cap;
     SkeletonPulseSlot* skeleton_cache;
     uint32_t skeleton_cache_count, skeleton_cache_cap;
+    DockSyncEntry* dock_sync_cache;
+    uint32_t dock_sync_cache_count, dock_sync_cache_cap;
+    HoverCardStateSlot* hover_card_states;
+    uint32_t hover_card_state_count, hover_card_state_cap;
+    ToastTimerSlot* toast_timers;
+    uint32_t toast_timer_count, toast_timer_cap;
+    ColorPickerSlot* color_picker_states;
+    uint32_t color_picker_state_count, color_picker_state_cap;
+    EditorScrollSlot* editor_scroll_states;
+    uint32_t editor_scroll_state_count, editor_scroll_state_cap;
+    DragHoverSlot* drag_hover_states;
+    uint32_t drag_hover_state_count, drag_hover_state_cap;
     ColorTweenSlot* color_tweens;
     uint32_t color_tween_count, color_tween_cap;
     // Persistent 2-way parsed `cls` utility cache (theme-independent ColorRef tokens)
@@ -715,17 +1268,30 @@ struct InlaySurface {
     char* source;
     uint32_t source_capacity, state_size, state_capacity;
     char error[1024], path[1024];
-    ActionBinding actions[32];
-    uint32_t action_count;
+    ActionBinding* actions;
+    uint32_t action_count, action_cap;
     SlotBinding slots[32];
     uint32_t slot_count;
     ContentBinding* content;
     uint32_t content_count, content_cap;
+    TerminalBinding* terminals;
+    uint32_t terminal_count, terminal_cap;
+    StreamBinding* streams;
+    uint32_t stream_count, stream_cap;
     InlayImageResolverFn image_resolver_fn;
     void* image_resolver_user_data;
+    InlayConsoleFn console_fn;
+    void* console_user_data;
+    EtchSyntaxTokenizeFn code_tok_fn;
+    void* code_tok_user_data;
+    InlayCodeHighlightFn doc_hl_fn;
+    void* doc_hl_user_data;
+    InlayCustomFenceEstimateFn doc_fence_est;
+    InlayCustomFenceRenderFn doc_fence_ren;
+    void* doc_fence_user_data;
     JSValue* handlers;
     uint32_t handler_count, handler_capacity;
-    TimerEntry timers[32];
+    TimerEntry timers[64];
     uint32_t next_timer;
     int64_t modified;
     uint64_t file_size, deadline, frame_counter;
@@ -836,6 +1402,9 @@ inline ColdVisualStyle* inlay_ui_ensure_cold(InlaySurface* s, NodeStyle& st) {
     c.transform = {0.f, 0.f, 1.f, 1.f, 0.f};
     c.on_hover_handler = INLAY_UI_NONE;
     c.on_focus_handler = INLAY_UI_NONE;
+    c.on_key_handler = INLAY_UI_NONE;
+    c.on_text_handler = INLAY_UI_NONE;
+    c.dnd_idx = INLAY_UI_NONE;
     st.cold_idx = idx;
     return &c;
 }
@@ -895,6 +1464,8 @@ bool inlay_ui_parse_ext_widget(InlaySurface* s, JSValueConst props,
 void inlay_ui_draw_ext_widget(InlaySurface* s, uint32_t index, uint32_t id, uint32_t parent_id,
                               const EtchTheme& theme, bool use_layer, WidgetEvents* events);
 void inlay_ui_reset_widget_specs(InlaySurface* s) noexcept;
+void inlay_ui_free_spec_pools(InlaySurface* s) noexcept;
+void inlay_ui_move_spec_pools(InlaySurface* dst, InlaySurface* src) noexcept;
 void inlay_ui_free_widget_caches(InlaySurface* s) noexcept;
 void inlay_ui_trim_document_cache(InlaySurface* s) noexcept;
 
